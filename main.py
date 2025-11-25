@@ -1,3 +1,4 @@
+import os
 from flask import Flask, request
 import requests
 import threading
@@ -6,14 +7,16 @@ from datetime import datetime
 import schedule
 
 # ============= CONFIG =============
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_TOKEN"
-CHAT_ID = 1869346832
+# ============= CONFIG =============
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = int(os.environ.get("CHAT_ID"))
+TG_TOKEN = os.environ.get("TG_TOKEN")
 
-WEBHOOK_URL = "YOUR_WEBHOOK_URL"  # ← Railway url + /webhook
+WEBHOOK_URL = "https://web-production-dd39a.up.railway.app/webhook"
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
-    "authorization": "Bearer ......",
+    "authorization": f"Bearer {TG_TOKEN}",
     "content-type": "application/json",
 }
 
