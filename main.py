@@ -15,8 +15,8 @@ MAX_RETRIES = 3
 RETRY_DELAY = 3
 APPLY_TIME = "03:00"
 
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Например https://your-app.up.railway.app/webhook
-TG_TOKEN = os.environ.get("TG_TOKEN")        # Для authorization в Gatto
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://app.up.railway.app/webhook
+TG_TOKEN = os.environ.get("TG_TOKEN")        # токен для Gatto авторизации
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
@@ -185,38 +185,6 @@ def apply_essences_to_pets():
     log("Эссенции применены ✓")
 
 
-# ================= Telegram Listener =================
-def telegram_listener():
-    log("Telegram listener started")
-    last_update = 0
-    while True:
-        try:
-            r = tg.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                params={"offset": last_update + 1, "timeout": 2},
-                timeout=TG_TIMEOUT
-            )
-            if r.status_code != 200:
-                time.sleep(1)
-                continue
-            data = r.json()
-            for upd in data.get("result", []):
-                last_update = upd["update_id"]
-                msg = upd.get("message", {})
-                if not msg:
-                    continue
-                chat_id = msg.get("chat", {}).get("id")
-                text = (msg.get("text") or "").strip().lower()
-                if chat_id != CHAT_ID:
-                    continue
-                if text == "/essence":
-                    send_telegram("Начинаю применение эссенций…")
-                    Thread(target=apply_essences_to_pets).start()
-        except Exception as e:
-            log(f"Listener exception: {e}")
-        time.sleep(0.2)
-
-
 # ================= Scheduler =================
 def scheduler_thread():
     schedule.every(2).minutes.do(lambda: Thread(target=feed_cat).start())
@@ -257,15 +225,24 @@ def webhook():
     return "ok"
 
 
-# ================= Start everything =================
+# ================= Start =================
 log("Бот запускается…")
-# стартовый цикл
+
+# Установка вебхука
+try:
+    wh = requests.get(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}"
+    )
+    log(f"Webhook set: {wh.text}")
+except Exception as e:
+    log(f"Ошибка установки webhook: {e}")
+
+# Стартовый цикл
 Thread(target=start_initial_cycle, daemon=True).start()
-# Listener
-Thread(target=telegram_listener, daemon=True).start()
-# Scheduler
+
+# Планировщик
 Thread(target=scheduler_thread, daemon=True).start()
 
-# Flask
+# Flask сервер
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
