@@ -1,23 +1,22 @@
 import os
-from flask import Flask, request
 import requests
 import schedule
 import time
 from datetime import datetime
 from threading import Thread
+from flask import Flask, request
 
 # ================= Конфигурация =================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = int(os.environ.get("CHAT_ID"))
-TG_TOKEN = os.environ.get("TG_TOKEN")  # для Gatto API "authorization"
-
-MAX_RETRIES = 3
-RETRY_DELAY = 3
 TG_TIMEOUT = 3
 GATTO_TIMEOUT = 20
+MAX_RETRIES = 3
+RETRY_DELAY = 3
 APPLY_TIME = "03:00"
 
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Например: https://your-project.up.railway.app/webhook
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # Например https://your-app.up.railway.app/webhook
+TG_TOKEN = os.environ.get("TG_TOKEN")        # Для authorization в Gatto
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
@@ -27,9 +26,10 @@ HEADERS = {
     "referer": "https://gatto.pw/",
 }
 
-# Разделяем соединения
+# Сессии
 tg = requests.Session()
 gatto = requests.Session()
+
 
 # ================= Утилиты =================
 def now():
@@ -45,9 +45,11 @@ def send_telegram(text):
             json={"chat_id": CHAT_ID, "text": text},
             timeout=TG_TIMEOUT
         )
-    except:
-        pass
+    except Exception as e:
+        log(f"Telegram send error: {e}")
 
+
+# ================= Запросы к Gatto =================
 def safe_request(url, payload=None):
     for _ in range(MAX_RETRIES):
         try:
@@ -65,6 +67,7 @@ def single_request(url, payload=None):
     except:
         pass
 
+
 # ================= API =================
 def get_all_stats():
     return safe_request("https://api.nl.gatto.pw/pet.getAllStats")
@@ -73,6 +76,21 @@ def feed_cat():
     log("Кормление котов…")
     safe_request("https://api.nl.gatto.pw/pet.feed", {"all": True})
     log("Кормление завершено ✓")
+
+def get_user_self():
+    r = safe_request("https://api.nl.gatto.pw/user.getSelf")
+    if not r:
+        return []
+    try:
+        data = r.json()
+        pets = []
+        for region in data.get("user", {}).get("regions", []):
+            pet = region.get("pet")
+            if pet and "_id" in pet:
+                pets.append(pet)
+        return pets
+    except:
+        return []
 
 def play_game():
     log("Игры с питомцами…")
@@ -83,22 +101,6 @@ def play_game():
                        {"id": pet["_id"], "alias": "pet.play"})
     log("Игры завершены ✓")
 
-def get_user_self():
-    r = safe_request("https://api.nl.gatto.pw/user.getSelf")
-    if not r:
-        return []
-    try:
-        data = r.json()
-    except:
-        return []
-    pets = []
-    for region in data.get("user", {}).get("regions", []):
-        pet = region.get("pet")
-        if pet and "_id" in pet:
-            pets.append(pet)
-    return pets
-
-# ================= Призы =================
 def format_prizes(data):
     lines = []
     for f in ["soft", "ton", "gton", "eventCurrency", "experience"]:
@@ -128,7 +130,6 @@ def get_prize():
         send_telegram("Ошибка при получении призов.")
     log("Призы получены ✓")
 
-# ================= Эссенции =================
 def get_pets_not_level_10():
     pets = get_user_self()
     return [{"id": p["_id"], "level": p.get("level", 0)} for p in pets if p.get("level", 0) < 10]
@@ -183,25 +184,8 @@ def apply_essences_to_pets():
     send_telegram(f"✨ Прокачка завершена.\nПрименено эссенций: {applied}\nПитомцев улучшено: {improved_pets}")
     log("Эссенции применены ✓")
 
-# ================= Flask webhook =================
-app = Flask(__name__)
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.json
-    if not data or "message" not in data:
-        return "ok"
-    msg = data["message"]
-    chat_id = msg.get("chat", {}).get("id")
-    text = msg.get("text", "")
-    if chat_id != CHAT_ID:
-        return "ok"
-    if text == "/essence":
-        Thread(target=apply_essences_to_pets).start()
-        send_telegram("Начинаю ⚡")
-    return "ok"
-
-# ================= Telegram listener (fallback polling) =================
+# ================= Telegram Listener =================
 def telegram_listener():
     log("Telegram listener started")
     last_update = 0
@@ -232,6 +216,7 @@ def telegram_listener():
             log(f"Listener exception: {e}")
         time.sleep(0.2)
 
+
 # ================= Scheduler =================
 def scheduler_thread():
     schedule.every(2).minutes.do(lambda: Thread(target=feed_cat).start())
@@ -243,24 +228,44 @@ def scheduler_thread():
         schedule.run_pending()
         time.sleep(1)
 
-# ================= Startup =================
-def set_webhook():
-    resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
-                        params={"url": WEBHOOK_URL})
-    log(f"Webhook setup response: {resp.text}")
 
-if __name__ == "__main__":
-    log("Starting bot services...")
-
-    set_webhook()
-    
+# ================= Initial Cycle =================
+def start_initial_cycle():
     log("Стартовый цикл…")
     feed_cat()
     get_prize()
     play_game()
     log("Стартовый цикл завершён ✓")
 
-    Thread(target=telegram_listener, daemon=True).start()
-    Thread(target=scheduler_thread, daemon=True).start()
 
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+# ================= Flask =================
+app = Flask(__name__)
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.json
+    if not data or "message" not in data:
+        return "ok"
+    msg = data["message"]
+    chat_id = msg.get("chat", {}).get("id")
+    text = msg.get("text", "")
+    if chat_id != CHAT_ID:
+        return "ok"
+    if text == "/essence":
+        Thread(target=apply_essences_to_pets).start()
+        send_telegram("Начинаю ⚡")
+    return "ok"
+
+
+# ================= Start everything =================
+log("Бот запускается…")
+# стартовый цикл
+Thread(target=start_initial_cycle, daemon=True).start()
+# Listener
+Thread(target=telegram_listener, daemon=True).start()
+# Scheduler
+Thread(target=scheduler_thread, daemon=True).start()
+
+# Flask
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
