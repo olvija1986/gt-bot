@@ -7,7 +7,6 @@ from datetime import datetime
 import schedule
 
 # ============= CONFIG =============
-# ============= CONFIG =============
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = int(os.environ.get("CHAT_ID"))
 TG_TOKEN = os.environ.get("TG_TOKEN")
@@ -127,4 +126,5 @@ if __name__ == "__main__":
     set_webhook()
     threading.Thread(target=scheduler_thread, daemon=True).start()
 
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
