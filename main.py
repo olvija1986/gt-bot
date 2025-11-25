@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
+"""
+Gatto bot — последовательная обработка запросов через очередь.
+Улучшения:
+- единый worker, который выполняет задачи из очереди последовательно;
+- безопасные сетевые вызовы с ретраями и логированием;
+- таймаут выполнения каждой задачи (чтобы воркер не блокировался);
+- защита от бесконечных циклов при применении эссенций;
+- /health endpoint для проверки состояния.
+"""
+
 import os
 import requests
 import schedule
@@ -8,7 +18,7 @@ import time
 from datetime import datetime
 from threading import Thread, Lock
 from queue import Queue, Empty
-from flask import Flask, request
+from flask import Flask, request, jsonify
 
 # ================= Конфигурация =================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -18,13 +28,15 @@ try:
 except Exception:
     CHAT_ID = None
 
-TG_TIMEOUT = 3
-GATTO_TIMEOUT = 20
-MAX_RETRIES = 3
-RETRY_DELAY = 3
+TG_TIMEOUT = int(os.environ.get("TG_TIMEOUT", 3))
+GATTO_TIMEOUT = int(os.environ.get("GATTO_TIMEOUT", 20))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 3))
+RETRY_DELAY = int(os.environ.get("RETRY_DELAY", 3))
 APPLY_TIME = os.environ.get("APPLY_TIME", "03:00")
+TASK_TIMEOUT = int(os.environ.get("TASK_TIMEOUT", 60))  # max seconds per task before marking timeout
+MAX_ESSENCE_ATTEMPTS_PER_PET = int(os.environ.get("MAX_ESSENCE_ATTEMPTS_PER_PET", 50))
 
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://app.up.railway.app/webhook
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g. https://app.up.railway.app/webhook
 TG_TOKEN = os.environ.get("TG_TOKEN")        # токен для Gatto авторизации
 
 HEADERS = {
@@ -41,7 +53,7 @@ gatto = requests.Session()
 
 # ================= Очередь задач и синхронизация =================
 task_queue = Queue()
-gatto_lock = Lock()  # дополнительная защита при обращении к сессии requests
+gatto_lock = Lock()  # дополнительная защита вокруг сетевых вызовов
 
 # ================= Утилиты =================
 def now():
@@ -51,24 +63,26 @@ def log(msg):
     print(f"[{now()}] {msg}", flush=True)
 
 def send_telegram(text):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        log("Telegram not configured: can't send message.")
+    if not TELEGRAM_TOKEN or CHAT_ID is None:
+        log("Telegram не настроен — пропускаю отправку.")
         return
     try:
-        tg.post(
+        r = tg.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": text},
             timeout=TG_TIMEOUT
         )
+        if r.status_code != 200:
+            log(f"Telegram send returned {r.status_code}: {r.text[:200]}")
     except Exception as e:
         log(f"Telegram send error: {e}")
 
-# ================= Запросы к Gatto =================
+# ================= Сетевые вызовы к Gatto =================
 def safe_request(url, payload=None):
     """
-    Последовательный, логирующий и ретрающий POST-запрос к Gatto API.
-    Возвращает объект response при успешном статусе 200, иначе None.
-    Все обращения к сети защищены gatto_lock для дополнительной безопасности.
+    Делает POST с ретраями. Возвращает объект requests.Response при status_code == 200,
+    иначе возвращает None. Логирует содержимое ответа (усечённое).
+    Все сетевые обращения защищены gatto_lock, чтобы избежать параллельных вызовов.
     """
     with gatto_lock:
         for attempt in range(1, MAX_RETRIES + 1):
@@ -79,35 +93,33 @@ def safe_request(url, payload=None):
                 r = None
 
             if r is None:
-                # запрос не удался (исключение)
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY)
                 continue
 
-            # Логируем statuse и начало тела
-            snippet = (r.text[:500] + '...') if len(r.text) > 500 else r.text
-            log(f"Response {r.status_code} from {url} (attempt {attempt}/{MAX_RETRIES}) -> {snippet}")
+            # Логируем ответ (HTTP-код и начало тела)
+            body_snippet = (r.text[:500] + '...') if len(r.text) > 500 else r.text
+            log(f"Response {r.status_code} from {url} (attempt {attempt}/{MAX_RETRIES}): {body_snippet}")
 
-            # Если 200 — возвращаем
             if r.status_code == 200:
+                # проверка на валидный JSON делается в вызывающем коде
                 return r
 
-            # Для остальных кодов — подождать и ретрай
+            # Не 200 — пробуем ретрайить (если остались попытки)
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
-        # все попытки использованы
+
         log(f"All {MAX_RETRIES} attempts failed for {url}")
         return None
 
 def single_request(url, payload=None):
     """
-    Неблокирующий вариант POST: мы всё равно выполняем его последовательно (через очередь),
-    но иногда хочется вызвать без обработки ответа.
-    Тем не менее используем safe_request внутри, чтобы видеть лог.
+    Небольшая обёртка, которая просто вызывает safe_request и игнорирует результат,
+    но позволяет видеть лог.
     """
     safe_request(url, payload)
 
-# ================= API =================
+# ================= API-функции =================
 def get_all_stats():
     r = safe_request("https://api.nl.gatto.pw/pet.getAllStats")
     if not r:
@@ -115,7 +127,7 @@ def get_all_stats():
     try:
         return r.json()
     except Exception as e:
-        log(f"JSON parse error in get_all_stats: {e}")
+        log(f"get_all_stats: JSON parse error: {e}")
         return None
 
 def feed_cat():
@@ -124,7 +136,8 @@ def feed_cat():
     if r:
         log("Кормление завершено ✓")
     else:
-        log("Кормление: ошибка при запросе")
+        log("Кормление: ошибка запроса")
+        send_telegram("Кормление: ошибка запроса к Gatto.")
 
 def get_user_self():
     r = safe_request("https://api.nl.gatto.pw/user.getSelf")
@@ -147,10 +160,10 @@ def play_game():
     log("Игры с питомцами…")
     r = safe_request("https://api.nl.gatto.pw/pet.play", {"all": True})
     if not r:
-        log("play_game: ошибка при pet.play")
+        log("play_game: pet.play gave no response")
+        send_telegram("Игры: ошибка pet.play.")
     pets = get_user_self()
     for pet in pets:
-        # ads.watch может не возвращать важный ответ, но мы всё равно вызовем через safe_request
         single_request("https://api.nl.gatto.pw/ads.watch", {"id": pet["_id"], "alias": "pet.play"})
     log("Игры завершены ✓")
 
@@ -178,7 +191,7 @@ def get_prize():
         data = r.json()
     except Exception as e:
         log(f"Ошибка при разборе JSON призов: {e}")
-        send_telegram("Ошибка при получении призов (неправильный JSON).")
+        send_telegram("Ошибка при получении призов (невалидный JSON).")
         return
     msg = format_prizes(data)
     send_telegram(f"🎁 Призы:\n{msg}")
@@ -195,12 +208,12 @@ def get_first_essence():
         return None
     try:
         arr = r.json()
-        # Некоторые ответы могут содержать объект с полем 'data' или список напрямую
+        # иногда API возвращает {'data': [...]}
         if isinstance(arr, dict) and "data" in arr and isinstance(arr["data"], list):
             arr = arr["data"]
         return arr[0] if arr else None
     except Exception as e:
-        log(f"get_first_essence: ошибка парсинга JSON: {e}")
+        log(f"get_first_essence: JSON parse error: {e}")
         return None
 
 def use_essence(pet_id, essence_id):
@@ -211,10 +224,14 @@ def use_essence(pet_id, essence_id):
     try:
         return r.json()
     except Exception as e:
-        log(f"use_essence: ошибка парсинга JSON: {e}")
+        log(f"use_essence: JSON parse error: {e}")
         return None
 
 def apply_essences_to_pets():
+    """
+    Применяем эссенции осторожно: для каждого питомца лимит попыток,
+    чтобы не зациклиться на ошибочных ответах API.
+    """
     pets = get_pets_not_level_10()
     send_telegram(f"✨ Начинаю применение эссенций. Питомцев ниже 10 уровня: {len(pets)}")
     log("Применение эссенций…")
@@ -226,26 +243,49 @@ def apply_essences_to_pets():
     for pet in pets:
         pet_id = pet["id"]
         start_level = pet["level"]
-        while True:
+        attempts = 0
+        while attempts < MAX_ESSENCE_ATTEMPTS_PER_PET:
+            attempts += 1
             ess = get_first_essence()
             if not ess:
                 send_telegram(f"Эссенции закончились. Всего применено: {applied}")
                 log("Эссенции закончились.")
                 return
-            res = use_essence(pet_id, ess.get("_id") or ess.get("id"))
+            essence_id = ess.get("_id") or ess.get("id")
+            if not essence_id:
+                log("get_first_essence вернул объект без id — пропускаю.")
+                break
+            res = use_essence(pet_id, essence_id)
             if not res:
-                log("use_essence вернуло None — прекращаем попытки на этом питомце.")
+                log("use_essence вернуло None — прекращаю попытки для этого питомца.")
                 break
             applied += 1
             new_level = res.get("level", start_level)
+            log(f"Pet {pet_id}: level {start_level} -> {new_level} (attempt {attempts})")
             if new_level >= 10:
                 improved_pets += 1
                 break
             start_level = new_level
+        else:
+            log(f"Превышен лимит попыток ({MAX_ESSENCE_ATTEMPTS_PER_PET}) для pet {pet_id}.")
     send_telegram(f"✨ Прокачка завершена.\nПрименено эссенций: {applied}\nПитомцев улучшено: {improved_pets}")
     log("Эссенции применены ✓")
 
-# ================= Worker (выполняет задачи последовательно) =================
+# ================= Worker =================
+def _run_task_with_timeout(task_callable, timeout):
+    """
+    Запускает task_callable в отдельном потоке и ждёт join(timeout).
+    Если задача ещё выполняется после timeout — помечаем таймаут и возвращаем False.
+    Возвращаем True если задача завершилась (без учёта ошибок внутри неё).
+    NOTE: Невозможно безопасно убить поток — надеемся на корректные timeouts в сетевых вызовах.
+    """
+    thr = Thread(target=task_callable, daemon=True)
+    thr.start()
+    thr.join(timeout)
+    if thr.is_alive():
+        return False
+    return True
+
 def worker():
     log("Worker запущен — готов обрабатывать задачи.")
     while True:
@@ -254,17 +294,19 @@ def worker():
         except Empty:
             continue
         try:
-            # task — callable без аргументов
-            try:
-                task()
-            except Exception as e:
-                log(f"Ошибка выполнения задачи {task}: {e}")
+            log(f"Worker: взял задачу {getattr(task, '__name__', str(task))}")
+            finished = _run_task_with_timeout(task, TASK_TIMEOUT)
+            if not finished:
+                log(f"Worker: задача {getattr(task, '__name__', str(task))} превысила таймаут {TASK_TIMEOUT}s и помечена как timed out.")
+                send_telegram(f"Задача {getattr(task, '__name__', 'task')} превысила таймаут и была прервана (лог отмечен).")
+        except Exception as e:
+            log(f"Worker: исключение при выполнении задачи: {e}")
         finally:
             task_queue.task_done()
 
-# ================= Scheduler — кладёт задачи в очередь =================
+# ================= Scheduler (кладёт задачи в очередь) =================
 def scheduler_thread():
-    # планировщик кладёт функции в очередь; сами функции выполняются worker'ом
+    # планировщик кладёт функции в очередь; сами функции выполняются worker'ом последовательно
     schedule.every(2).minutes.do(lambda: task_queue.put(feed_cat))
     schedule.every(29).minutes.do(lambda: task_queue.put(get_prize))
     schedule.every(60).minutes.do(lambda: task_queue.put(play_game))
@@ -272,7 +314,10 @@ def scheduler_thread():
 
     log("Планировщик запущен")
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            log(f"Scheduler exception: {e}")
         time.sleep(1)
 
 # ================= Initial Cycle =================
@@ -301,33 +346,49 @@ def webhook():
         send_telegram("Начинаю применение эссенций (задача поставлена в очередь) ⚡")
     return "ok"
 
+@app.route("/health", methods=["GET"])
+def health():
+    """
+    Возвращает базовую информацию:
+    - size очереди
+    - наличие TELEGRAM_TOKEN / TG_TOKEN
+    """
+    return jsonify({
+        "ok": True,
+        "queue_size": task_queue.qsize(),
+        "telegram_configured": bool(TELEGRAM_TOKEN and CHAT_ID is not None),
+        "gatto_token_present": bool(TG_TOKEN),
+        "task_timeout_sec": TASK_TIMEOUT
+    })
+
 # ================= Start =================
 if __name__ == "__main__":
     log("Бот запускается…")
 
-    # Установка вебхука (не критично для очереди, но полезно)
+    # Попытка установить webhook (если задан)
     if TELEGRAM_TOKEN and WEBHOOK_URL:
         try:
             wh = requests.get(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}",
                 timeout=TG_TIMEOUT
             )
-            log(f"Webhook set: {wh.text}")
+            log(f"Webhook set: {wh.status_code} {wh.text[:200]}")
         except Exception as e:
             log(f"Ошибка установки webhook: {e}")
     else:
-        log("Webhook или TELEGRAM_TOKEN не настроены — пропускаю установку webhook.")
+        log("Webhook/TELEGRAM_TOKEN/WEBHOOK_URL не настроены — пропускаю установку webhook.")
 
     # Запуск worker'а
     t_worker = Thread(target=worker, daemon=True)
     t_worker.start()
 
-    # Стартовый цикл помещает задачи в очередь
+    # Стартовый цикл — кладём задачи в очередь (не выполняем синхронно)
     start_initial_cycle()
 
-    # Планировщик в отдельном потоке (он только кладет задачи)
+    # Планировщик в отдельном потоке (он только кладёт задачи)
     t_sched = Thread(target=scheduler_thread, daemon=True)
     t_sched.start()
 
     # Flask сервер
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
