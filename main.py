@@ -251,15 +251,22 @@ def open_boxes():
     text_lines.append("-------------------------------------")
 
     # Предметы по категориям
+    from collections import Counter
+
     def format_items(items, title_emoji, title_name):
         if not items:
             return ""
+    # Считаем количество каждого предмета
+        counts = Counter(item.get("name") or item.get("description") or "Unknown" for item in items)
         lines = [f"{title_emoji} {title_name}:"]
-        for item in items:
-            name = item.get("name") or item.get("description") or "Unknown"
-            lines.append(f"  - {name}")
+        for name, count in counts.items():
+            if count == 1:
+                lines.append(f"  - {name}")
+            else:
+                lines.append(f"  - {name} x{count}")
         lines.append("-------------------------------------")
         return "\n".join(lines)
+
 
     text_lines.append(format_items(lootboxes_stats["resultSkins"], "🎨", "Скины"))
     text_lines.append(format_items(lootboxes_stats["resultEggs"], "🥚", "Яйца"))
