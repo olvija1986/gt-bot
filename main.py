@@ -126,7 +126,15 @@ def play_game():
     log("Игры завершены ✓")
 
 
-# ================= /box Команда =================
+# ================= Форматирование дропа =================
+
+VALID_CATEGORIES = [
+    "soft", "ton", "gton", "eventCurrency", "experience",
+    "resultSkins", "resultEggs", "resultEssence",
+    "resultLootBox", "resultPremium", "resultPromotionPromocodes",
+    "resultExtraItem", "resultMutagen", "resultFoods"
+]
+
 CATEGORY_EMOJI = {
     "resultEggs": "🥚 Яйца",
     "resultFoods": "🍖 Еда",
@@ -139,18 +147,58 @@ CATEGORY_EMOJI = {
     "resultLootBox": "🎁 Боксы (дроп)"
 }
 
-def add_items_to_stats(stats, category, items):
-    if category not in stats:
-        stats[category] = {}
-    for item in items:
-        name = item.get("name") or item.get("description") or f"{item.get('rarity','')} {item.get('itemType','item')}".strip()
-        if name in stats[category]:
-            stats[category][name] += 1
-        else:
-            stats[category][name] = 1
+def format_loot_stats(stats, total_boxes):
+    """Возвращает красивый текст Telegram с группировкой."""
+    out = []
+    out.append("📦 Финальная статистика\n-------------------------------------")
+    out.append(f"🎁 Открытые боксы: {total_boxes}")
+    out.append("-------------------------------------")
 
+    # Валюта
+    for key in ["soft", "ton", "gton", "eventCurrency", "experience"]:
+        if key in stats and isinstance(stats[key], int):
+            out.append(f"💰 {key}: {stats[key]}")
+    out.append("-------------------------------------")
+
+    # Предметы
+    for cat, items in stats.items():
+        if isinstance(items, dict) and items:
+            title = CATEGORY_EMOJI.get(cat, f"📂 {cat}")
+            out.append(f"{title}:")
+            for name, count in items.items():
+                out.append(f"  - {name} — {count}")
+            out.append("-------------------------------------")
+
+    return "\n".join(out)
+
+
+# ================= /box командный процесс =================
+# ================= Команда /box =================
 def open_boxes():
-    r = safe_request("https://api.nl.gatto.pw/warehouseGoods.getByLimit", {"type": "lootBoxes", "limit": 8, "offset": 0})
+    """Открывает все боксы на складе и отправляет финальную статистику."""
+    send_telegram("📦 Начинаю открывать боксы…")
+    lootboxes_stats = {
+        "soft": 0,
+        "ton": 0,
+        "gton": 0,
+        "eventCurrency": 0,
+        "experience": 0,
+        "resultSkins": [],
+        "resultEggs": [],
+        "resultEssence": [],
+        "resultLootBox": [],
+        "resultPremium": [],
+        "resultPromotionPromocodes": [],
+        "resultExtraItem": [],
+        "resultMutagen": [],
+        "resultFoods": []
+    }
+
+    # 1. Получаем боксы со склада
+    r = safe_request(
+        "https://api.nl.gatto.pw/warehouseGoods.getByLimit",
+        {"type": "lootBoxes", "limit": 8, "offset": 0}
+    )
     if not r:
         send_telegram("Ошибка: не удалось получить список боксов.")
         return
@@ -165,13 +213,7 @@ def open_boxes():
         send_telegram("📦 На складе нет боксов.")
         return
 
-    send_telegram(f"📦 На складе найдено {len(boxes)} бокса(ов). Начинаю открывать…")
-
-    stats = {"soft": 0, "ton":0, "gton":0, "eventCurrency":0, "experience":0}
-
-    for field in CATEGORY_EMOJI.keys():
-        stats[field] = {}
-
+    # 2. Открываем каждый бокс
     for box in boxes:
         box_id = box.get("metadata", {}).get("lootBox", {}).get("_id")
         if not box_id:
@@ -185,36 +227,58 @@ def open_boxes():
         except:
             continue
 
-        # Валюта
-        for cur in ["soft","ton","gton","eventCurrency","experience"]:
-            stats[cur] += data.get(cur,0)
+        # 3. Суммируем валюту
+        for cur in ["soft", "ton", "gton", "eventCurrency", "experience"]:
+            lootboxes_stats[cur] += data.get(cur, 0)
 
-        # Предметы
-        for arr_field in CATEGORY_EMOJI.keys():
-            add_items_to_stats(stats, arr_field, data.get(arr_field,[]))
+        # 4. Добавляем массивы предметов
+        for arr_field in [
+            "resultSkins", "resultEggs", "resultEssence",
+            "resultLootBox", "resultPremium", "resultPromotionPromocodes",
+            "resultExtraItem", "resultMutagen", "resultFoods"
+        ]:
+            lootboxes_stats[arr_field].extend(data.get(arr_field, []))
 
-    # Формирование текста
-    lines = ["📦 Финальная статистика","-------------------------------------"]
-    lines.append(f"🎁 Открыто боксов: {len(boxes)}")
-    lines.append("-------------------------------------")
-    for cur in ["soft","ton","gton","eventCurrency","experience"]:
-        lines.append(f"💰 {cur}: {stats[cur]}")
-    lines.append("-------------------------------------")
+    # 5. Форматируем финальный текст
+    text_lines = ["📦 Финальная статистика", "-------------------------------------"]
+    text_lines.append(f"🎁 Открыто боксов: {len(boxes)}")
+    text_lines.append("-------------------------------------")
 
-    for cat, items in stats.items():
-        if cat in ["soft","ton","gton","eventCurrency","experience"]:
-            continue
+    # Валюта
+    for cur in ["soft", "ton", "gton", "eventCurrency", "experience"]:
+        text_lines.append(f"💰 {cur}: {lootboxes_stats[cur]}")
+    text_lines.append("-------------------------------------")
+
+    # Предметы по категориям
+    def format_items(items, title_emoji, title_name):
         if not items:
-            continue
-        lines.append(f"{CATEGORY_EMOJI.get(cat,cat)}:")
-        for name,count in items.items():
-            lines.append(f"  - {name} — {count}")
+            return ""
+        lines = [f"{title_emoji} {title_name}:"]
+        for item in items:
+            name = item.get("name") or item.get("description") or "Unknown"
+            lines.append(f"  - {name}")
         lines.append("-------------------------------------")
+        return "\n".join(lines)
 
-    send_telegram("\n".join(lines))
+    text_lines.append(format_items(lootboxes_stats["resultSkins"], "🎨", "Скины"))
+    text_lines.append(format_items(lootboxes_stats["resultEggs"], "🥚", "Яйца"))
+    text_lines.append(format_items(lootboxes_stats["resultEssence"], "✨", "Эссенция"))
+    text_lines.append(format_items(lootboxes_stats["resultLootBox"], "🎁", "Боксы (дроп)"))
+    text_lines.append(format_items(lootboxes_stats["resultPremium"], "💎", "Премиум"))
+    text_lines.append(format_items(lootboxes_stats["resultPromotionPromocodes"], "🎟", "Промокоды"))
+    text_lines.append(format_items(lootboxes_stats["resultExtraItem"], "📦", "Доп. предметы"))
+    text_lines.append(format_items(lootboxes_stats["resultMutagen"], "🧪", "Мутаген"))
+    text_lines.append(format_items(lootboxes_stats["resultFoods"], "🍖", "Еда"))
 
+    final_text = "\n".join([line for line in text_lines if line])
 
-# ================= Призы =================
+    # 6. Разбиваем на части ≤ 4000 символов
+    max_len = 4000
+    for i in range(0, len(final_text), max_len):
+        send_telegram(final_text[i:i+max_len])
+
+# ================= getPrize и Essences =================
+
 def format_prizes(data):
     lines = []
 
@@ -233,6 +297,7 @@ def format_prizes(data):
 
     return "\n".join(lines) if lines else "Нет призов"
 
+
 def get_prize():
     log("Получение призов…")
     get_all_stats_before_action()
@@ -246,16 +311,22 @@ def get_prize():
         send_telegram(f"🎁 Призы:\n{msg}")
     except:
         send_telegram("Ошибка при разборе призов.")
+
     log("Призы получены ✓")
 
 
-# ================= Эссенции =================
+# ===== Эссенции (без изменений) =====
+
 def get_pets_not_level_10():
     pets = get_user_self()
     return [{"id": p["_id"], "level": p.get("level", 0)} for p in pets if p.get("level", 0) < 10]
 
+
 def get_first_essence():
-    r = safe_request("https://api.nl.gatto.pw/warehouseGoods.getByLimit", {"type": "essences","limit":8,"offset":0})
+    r = safe_request(
+        "https://api.nl.gatto.pw/warehouseGoods.getByLimit",
+        {"type": "essences", "limit": 8, "offset": 0}
+    )
     if not r:
         return None
     try:
@@ -264,8 +335,12 @@ def get_first_essence():
     except:
         return None
 
+
 def use_essence(pet_id, essence_id):
-    r = safe_request("https://api.nl.gatto.pw/essence.activate", {"petId":pet_id,"essenceId":essence_id})
+    r = safe_request(
+        "https://api.nl.gatto.pw/essence.activate",
+        {"petId": pet_id, "essenceId": essence_id}
+    )
     if not r:
         return None
     try:
@@ -273,15 +348,18 @@ def use_essence(pet_id, essence_id):
     except:
         return None
 
+
 def apply_essences_to_pets():
     pets = get_pets_not_level_10()
     send_telegram(f"✨ Начинаю применение эссенций. Питомцев ниже 10 уровня: {len(pets)}")
+
     if not pets:
         send_telegram("Нет питомцев ниже 10 уровня.")
         return
 
     applied = 0
     improved_pets = 0
+
     for pet in pets:
         pet_id = pet["id"]
         current_level = pet["level"]
@@ -297,13 +375,19 @@ def apply_essences_to_pets():
                 break
 
             applied += 1
-            new_level = res.get("level",current_level)
+            new_level = res.get("level", current_level)
+
             if new_level >= 10:
                 improved_pets += 1
                 break
+
             current_level = new_level
 
-    send_telegram(f"✨ Прокачка завершена.\nПрименено эссенций: {applied}\nПитомцев улучшено: {improved_pets}")
+    send_telegram(
+        f"✨ Прокачка завершена.\n"
+        f"Применено эссенций: {applied}\n"
+        f"Питомцев улучшено: {improved_pets}"
+    )
 
 
 # ================= Scheduler =================
@@ -332,6 +416,7 @@ def start_initial_cycle():
 # ================= Flask =================
 app = Flask(__name__)
 
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
@@ -349,16 +434,22 @@ def webhook():
         Thread(target=apply_essences_to_pets).start()
         send_telegram("Начинаю ⚡")
 
+    # ========== НОВАЯ КОМАНДА /box ==========
     if text.startswith("/box"):
+        parts = text.split()
         Thread(target=open_boxes).start()
+        send_telegram(f"📦 Открываю боксы…")
 
     return "ok"
 
 
 # ================= Start =================
 log("Бот запускается…")
+
 try:
-    wh = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}")
+    wh = requests.get(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}"
+    )
     log(f"Webhook set: {wh.text}")
 except Exception as e:
     log(f"Ошибка установки webhook: {e}")
