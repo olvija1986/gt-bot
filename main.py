@@ -173,6 +173,7 @@ def format_loot_stats(stats, total_boxes):
 
 
 # ================= /box командный процесс =================
+<<<<<<< HEAD
 # ================= Команда /box =================
 def open_boxes():
     """Открывает все боксы на складе и отправляет финальную статистику."""
@@ -276,6 +277,55 @@ def open_boxes():
     max_len = 4000
     for i in range(0, len(final_text), max_len):
         send_telegram(final_text[i:i+max_len])
+=======
+def open_boxes(count=1):
+    """
+    Открывает боксы count раз, отправляет итоговую статистику в Telegram.
+    """
+    send_telegram(f"📦 Открываю боксы: {count}…")
+
+    total_boxes = 0
+    stats = {}
+
+    # Инициализация структур
+    for key in VALID_CATEGORIES:
+        if key in ["soft", "ton", "gton", "eventCurrency", "experience"]:
+            stats[key] = 0  # валюта
+        else:
+            stats[key] = {}  # предметы
+
+    for _ in range(count):
+        get_all_stats_before_action()
+        r = safe_request("https://api.nl.gatto.pw/lootbox.open", {"count": 1})
+        if not r:
+            continue
+
+        data = r.json()
+        total_boxes += 1
+
+        for cat in VALID_CATEGORIES:
+            value = data.get(cat)
+
+            # Валюта
+            if isinstance(value, int):
+                stats[cat] += value
+
+            # Массив предметов
+            elif isinstance(value, list):
+                for item in value:
+                    name = (
+                        item.get("name")
+                        or item.get("description")
+                        or f"{item.get('rarity', '')} {item.get('itemType') or item.get('category', '')}".strip()
+                    )
+
+                    stats[cat][name] = stats[cat].get(name, 0) + 1
+
+    # Итог
+    summary = format_loot_stats(stats, total_boxes)
+    send_telegram(summary)
+
+>>>>>>> e97d85bce66292e6f3a978f91992f3dc580c8c04
 
 # ================= getPrize и Essences =================
 
@@ -437,8 +487,14 @@ def webhook():
     # ========== НОВАЯ КОМАНДА /box ==========
     if text.startswith("/box"):
         parts = text.split()
+<<<<<<< HEAD
         Thread(target=open_boxes).start()
         send_telegram(f"📦 Открываю боксы…")
+=======
+        count = int(parts[1]) if len(parts) > 1 else 1
+        Thread(target=open_boxes, args=(count,)).start()
+        send_telegram(f"📦 Открываю {count} боксов…")
+>>>>>>> e97d85bce66292e6f3a978f91992f3dc580c8c04
 
     return "ok"
 
@@ -459,4 +515,7 @@ Thread(target=scheduler_thread, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+<<<<<<< HEAD
 
+=======
+>>>>>>> e97d85bce66292e6f3a978f91992f3dc580c8c04
