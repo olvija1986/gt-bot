@@ -251,22 +251,59 @@ def open_boxes():
     text_lines.append("-------------------------------------")
 
     # Предметы по категориям
-    from collections import Counter
+    from collections import defaultdict
 
-    def format_items(items, title_emoji, title_name):
-        if not items:
-            return ""
-    # Считаем количество каждого предмета
-        counts = Counter(item.get("name") or item.get("description") or "Unknown" for item in items)
-        lines = [f"{title_emoji} {title_name}:"]
-        for name, count in counts.items():
-            if count == 1:
-                lines.append(f"  - {name}")
-            else:
-                lines.append(f"  - {name} x{count}")
-        lines.append("-------------------------------------")
-        return "\n".join(lines)
+    def get_item_key(item):
+        # ================= МУТАГЕН =================
+        if item.get("category") == "mutagens" or item.get("itemType") == "mutagen":
+            mut = item.get("metadata", {}).get("mutagen", item)
+            return mut.get("probability", "mutagen")
 
+        # ================= ЕДА =================
+        if item.get("category") == "foods" or item.get("itemType") == "food":
+            food = item.get("food", item)
+            return food.get("name", "food")
+
+        # ================= СКИНЫ =================
+        if item.get("category") == "skins" or item.get("itemType") == "skin":
+            return item.get("itemName") or item.get("name") or "skin"
+
+        # ================= ЯЙЦА =================
+        if item.get("category") == "eggs" or item.get("itemType") == "egg":
+            region = item.get("allowedRegion", "unknownRegion")
+            rarity = item.get("rarity", "unknownRarity")
+            return f"{region}_{rarity}"
+
+        # ================= ЭССЕНЦИИ =================
+        if item.get("category") == "essences" or item.get("itemType") == "essence":
+            return item.get("type", "essence")
+
+        # ================= ДОП. ТОВАРЫ =================
+        if item.get("category") == "extraItems" or item.get("itemType") == "extraItem":
+            extra = item.get("metadata", {}).get("extraItem", item)
+            return extra.get("name", "extraItem")
+
+        # ================= ФОЛБЕК =================
+        return item.get("itemType", "unknown")
+
+
+    def format_items(items):
+        counts = defaultdict(int)
+
+        # Считаем количество для каждого ключа
+        for item in items:
+            key = get_item_key(item)
+            counts[key] += item.get("count", 1)
+
+        # Формируем текст
+        result_lines = []
+        for key, count in counts.items():
+            result_lines.append(f"• {key}: {count}")
+
+        if not result_lines:
+            return "Инвентарь пуст."
+
+        return "\n".join(result_lines)
 
     text_lines.append(format_items(lootboxes_stats["resultSkins"], "🎨", "Скины"))
     text_lines.append(format_items(lootboxes_stats["resultEggs"], "🥚", "Яйца"))
