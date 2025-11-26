@@ -310,7 +310,7 @@ def open_boxes():
     # Добавляем категории
     text_parts.extend(categories)
 
-    final_text = "\n\n".join(text_parts)
+    final_text = "\n".join(text_parts)
 
     send_telegram(final_text)
 
