@@ -18,15 +18,15 @@ APPLY_TIME = "03:00"
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://app.up.railway.app/webhook
 TG_TOKEN = os.environ.get("TG_TOKEN")        # токен для Gatto авторизации
 
+
 HEADERS = {
     "accept": "application/json, text/plain, */*",
     "authorization": f"Bearer {TG_TOKEN}",
     "content-type": "application/json",
-    "user-agent": "Mozilla/5.0",
     "referer": "https://gatto.pw/",
+    "user-agent": "Mozilla/5.0"
 }
 
-# Сессии
 tg = requests.Session()
 gatto = requests.Session()
 
@@ -35,8 +35,10 @@ gatto = requests.Session()
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+
 def log(msg):
     print(f"[{now()}] {msg}")
+
 
 def send_telegram(text):
     try:
@@ -61,6 +63,7 @@ def safe_request(url, payload=None):
         time.sleep(RETRY_DELAY)
     return None
 
+
 def single_request(url, payload=None):
     try:
         gatto.post(url, headers=HEADERS, json=payload or {}, timeout=GATTO_TIMEOUT)
@@ -68,14 +71,24 @@ def single_request(url, payload=None):
         pass
 
 
-# ================= API =================
+# ================= getAllStats Wrapper =================
 def get_all_stats():
     return safe_request("https://api.nl.gatto.pw/pet.getAllStats")
 
+
+def get_all_stats_before_action():
+    """Вызов getAllStats + задержка (как в рабочем коде)."""
+    get_all_stats()
+    time.sleep(2)
+
+
+# ================= API =================
 def feed_cat():
     log("Кормление котов…")
+    get_all_stats_before_action()  # ← обязательно
     safe_request("https://api.nl.gatto.pw/pet.feed", {"all": True})
     log("Кормление завершено ✓")
+
 
 def get_user_self():
     r = safe_request("https://api.nl.gatto.pw/user.getSelf")
@@ -92,51 +105,70 @@ def get_user_self():
     except:
         return []
 
+
 def play_game():
     log("Игры с питомцами…")
+    get_all_stats_before_action()  # ← обязательно
     safe_request("https://api.nl.gatto.pw/pet.play", {"all": True})
+
     pets = get_user_self()
     for pet in pets:
-        single_request("https://api.nl.gatto.pw/ads.watch",
-                       {"id": pet["_id"], "alias": "pet.play"})
+        single_request(
+            "https://api.nl.gatto.pw/ads.watch",
+            {"id": pet["_id"], "alias": "pet.play"}
+        )
     log("Игры завершены ✓")
+
 
 def format_prizes(data):
     lines = []
+
     for f in ["soft", "ton", "gton", "eventCurrency", "experience"]:
         if data.get(f):
             lines.append(f"{f}: {data[f]}")
+
     for s in data.get("resultSkins", []):
         lines.append(f"Skin: {s.get('name')} ({s.get('rarity')})")
+
     for e in data.get("resultEggs", []):
         lines.append(f"Egg: {e.get('allowedRegion')} ({e.get('rarity')})")
+
     for ess in data.get("resultEssence", []):
         lines.append(f"Essence: {ess.get('type')}")
+
     return "\n".join(lines) if lines else "Нет призов"
+
 
 def get_prize():
     log("Получение призов…")
+    get_all_stats_before_action()  # ← обязательно
     r = safe_request("https://api.nl.gatto.pw/pet.getPrize", {"all": True})
     if not r:
         log("Призы не получены (ошибка)")
         send_telegram("Призы не получены (ошибка).")
         return
+
     try:
         data = r.json()
         msg = format_prizes(data)
         send_telegram(f"🎁 Призы:\n{msg}")
     except Exception as e:
-        log(f"Ошибка при разборе JSON призов: {e}")
+        log(f"Ошибка parse JSON призов: {e}")
         send_telegram("Ошибка при получении призов.")
+
     log("Призы получены ✓")
+
 
 def get_pets_not_level_10():
     pets = get_user_self()
     return [{"id": p["_id"], "level": p.get("level", 0)} for p in pets if p.get("level", 0) < 10]
 
+
 def get_first_essence():
-    r = safe_request("https://api.nl.gatto.pw/warehouseGoods.getByLimit",
-                     {"type": "essences", "limit": 8, "offset": 0})
+    r = safe_request(
+        "https://api.nl.gatto.pw/warehouseGoods.getByLimit",
+        {"type": "essences", "limit": 8, "offset": 0}
+    )
     if not r:
         return None
     try:
@@ -145,9 +177,12 @@ def get_first_essence():
     except:
         return None
 
+
 def use_essence(pet_id, essence_id):
-    r = safe_request("https://api.nl.gatto.pw/essence.activate",
-                     {"petId": pet_id, "essenceId": essence_id})
+    r = safe_request(
+        "https://api.nl.gatto.pw/essence.activate",
+        {"petId": pet_id, "essenceId": essence_id}
+    )
     if not r:
         return None
     try:
@@ -155,33 +190,47 @@ def use_essence(pet_id, essence_id):
     except:
         return None
 
+
 def apply_essences_to_pets():
     pets = get_pets_not_level_10()
     send_telegram(f"✨ Начинаю применение эссенций. Питомцев ниже 10 уровня: {len(pets)}")
     log("Применение эссенций…")
+
     if not pets:
         send_telegram("Нет питомцев ниже 10 уровня.")
         return
+
     applied = 0
     improved_pets = 0
+
     for pet in pets:
         pet_id = pet["id"]
-        start_level = pet["level"]
+        current_level = pet["level"]
+
         while True:
             ess = get_first_essence()
             if not ess:
                 send_telegram(f"Эссенции закончились. Всего применено: {applied}")
                 return
+
             res = use_essence(pet_id, ess["_id"])
             if not res:
                 break
+
             applied += 1
-            new_level = res.get("level", start_level)
+            new_level = res.get("level", current_level)
+
             if new_level >= 10:
                 improved_pets += 1
                 break
-            start_level = new_level
-    send_telegram(f"✨ Прокачка завершена.\nПрименено эссенций: {applied}\nПитомцев улучшено: {improved_pets}")
+
+            current_level = new_level
+
+    send_telegram(
+        f"✨ Прокачка завершена.\n"
+        f"Применено эссенций: {applied}\n"
+        f"Питомцев улучшено: {improved_pets}"
+    )
     log("Эссенции применены ✓")
 
 
@@ -191,6 +240,7 @@ def scheduler_thread():
     schedule.every(29).minutes.do(lambda: Thread(target=get_prize).start())
     schedule.every(60).minutes.do(lambda: Thread(target=play_game).start())
     schedule.every().day.at(APPLY_TIME).do(lambda: Thread(target=apply_essences_to_pets).start())
+
     log("Планировщик запущен")
     while True:
         schedule.run_pending()
@@ -200,6 +250,7 @@ def scheduler_thread():
 # ================= Initial Cycle =================
 def start_initial_cycle():
     log("Стартовый цикл…")
+    get_all_stats_before_action()   # ← ВАЖНО
     feed_cat()
     get_prize()
     play_game()
@@ -209,26 +260,30 @@ def start_initial_cycle():
 # ================= Flask =================
 app = Flask(__name__)
 
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
     if not data or "message" not in data:
         return "ok"
+
     msg = data["message"]
     chat_id = msg.get("chat", {}).get("id")
     text = msg.get("text", "")
+
     if chat_id != CHAT_ID:
         return "ok"
+
     if text == "/essence":
         Thread(target=apply_essences_to_pets).start()
         send_telegram("Начинаю ⚡")
+
     return "ok"
 
 
 # ================= Start =================
 log("Бот запускается…")
 
-# Установка вебхука
 try:
     wh = requests.get(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}"
@@ -237,12 +292,8 @@ try:
 except Exception as e:
     log(f"Ошибка установки webhook: {e}")
 
-# Стартовый цикл
 Thread(target=start_initial_cycle, daemon=True).start()
-
-# Планировщик
 Thread(target=scheduler_thread, daemon=True).start()
 
-# Flask сервер
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
