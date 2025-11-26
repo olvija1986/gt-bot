@@ -403,6 +403,19 @@ def scheduler_thread():
         schedule.run_pending()
         time.sleep(1)
 
+def set_bot_commands():
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
+    commands = [
+        {"command": "start", "description": "Запуск бота"},
+        {"command": "box", "description": "Открыть все боксы"},
+        {"command": "essence", "description": "Применить эссенции"}
+    ]
+    try:
+        resp = requests.post(url, json={"commands": commands})
+        log(f"Команды меню обновлены: {resp.json()}")
+    except Exception as e:
+        log(f"Ошибка обновления команд меню: {e}")
+
 
 # ================= Initial Cycle =================
 def start_initial_cycle():
@@ -454,6 +467,7 @@ try:
     log(f"Webhook set: {wh.text}")
 except Exception as e:
     log(f"Ошибка установки webhook: {e}")
+set_bot_commands()
 
 Thread(target=start_initial_cycle, daemon=True).start()
 Thread(target=scheduler_thread, daemon=True).start()
