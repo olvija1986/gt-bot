@@ -175,6 +175,8 @@ def format_loot_stats(stats, total_boxes):
 # ================= /box командный процесс =================
 def open_boxes():
     """Открывает все боксы со склада и отправляет финальную статистику."""
+    from collections import defaultdict
+
     send_telegram("📦 Ищу боксы…")
 
     lootboxes_stats = {
@@ -242,11 +244,7 @@ def open_boxes():
 
         time.sleep(0.4)
 
-    # ------------------------------------------------
-    # ГРУППИРОВКА
-    # ------------------------------------------------
-    from collections import defaultdict
-
+    # ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
     def get_item_key(item):
         if item.get("itemType") == "egg":
             return f"{item.get('allowedRegion')}_{item.get('rarity')}"
@@ -270,35 +268,30 @@ def open_boxes():
 
     def format_category(items, title, icon):
         if not items:
-            return ""   # 🔥 Возвращаем пустую строку — категория не появится
-
+            return ""
         counts = defaultdict(int)
         for item in items:
             key = get_item_key(item)
             counts[key] += item.get("count", 1)
-
         lines = [f"{icon} {title}"]
         for k, c in counts.items():
             lines.append(f"• {k}: {c}")
-
         return "\n".join(lines)
 
-# ------------------------------------------------
-# Формирование текста
-# ------------------------------------------------
-categories = [
-    format_category(lootboxes_stats["resultSkins"], "Скины", "🎨"),
-    format_category(lootboxes_stats["resultEggs"], "Яйца", "🥚"),
-    format_category(lootboxes_stats["resultEssence"], "Эссенции", "✨"),
-    format_category(lootboxes_stats["resultMutagen"], "Мутеген", "🧪"),
-    format_category(lootboxes_stats["resultFoods"], "Еда", "🍖"),
-    format_category(lootboxes_stats["resultExtraItem"], "Доп. предметы", "📦"),
-    format_category(lootboxes_stats["resultLootBox"], "Лутбоксы", "🎁"),
-    format_category(lootboxes_stats["resultPremium"], "Премиум", "💎"),
-    format_category(lootboxes_stats["resultPromotionPromocodes"], "Промокоды", "🎟")
-]
+    # ================= ФОРМИРОВАНИЕ ФИНАЛЬНОГО ТЕКСТА =================
+    categories = [
+        format_category(lootboxes_stats["resultSkins"], "Скины", "🎨"),
+        format_category(lootboxes_stats["resultEggs"], "Яйца", "🥚"),
+        format_category(lootboxes_stats["resultEssence"], "Эссенции", "✨"),
+        format_category(lootboxes_stats["resultMutagen"], "Мутеген", "🧪"),
+        format_category(lootboxes_stats["resultFoods"], "Еда", "🍖"),
+        format_category(lootboxes_stats["resultExtraItem"], "Доп. предметы", "📦"),
+        format_category(lootboxes_stats["resultLootBox"], "Лутбоксы", "🎁"),
+        format_category(lootboxes_stats["resultPremium"], "Премиум", "💎"),
+        format_category(lootboxes_stats["resultPromotionPromocodes"], "Промокоды", "🎟")
+    ]
 
-# 🔥 Убираем пустые категории
+    # Убираем пустые категории
     categories = [c for c in categories if c.strip()]
 
     text_parts = [
@@ -314,7 +307,7 @@ categories = [
         "-------------------------------------",
     ]
 
-        # Добавляем категории, только если они существуют
+    # Добавляем категории
     text_parts.extend(categories)
 
     final_text = "\n\n".join(text_parts)
