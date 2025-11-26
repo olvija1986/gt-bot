@@ -173,10 +173,10 @@ def format_loot_stats(stats, total_boxes):
 
 
 # ================= /box командный процесс =================
-# ================= Команда /box =================
 def open_boxes():
-    """Открывает все боксы на складе и отправляет финальную статистику."""
+    """Открывает все боксы со склада и отправляет финальную статистику."""
     send_telegram("📦 Ищу боксы…")
+
     lootboxes_stats = {
         "soft": 0,
         "ton": 0,
@@ -194,26 +194,26 @@ def open_boxes():
         "resultFoods": []
     }
 
-    # 1. Получаем боксы со склада
+    # ---- 1. Получаем боксы ----
     r = safe_request(
         "https://api.nl.gatto.pw/warehouseGoods.getByLimit",
-        {"type": "lootBoxes", "limit": 8, "offset": 0}
+        {"type": "lootBoxes", "limit": 50, "offset": 0}
     )
     if not r:
-        send_telegram("Ошибка: не удалось получить список боксов.")
+        send_telegram("❌ Ошибка: не удалось получить список боксов.")
         return
 
     try:
         boxes = r.json()
     except:
-        send_telegram("Ошибка разбора JSON списка боксов.")
+        send_telegram("❌ Ошибка разбора JSON списка боксов.")
         return
 
     if not boxes:
         send_telegram("📦 На складе нет боксов.")
         return
 
-    # 2. Открываем каждый бокс
+    # ---- 2. Открываем бокс за боксом ----
     for box in boxes:
         box_id = box.get("_id")
         if not box_id:
@@ -222,105 +222,91 @@ def open_boxes():
         resp = safe_request("https://api.nl.gatto.pw/lootBox.open", {"id": box_id})
         if not resp:
             continue
+
         try:
             data = resp.json()
         except:
             continue
 
-        # 3. Суммируем валюту
+        # Валюта
         for cur in ["soft", "ton", "gton", "eventCurrency", "experience"]:
             lootboxes_stats[cur] += data.get(cur, 0)
 
-        # 4. Добавляем массивы предметов
-        for arr_field in [
-            "resultSkins", "resultEggs", "resultEssence",
-            "resultLootBox", "resultPremium", "resultPromotionPromocodes",
+        # Категории
+        for arr in [
+            "resultSkins", "resultEggs", "resultEssence", "resultLootBox",
+            "resultPremium", "resultPromotionPromocodes",
             "resultExtraItem", "resultMutagen", "resultFoods"
         ]:
-            lootboxes_stats[arr_field].extend(data.get(arr_field, []))
-        time.sleep(0.5)  # пауза между открытиями
+            lootboxes_stats[arr].extend(data.get(arr, []))
 
-    # 5. Форматируем финальный текст
-    text_lines = ["📦 Финальная статистика", "-------------------------------------"]
-    text_lines.append(f"🎁 Открыто боксов: {len(boxes)}")
-    text_lines.append("-------------------------------------")
+        time.sleep(0.4)
 
-    # Валюта
-    for cur in ["soft", "ton", "gton", "eventCurrency", "experience"]:
-        text_lines.append(f"💰 {cur}: {lootboxes_stats[cur]}")
-    text_lines.append("-------------------------------------")
-
-    # Предметы по категориям
+    # ------------------------------------------------
+    # ГРУППИРОВКА
+    # ------------------------------------------------
     from collections import defaultdict
 
     def get_item_key(item):
-        # ================= МУТАГЕН =================
-        if item.get("category") == "mutagens" or item.get("itemType") == "mutagen":
-            mut = item.get("metadata", {}).get("mutagen", item)
-            return mut.get("probability", "mutagen")
+        if item.get("itemType") == "egg":
+            return f"{item.get('allowedRegion')}_{item.get('rarity')}"
+        if item.get("itemType") == "skin":
+            return item.get("itemName")
+        if item.get("itemType") == "food":
+            return item.get("name")
+        if item.get("itemType") == "mutagen":
+            return item.get("probability")
+        if item.get("itemType") == "essence":
+            return item.get("type")
+        if item.get("itemType") == "extraItem":
+            return item.get("name")
+        if item.get("itemType") == "lootBox":
+            return item.get("name")
+        if item.get("itemType") == "premiumItem":
+            return item.get("name")
+        if item.get("itemType") == "promotionPromocode":
+            return item.get("name")
+        return "unknown"
 
-        # ================= ЕДА =================
-        if item.get("category") == "foods" or item.get("itemType") == "food":
-            food = item.get("food", item)
-            return food.get("name", "food")
-
-        # ================= СКИНЫ =================
-        if item.get("category") == "skins" or item.get("itemType") == "skin":
-            return item.get("itemName") or item.get("name") or "skin"
-
-        # ================= ЯЙЦА =================
-        if item.get("category") == "eggs" or item.get("itemType") == "egg":
-            region = item.get("allowedRegion", "unknownRegion")
-            rarity = item.get("rarity", "unknownRarity")
-            return f"{region}_{rarity}"
-
-        # ================= ЭССЕНЦИИ =================
-        if item.get("category") == "essences" or item.get("itemType") == "essence":
-            return item.get("type", "essence")
-
-        # ================= ДОП. ТОВАРЫ =================
-        if item.get("category") == "extraItems" or item.get("itemType") == "extraItem":
-            extra = item.get("metadata", {}).get("extraItem", item)
-            return extra.get("name", "extraItem")
-
-        # ================= ФОЛБЕК =================
-        return item.get("itemType", "unknown")
-
-
-    def format_items(items):
+    def format_category(items, title, icon):
+        if not items:
+            return f"{icon} {title}\n• Пусто"
         counts = defaultdict(int)
-
-        # Считаем количество для каждого ключа
         for item in items:
             key = get_item_key(item)
             counts[key] += item.get("count", 1)
+        lines = [f"{icon} {title}"]
+        for k, c in counts.items():
+            lines.append(f"• {k}: {c}")
+        return "\n".join(lines)
 
-        # Формируем текст
-        result_lines = []
-        for key, count in counts.items():
-            result_lines.append(f"• {key}: {count}")
+    # ------------------------------------------------
+    # Формирование текста
+    # ------------------------------------------------
+    text_parts = [
+        f"📦 Финальная статистика\n-------------------------------------",
+        f"🎁 Открыто боксов: {len(boxes)}",
+        "-------------------------------------",
+        f"💰 soft: {lootboxes_stats['soft']}",
+        f"💰 ton: {lootboxes_stats['ton']}",
+        f"💰 gton: {lootboxes_stats['gton']}",
+        f"💰 eventCurrency: {lootboxes_stats['eventCurrency']}",
+        f"💰 experience: {lootboxes_stats['experience']}",
+        "-------------------------------------",
+        format_category(lootboxes_stats["resultSkins"], "Скины", "🎨"),
+        format_category(lootboxes_stats["resultEggs"], "Яйца", "🥚"),
+        format_category(lootboxes_stats["resultEssence"], "Эссенции", "✨"),
+        format_category(lootboxes_stats["resultMutagen"], "Мутеген", "🧪"),
+        format_category(lootboxes_stats["resultFoods"], "Еда", "🍖"),
+        format_category(lootboxes_stats["resultExtraItem"], "Доп. предметы", "📦"),
+        format_category(lootboxes_stats["resultLootBox"], "Лутбоксы", "🎁"),
+        format_category(lootboxes_stats["resultPremium"], "Премиум", "💎"),
+        format_category(lootboxes_stats["resultPromotionPromocodes"], "Промокоды", "🎟")
+    ]
 
-        if not result_lines:
-            return "Инвентарь пуст."
+    final_text = "\n\n".join(text_parts)
 
-        return "\n".join(result_lines)
-
-    text_lines.append(format_items(lootboxes_stats["resultSkins"], "🎨", "Скины"))
-    text_lines.append(format_items(lootboxes_stats["resultEggs"], "🥚", "Яйца"))
-    text_lines.append(format_items(lootboxes_stats["resultEssence"], "✨", "Эссенция"))
-    text_lines.append(format_items(lootboxes_stats["resultLootBox"], "🎁", "Боксы (дроп)"))
-    text_lines.append(format_items(lootboxes_stats["resultPremium"], "💎", "Премиум"))
-    text_lines.append(format_items(lootboxes_stats["resultPromotionPromocodes"], "🎟", "Промокоды"))
-    text_lines.append(format_items(lootboxes_stats["resultExtraItem"], "📦", "Доп. предметы"))
-    text_lines.append(format_items(lootboxes_stats["resultMutagen"], "🧪", "Мутаген"))
-    text_lines.append(format_items(lootboxes_stats["resultFoods"], "🍖", "Еда"))
-
-    final_text = "\n".join([line for line in text_lines if line])
-
-    # 6. Разбиваем на части ≤ 4000 символов
-    max_len = 4000
-    for i in range(0, len(final_text), max_len):
-        send_telegram(final_text[i:i+max_len])
+    send_telegram(final_text)
 
 # ================= getPrize и Essences =================
 
