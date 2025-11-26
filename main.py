@@ -215,7 +215,7 @@ def open_boxes():
 
     # 2. Открываем каждый бокс
     for box in boxes:
-        box_id = box.get("metadata", {}).get("lootBox", {}).get("_id")
+        box_id = box.get("_id")
         if not box_id:
             continue
 
@@ -238,6 +238,7 @@ def open_boxes():
             "resultExtraItem", "resultMutagen", "resultFoods"
         ]:
             lootboxes_stats[arr_field].extend(data.get(arr_field, []))
+        time.sleep(0.5)  # пауза между открытиями
 
     # 5. Форматируем финальный текст
     text_lines = ["📦 Финальная статистика", "-------------------------------------"]
