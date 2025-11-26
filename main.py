@@ -245,68 +245,81 @@ def open_boxes():
     # ------------------------------------------------
     # ГРУППИРОВКА
     # ------------------------------------------------
-    from collections import defaultdict
+from collections import defaultdict
 
-    def get_item_key(item):
-        if item.get("itemType") == "egg":
-            return f"{item.get('allowedRegion')}_{item.get('rarity')}"
-        if item.get("itemType") == "skin":
-            return item.get("itemName")
-        if item.get("itemType") == "food":
-            return item.get("name")
-        if item.get("itemType") == "mutagen":
-            return item.get("probability")
-        if item.get("itemType") == "essence":
-            return item.get("type")
-        if item.get("itemType") == "extraItem":
-            return item.get("name")
-        if item.get("itemType") == "lootBox":
-            return item.get("name")
-        if item.get("itemType") == "premiumItem":
-            return item.get("name")
-        if item.get("itemType") == "promotionPromocode":
-            return item.get("name")
-        return "unknown"
+def get_item_key(item):
+    if item.get("itemType") == "egg":
+        return f"{item.get('allowedRegion')}_{item.get('rarity')}"
+    if item.get("itemType") == "skin":
+        return item.get("itemName")
+    if item.get("itemType") == "food":
+        return item.get("name")
+    if item.get("itemType") == "mutagen":
+        return item.get("probability")
+    if item.get("itemType") == "essence":
+        return item.get("type")
+    if item.get("itemType") == "extraItem":
+        return item.get("name")
+    if item.get("itemType") == "lootBox":
+        return item.get("name")
+    if item.get("itemType") == "premiumItem":
+        return item.get("name")
+    if item.get("itemType") == "promotionPromocode":
+        return item.get("name")
+    return "unknown"
 
-    def format_category(items, title, icon):
-        if not items:
-            return f"{icon} {title}\n• Пусто"
-        counts = defaultdict(int)
-        for item in items:
-            key = get_item_key(item)
-            counts[key] += item.get("count", 1)
-        lines = [f"{icon} {title}"]
-        for k, c in counts.items():
-            lines.append(f"• {k}: {c}")
-        return "\n".join(lines)
+def format_category(items, title, icon):
+    if not items:
+        return ""   # 🔥 Возвращаем пустую строку — категория не появится
 
-    # ------------------------------------------------
-    # Формирование текста
-    # ------------------------------------------------
-    text_parts = [
-        f"📦 Финальная статистика\n-------------------------------------",
-        f"🎁 Открыто боксов: {len(boxes)}",
-        "-------------------------------------",
-        f"💰 soft: {lootboxes_stats['soft']}",
-        f"💰 ton: {lootboxes_stats['ton']}",
-        f"💰 gton: {lootboxes_stats['gton']}",
-        f"💰 eventCurrency: {lootboxes_stats['eventCurrency']}",
-        f"💰 experience: {lootboxes_stats['experience']}",
-        "-------------------------------------",
-        format_category(lootboxes_stats["resultSkins"], "Скины", "🎨"),
-        format_category(lootboxes_stats["resultEggs"], "Яйца", "🥚"),
-        format_category(lootboxes_stats["resultEssence"], "Эссенции", "✨"),
-        format_category(lootboxes_stats["resultMutagen"], "Мутеген", "🧪"),
-        format_category(lootboxes_stats["resultFoods"], "Еда", "🍖"),
-        format_category(lootboxes_stats["resultExtraItem"], "Доп. предметы", "📦"),
-        format_category(lootboxes_stats["resultLootBox"], "Лутбоксы", "🎁"),
-        format_category(lootboxes_stats["resultPremium"], "Премиум", "💎"),
-        format_category(lootboxes_stats["resultPromotionPromocodes"], "Промокоды", "🎟")
-    ]
+    counts = defaultdict(int)
+    for item in items:
+        key = get_item_key(item)
+        counts[key] += item.get("count", 1)
 
-    final_text = "\n\n".join(text_parts)
+    lines = [f"{icon} {title}"]
+    for k, c in counts.items():
+        lines.append(f"• {k}: {c}")
 
-    send_telegram(final_text)
+    return "\n".join(lines)
+
+# ------------------------------------------------
+# Формирование текста
+# ------------------------------------------------
+categories = [
+    format_category(lootboxes_stats["resultSkins"], "Скины", "🎨"),
+    format_category(lootboxes_stats["resultEggs"], "Яйца", "🥚"),
+    format_category(lootboxes_stats["resultEssence"], "Эссенции", "✨"),
+    format_category(lootboxes_stats["resultMutagen"], "Мутеген", "🧪"),
+    format_category(lootboxes_stats["resultFoods"], "Еда", "🍖"),
+    format_category(lootboxes_stats["resultExtraItem"], "Доп. предметы", "📦"),
+    format_category(lootboxes_stats["resultLootBox"], "Лутбоксы", "🎁"),
+    format_category(lootboxes_stats["resultPremium"], "Премиум", "💎"),
+    format_category(lootboxes_stats["resultPromotionPromocodes"], "Промокоды", "🎟")
+]
+
+# 🔥 Убираем пустые категории
+categories = [c for c in categories if c.strip()]
+
+text_parts = [
+    "📦 Финальная статистика",
+    "-------------------------------------",
+    f"🎁 Открыто боксов: {len(boxes)}",
+    "-------------------------------------",
+    f"💰 soft: {lootboxes_stats['soft']}",
+    f"💰 ton: {lootboxes_stats['ton']}",
+    f"💰 gton: {lootboxes_stats['gton']}",
+    f"💰 eventCurrency: {lootboxes_stats['eventCurrency']}",
+    f"💰 experience: {lootboxes_stats['experience']}",
+    "-------------------------------------",
+]
+
+    # Добавляем категории, только если они существуют
+text_parts.extend(categories)
+
+final_text = "\n\n".join(text_parts)
+
+send_telegram(final_text)
 
 # ================= getPrize и Essences =================
 
