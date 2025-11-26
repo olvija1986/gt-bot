@@ -15,9 +15,8 @@ MAX_RETRIES = 3
 RETRY_DELAY = 3
 APPLY_TIME = "03:00"
 
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://app.up.railway.app/webhook
-TG_TOKEN = os.environ.get("TG_TOKEN")        # токен для Gatto авторизации
-
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+TG_TOKEN = os.environ.get("TG_TOKEN")
 
 HEADERS = {
     "accept": "application/json, text/plain, */*",
@@ -30,15 +29,12 @@ HEADERS = {
 tg = requests.Session()
 gatto = requests.Session()
 
-
 # ================= Утилиты =================
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-
 def log(msg):
     print(f"[{now()}] {msg}")
-
 
 def send_telegram(text):
     try:
@@ -50,8 +46,7 @@ def send_telegram(text):
     except Exception as e:
         log(f"Telegram send error: {e}")
 
-
-# ================= Запросы к Gatto =================
+# ================= Запросы =================
 def safe_request(url, payload=None):
     for _ in range(MAX_RETRIES):
         try:
@@ -63,32 +58,26 @@ def safe_request(url, payload=None):
         time.sleep(RETRY_DELAY)
     return None
 
-
 def single_request(url, payload=None):
     try:
         gatto.post(url, headers=HEADERS, json=payload or {}, timeout=GATTO_TIMEOUT)
     except:
         pass
 
-
 # ================= getAllStats Wrapper =================
 def get_all_stats():
     return safe_request("https://api.nl.gatto.pw/pet.getAllStats")
 
-
 def get_all_stats_before_action():
-    """Вызов getAllStats + задержка (как в рабочем коде)."""
     get_all_stats()
     time.sleep(2)
-
 
 # ================= API =================
 def feed_cat():
     log("Кормление котов…")
-    get_all_stats_before_action()  # ← обязательно
+    get_all_stats_before_action()
     safe_request("https://api.nl.gatto.pw/pet.feed", {"all": True})
     log("Кормление завершено ✓")
-
 
 def get_user_self():
     r = safe_request("https://api.nl.gatto.pw/user.getSelf")
@@ -105,21 +94,16 @@ def get_user_self():
     except:
         return []
 
-
 def play_game():
     log("Игры с питомцами…")
-    get_all_stats_before_action()  # ← обязательно
+    get_all_stats_before_action()
     safe_request("https://api.nl.gatto.pw/pet.play", {"all": True})
-
     pets = get_user_self()
     for pet in pets:
-        single_request(
-            "https://api.nl.gatto.pw/ads.watch",
-            {"id": pet["_id"], "alias": "pet.play"}
-        )
+        single_request("https://api.nl.gatto.pw/ads.watch", {"id": pet["_id"], "alias": "pet.play"})
     log("Игры завершены ✓")
 
-
+# ================= Формат наград =================
 def format_prizes(data):
     lines = []
 
@@ -138,31 +122,24 @@ def format_prizes(data):
 
     return "\n".join(lines) if lines else "Нет призов"
 
-
 def get_prize():
     log("Получение призов…")
-    get_all_stats_before_action()  # ← обязательно
+    get_all_stats_before_action()
     r = safe_request("https://api.nl.gatto.pw/pet.getPrize", {"all": True})
     if not r:
-        log("Призы не получены (ошибка)")
         send_telegram("Призы не получены (ошибка).")
         return
 
     try:
         data = r.json()
-        msg = format_prizes(data)
-        send_telegram(f"🎁 Призы:\n{msg}")
-    except Exception as e:
-        log(f"Ошибка parse JSON призов: {e}")
+        send_telegram(f"🎁 Призы:\n{format_prizes(data)}")
+    except:
         send_telegram("Ошибка при получении призов.")
 
-    log("Призы получены ✓")
-
-
+# ================= Эссенции =================
 def get_pets_not_level_10():
     pets = get_user_self()
     return [{"id": p["_id"], "level": p.get("level", 0)} for p in pets if p.get("level", 0) < 10]
-
 
 def get_first_essence():
     r = safe_request(
@@ -177,35 +154,26 @@ def get_first_essence():
     except:
         return None
 
-
 def use_essence(pet_id, essence_id):
     r = safe_request(
         "https://api.nl.gatto.pw/essence.activate",
         {"petId": pet_id, "essenceId": essence_id}
     )
-    if not r:
-        return None
-    try:
-        return r.json()
-    except:
-        return None
-
+    return r.json() if r else None
 
 def apply_essences_to_pets():
     pets = get_pets_not_level_10()
     send_telegram(f"✨ Начинаю применение эссенций. Питомцев ниже 10 уровня: {len(pets)}")
-    log("Применение эссенций…")
-
     if not pets:
         send_telegram("Нет питомцев ниже 10 уровня.")
         return
 
     applied = 0
-    improved_pets = 0
+    improved = 0
 
     for pet in pets:
         pet_id = pet["id"]
-        current_level = pet["level"]
+        level = pet["level"]
 
         while True:
             ess = get_first_essence()
@@ -218,21 +186,80 @@ def apply_essences_to_pets():
                 break
 
             applied += 1
-            new_level = res.get("level", current_level)
+            new_level = res.get("level", level)
 
             if new_level >= 10:
-                improved_pets += 1
+                improved += 1
                 break
 
-            current_level = new_level
+            level = new_level
 
     send_telegram(
         f"✨ Прокачка завершена.\n"
         f"Применено эссенций: {applied}\n"
-        f"Питомцев улучшено: {improved_pets}"
+        f"Питомцев улучшено: {improved}"
     )
-    log("Эссенции применены ✓")
 
+# ================= Боксы =================
+def open_all_boxes():
+    log("Открываю все боксы…")
+
+    stats = {
+        "soft": 0,
+        "ton": 0,
+        "gton": 0,
+        "eventCurrency": 0,
+        "experience": 0,
+        "resultSkins": [],
+        "resultEggs": [],
+        "resultEssence": [],
+        "resultLootBox": [],
+        "resultPremium": [],
+        "resultPromotionPromocodes": [],
+        "resultExtraItem": [],
+        "resultMutagen": [],
+        "resultFoods": []
+    }
+
+    offset = 0
+    limit = 8
+    opened_count = 0
+    categories = stats.keys()
+
+    while True:
+        resp = safe_request(
+            "https://api.nl.gatto.pw/warehouseGoods.getByLimit",
+            {"type": "lootBoxes", "limit": limit, "offset": offset}
+        )
+        if not resp:
+            break
+
+        boxes = resp.json()
+        if not boxes:
+            break
+
+        for box in boxes:
+            opened_count += 1
+            drop = safe_request(
+                "https://api.nl.gatto.pw/lootBox.open",
+                {"id": box.get("_id")}
+            )
+            if not drop:
+                continue
+
+            drop = drop.json()
+
+            for cat in categories:
+                val = drop.get(cat)
+                if isinstance(val, int):
+                    stats[cat] += val
+                elif isinstance(val, list):
+                    stats[cat].extend(val)
+
+        offset += limit
+
+    send_telegram(f"📦 Открыто боксов: {opened_count}\n{stats}")
+    log("Боксы завершены ✓")
 
 # ================= Scheduler =================
 def scheduler_thread():
@@ -246,20 +273,17 @@ def scheduler_thread():
         schedule.run_pending()
         time.sleep(1)
 
-
 # ================= Initial Cycle =================
 def start_initial_cycle():
     log("Стартовый цикл…")
-    get_all_stats_before_action()   # ← ВАЖНО
+    get_all_stats_before_action()
     feed_cat()
     get_prize()
     play_game()
     log("Стартовый цикл завершён ✓")
 
-
 # ================= Flask =================
 app = Flask(__name__)
-
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -278,8 +302,11 @@ def webhook():
         Thread(target=apply_essences_to_pets).start()
         send_telegram("Начинаю ⚡")
 
-    return "ok"
+    elif text == "/box":
+        send_telegram("📦 Начинаю открывать боксы…")
+        Thread(target=open_all_boxes).start()
 
+    return "ok"
 
 # ================= Start =================
 log("Бот запускается…")
