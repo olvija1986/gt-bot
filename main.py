@@ -406,9 +406,9 @@ def scheduler_thread():
 def set_bot_commands():
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
     commands = [
-        {"command": "start", "description": "Запуск бота"},
-        {"command": "box", "description": "Открыть все боксы"},
-        {"command": "essence", "description": "Применить эссенции"}
+        {"command": "start", "description": "go"},
+        {"command": "box", "description": "box open"},
+        {"command": "essence", "description": "essence"}
     ]
     try:
         resp = requests.post(url, json={"commands": commands})
