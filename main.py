@@ -388,6 +388,7 @@ def apply_essences_to_pets():
         send_telegram("Нет питомцев ниже 10 уровня.")
         return
 
+
     applied = 0
     improved_pets = 0
 
