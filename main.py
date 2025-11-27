@@ -433,7 +433,6 @@ def scheduler_thread():
     schedule.every(2).minutes.do(lambda: Thread(target=feed_cat).start())
     schedule.every(29).minutes.do(lambda: Thread(target=get_prize).start())
     schedule.every(60).minutes.do(lambda: Thread(target=play_game).start())
-    schedule.every().day.at(APPLY_TIME).do(lambda: Thread(target=apply_essences_to_pets).start())
 
     log("Планировщик запущен")
     while True:
