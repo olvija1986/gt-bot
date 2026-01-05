@@ -314,6 +314,78 @@ def open_boxes():
 
     send_telegram(final_text)
 
+# ================= Daily Prize =================
+
+def format_daily_prize(data):
+    """Форматирует ответ от getDailyPrize для отправки в Telegram."""
+    if not data:
+        return "❌ Не удалось получить ежедневный подарок"
+    
+    prize_type = data.get("type", "unknown")
+    rarity = data.get("rarity", "")
+    value = data.get("value", 0)
+    photo_url = data.get("photoUrl", "")
+    
+    # Эмодзи для типов
+    type_emoji = {
+        "essences": "✨",
+        "soft": "💰",
+        "ton": "💎",
+        "gton": "💎",
+        "experience": "⭐",
+        "eventCurrency": "🎫"
+    }
+    
+    emoji = type_emoji.get(prize_type, "🎁")
+    
+    # Формируем сообщение
+    lines = [
+        f"{emoji} Ежедневный подарок получен!",
+        "-------------------------------------",
+        f"Тип: {prize_type}",
+    ]
+    
+    if rarity:
+        rarity_ru = {
+            "common": "Обычный",
+            "medium": "Средний",
+            "rare": "Редкий",
+            "epic": "Эпический",
+            "legendary": "Легендарный"
+        }.get(rarity, rarity)
+        lines.append(f"Редкость: {rarity_ru}")
+    
+    if value:
+        lines.append(f"Количество: {value}")
+    
+    if photo_url:
+        lines.append(f"Фото: {photo_url}")
+    
+    return "\n".join(lines)
+
+
+def get_daily_prize():
+    """Получает ежедневный подарок через user.getDailyPrize."""
+    log("Получение ежедневного подарка…")
+    get_all_stats_before_action()
+    
+    r = safe_request("https://api.nl.gatto.pw/user.getDailyPrize", {})
+    
+    if not r:
+        send_telegram("❌ Ошибка: не удалось получить ежедневный подарок.")
+        log("Ежедневный подарок не получен (ошибка)")
+        return
+    
+    try:
+        data = r.json()
+        msg = format_daily_prize(data)
+        send_telegram(msg)
+        log("Ежедневный подарок получен ✓")
+    except Exception as e:
+        send_telegram(f"❌ Ошибка при разборе ежедневного подарка: {e}")
+        log(f"Ошибка при разборе ежедневного подарка: {e}")
+
+
 # ================= getPrize и Essences =================
 
 def format_prizes(data):
@@ -433,6 +505,7 @@ def scheduler_thread():
     schedule.every(2).minutes.do(lambda: Thread(target=feed_cat).start())
     schedule.every(29).minutes.do(lambda: Thread(target=get_prize).start())
     schedule.every(60).minutes.do(lambda: Thread(target=play_game).start())
+    schedule.every().day.at("02:00").do(lambda: Thread(target=get_daily_prize).start())
 
     log("Планировщик запущен")
     while True:
