@@ -533,6 +533,7 @@ def start_initial_cycle():
     feed_cat()
     get_prize()
     play_game()
+    get_daily_prize()
     log("Стартовый цикл завершён ✓")
 
 
