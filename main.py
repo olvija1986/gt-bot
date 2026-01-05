@@ -418,9 +418,6 @@ def format_daily_prize(data):
     if value:
         lines.append(f"Количество: {value}")
     
-    if photo_url:
-        lines.append(f"Фото: {photo_url}")
-    
     return "\n".join(lines)
 
 
