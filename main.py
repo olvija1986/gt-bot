@@ -325,10 +325,31 @@ def format_daily_prize(data):
     rarity = data.get("rarity", "")
     value = data.get("value", 0)
     photo_url = data.get("photoUrl", "")
+    allowed_region = data.get("allowedRegion", "")
+    name = data.get("name", "")
+    item_name = data.get("itemName", "")
+    probability = data.get("probability", "")
     
-    # Эмодзи для типов
+    # Эмодзи для типов (соответствует категориям из лутбоксов)
     type_emoji = {
         "essences": "✨",
+        "resultEssence": "✨",
+        "eggs": "🥚",
+        "resultEggs": "🥚",
+        "skins": "🎨",
+        "resultSkins": "🎨",
+        "mutagen": "🧪",
+        "resultMutagen": "🧪",
+        "foods": "🍖",
+        "resultFoods": "🍖",
+        "extraItem": "📦",
+        "resultExtraItem": "📦",
+        "lootBox": "🎁",
+        "resultLootBox": "🎁",
+        "premium": "💎",
+        "resultPremium": "💎",
+        "promotionPromocodes": "🎟",
+        "resultPromotionPromocodes": "🎟",
         "soft": "💰",
         "ton": "💎",
         "gton": "💎",
@@ -342,18 +363,57 @@ def format_daily_prize(data):
     lines = [
         f"{emoji} Ежедневный подарок получен!",
         "-------------------------------------",
-        f"Тип: {prize_type}",
     ]
     
-    if rarity:
-        rarity_ru = {
-            "common": "Обычный",
-            "medium": "Средний",
-            "rare": "Редкий",
-            "epic": "Эпический",
-            "legendary": "Легендарный"
-        }.get(rarity, rarity)
-        lines.append(f"Редкость: {rarity_ru}")
+    # Обработка разных типов подарков
+    if prize_type in ["eggs", "resultEggs"]:
+        if allowed_region:
+            lines.append(f"Яйцо: {allowed_region}")
+        else:
+            lines.append(f"Тип: {prize_type}")
+        if rarity:
+            lines.append(f"Редкость: {rarity}")
+    elif prize_type in ["skins", "resultSkins"]:
+        if item_name:
+            lines.append(f"Скин: {item_name}")
+        elif name:
+            lines.append(f"Скин: {name}")
+        else:
+            lines.append(f"Тип: {prize_type}")
+        if rarity:
+            lines.append(f"Редкость: {rarity}")
+    elif prize_type in ["foods", "resultFoods"]:
+        if name:
+            lines.append(f"Еда: {name}")
+        else:
+            lines.append(f"Тип: {prize_type}")
+    elif prize_type in ["mutagen", "resultMutagen"]:
+        if probability:
+            lines.append(f"Мутаген: {probability}")
+        elif name:
+            lines.append(f"Мутаген: {name}")
+        else:
+            lines.append(f"Тип: {prize_type}")
+    elif prize_type in ["essences", "resultEssence"]:
+        if name:
+            lines.append(f"Эссенция: {name}")
+        else:
+            lines.append(f"Тип: {prize_type}")
+        if rarity:
+            lines.append(f"Редкость: {rarity}")
+    elif prize_type in ["extraItem", "resultExtraItem", "lootBox", "resultLootBox", 
+                         "premium", "resultPremium", "promotionPromocodes", "resultPromotionPromocodes"]:
+        if name:
+            lines.append(f"{prize_type}: {name}")
+        else:
+            lines.append(f"Тип: {prize_type}")
+        if rarity:
+            lines.append(f"Редкость: {rarity}")
+    else:
+        # Для валюты и других типов
+        lines.append(f"Тип: {prize_type}")
+        if rarity:
+            lines.append(f"Редкость: {rarity}")
     
     if value:
         lines.append(f"Количество: {value}")
