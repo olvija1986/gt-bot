@@ -61,6 +61,22 @@ HEADERS_HTTP = {
 # ══════════════════════════════════════════════════════════
 #  Физика прыжка (порт physics.ts)
 # ══════════════════════════════════════════════════════════
+def validate_token() -> bool:
+    """Проверяет что TG_TOKEN рабочий через обычный HTTP запрос."""
+    try:
+        r = requests.post(
+            f"{API_BASE}/user.getSelf",
+            headers=HEADERS_HTTP,
+            json={},
+            timeout=10
+        )
+        logger.info(f"[token check] status={r.status_code} response={r.text[:100]}")
+        return r.status_code == 200
+    except Exception as e:
+        logger.error(f"[token check] error: {e}")
+        return False
+
+
 def ticks_to_reach_height(jump_power: float, gravity: float, target_height: float) -> int:
     y, speed_y = 0.0, jump_power
     for tick in range(1, 200):
@@ -169,8 +185,13 @@ class SioClient:
         # Engine.IO open: 0{sid, pingInterval, ...}
         if msg.startswith("0") and not self._eio_open_received:
             self._eio_open_received = True
-            log.info("[SioClient] EIO open received, sending SIO auth...")
-            self._ws_send(f'40{{"token":"Bearer {self.token}"}}')
+            log.info(f"[SioClient] EIO open received. Token starts with: {self.token[:60]!r}")
+            auth = f'40{{"token":"Bearer {self.token}"}}' 
+            log.info(f"[SioClient] Sending auth: {auth[:100]}")
+            self._ws_send(auth)
+            # x-info шлём отдельно, после небольшой паузы
+            import time as _t
+            _t.sleep(0.1)
             self.emit("x-info", "Amsterdam")
             return
 
@@ -519,6 +540,11 @@ class AutoPlayer:
         return self._thread is not None and self._thread.is_alive()
 
     def _run(self):
+        logger.info(f"[AutoPlayer] TG_TOKEN prefix: {TG_TOKEN[:60]!r}")
+        if not validate_token():
+            self._notify("error", {"msg": "❌ TG_TOKEN не работает — проверь переменную окружения."})
+            return
+
         self.user_id = get_my_user_id()
         self.pet_id  = get_my_pet_id()
 
