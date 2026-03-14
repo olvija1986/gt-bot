@@ -172,6 +172,11 @@ class SioClient:
         self._ack += 1
         self._ws_send(str(n) + json.dumps([event, data], ensure_ascii=False, separators=(',', ':')))
 
+    def emit_with_null(self, event: str, data):
+        """42["event", data, null] — формат из реального клиентского трафика."""
+        raw = "42" + json.dumps([event, data, None], ensure_ascii=False, separators=(',', ':'))
+        self._ws_send(raw)
+
     def _ws_send(self, raw: str):
         try:
             if self._ws:
@@ -362,18 +367,23 @@ class GameSession:
                     pass  # ждём карту
                 elif self.mode == "race" and self._should_act("race"):
                     payload = self._make_action_payload()
-                    self._client.emit("engine.jump", payload)
+                    self._client.emit_with_null("engine.jump", payload)
                     logger.info(f"[{self.game_id}] → JUMP sent: {payload}")
                     setattr(self, '_first_jump_done', True)
                     self.pet_status = "jumping"
-                    time.sleep(0.4)
+                    # Ждём пока прыжок завершится (~1.5с), потом снова running
+                    time.sleep(1.5)
+                    if self.pet_status == "jumping":
+                        self.pet_status = "running"
                 elif self.mode == "swim" and self._should_act("swim"):
                     payload = self._make_action_payload()
-                    self._client.emit("engine.dive", payload)
+                    self._client.emit_with_null("engine.dive", payload)
                     logger.info(f"[{self.game_id}] → DIVE sent: {payload}")
                     setattr(self, '_first_jump_done', True)
                     self.pet_status = "diving"
-                    time.sleep(0.4)
+                    time.sleep(1.5)
+                    if self.pet_status == "diving":
+                        self.pet_status = "running"
             time.sleep(0.08)
 
     def _should_act(self, mode: str) -> bool:
