@@ -356,7 +356,7 @@ class GameSession:
         # бот с agility=77 проходит ~600px за ~1сек = 0.6px/ms
         # бот с agility=86 проходит ~600px за ~0.8сек = 0.75px/ms  
         # наш пет agility~53 → примерно 0.45px/ms
-        self.speed_per_ms  = 0.45
+        self.speed_per_ms  = 3.026 / 16  # дефолт для agility=53
         self.result        = None
         self._done         = threading.Event()
 
@@ -415,10 +415,11 @@ class GameSession:
             self.barriers = [b for b in self.barriers if b["x"] + self.width_barrier > pet_front]
             return False
 
-        # trigger: за сколько px до барьера надо прыгать
-        # Из реального трафика: прыжок при x≈560-588 к барьеру x=593 → dist≈5-33
-        # Возьмём ~80px запаса
-        trigger = 100
+        # trigger = speed_px_per_tick * 20 тиков запаса
+        # Из реального трафика: Foxy(agi=53) прыгал при dist=52-80px
+        # speed_px_per_tick = agility * 0.032 + 1.33
+        speed_px_per_tick = self.speed_per_ms * 16
+        trigger = speed_px_per_tick * 20   # ~320ms запас до барьера
 
         logger.info(f"[{self.game_id}] CHECK est_x={estimated_x:.0f} dist={dist:.0f} "
                     f"trigger={trigger} barrier_x={next_b['x']} elapsed={elapsed_ms:.0f}ms "
@@ -442,11 +443,14 @@ class GameSession:
         self._client = client
 
         def on_open():
-            logger.info(f"[{self.game_id}] WS игры открыт, подключаемся…")
-            client.emit_ack("game.connect", {
+            logger.info(f"[{self.game_id}] WS игры открыт, подключаемся… petId={self.pet_id}")
+            payload = {
                 "gameId":           self.game_id,
                 "screenResolution": SCREEN,
-            })
+            }
+            if self.pet_id:
+                payload["petId"] = self.pet_id
+            client.emit_ack("game.connect", payload)
 
         def on_user_connected(data: dict):
             user = data.get("user", {})
@@ -456,14 +460,18 @@ class GameSession:
             info = pet_wrap.get("info", {})
             self.pet_id  = str(info.get("_id", ""))
             self.pet_row = pet_wrap.get("row")
-            # Вычисляем скорость из agility
+            # Формула из реального трафика:
+            # speed_px_per_tick = agility * 0.032 + 1.33
+            # tick = 16ms → speed_px_per_ms = speed_px_per_tick / 16
+            # Проверено: agi=10→1.650, agi=53→3.026, agi=77≈3.8 px/tick
             agility = info.get("chars", {}).get("agility", 53)
-            # Линейная аппроксимация: agility=53 → 0.45px/ms, agility=86 → 0.75px/ms
-            self.speed_per_ms = 0.45 + (agility - 53) * (0.75 - 0.45) / (86 - 53)
-            self.speed_per_ms = max(0.3, min(1.5, self.speed_per_ms))
+            speed_px_per_tick = agility * 0.032 + 1.33
+            self.speed_per_ms = speed_px_per_tick / 16
             logger.info(
                 f"[{self.game_id}] Наш пет: {info.get('name')} "
-                f"row={self.pet_row} agility={agility} speed_per_ms={self.speed_per_ms:.3f}"
+                f"row={self.pet_row} agility={agility} "
+                f"speed={speed_px_per_tick:.3f}px/tick "
+                f"speed_per_ms={self.speed_per_ms:.4f}"
             )
             # Применяем барьеры если они уже пришли до нашего connected
             if self._all_barriers_raw and self.pet_row and not self.barriers:
@@ -671,9 +679,17 @@ def get_all_pets() -> list:
     raw_pets = []
     try:
         regions = data.get("user", {}).get("regions", [])
-        for region in regions:
+        logger.info(f"get_all_pets: регионов={len(regions)}")
+        for i, region in enumerate(regions):
             pet = region.get("pet")
             if pet and pet.get("_id"):
+                chars = pet.get("chars", {})
+                logger.info(
+                    f"  [{i}] {pet.get('name')} | id={pet.get('_id')} | "
+                    f"evo={pet.get('evolution')} lv={pet.get('level')} | "
+                    f"agi={chars.get('agility',0)} swim={chars.get('swim',0)} "
+                    f"str={chars.get('strength',0)}"
+                )
                 base = pet.get("basePet", {})
                 chars = pet.get("chars", {})
                 raw_pets.append({
