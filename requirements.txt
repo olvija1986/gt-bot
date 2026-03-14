@@ -2,3 +2,4 @@ flask
 requests
 schedule
 gunicorn
+websocket-client
