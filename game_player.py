@@ -441,10 +441,12 @@ class GameSession:
                 if p.get("userId") == self.user_id:
                     self.result = p
                     prize = p.get("prize", {})
+                    extra = p.get("extraAwards", [])
                     logger.info(
-                        f"[{self.game_id}] 🏅 Место: {p.get('winningPlace','?')} | "
+                        f"[{self.game_id}] Место: {p.get('winningPlace','?')} | "
                         f"монет: {prize.get('moneyAmount',0)} | "
-                        f"опыт: {prize.get('experience',0)}"
+                        f"опыт: {prize.get('experience',0)} | "
+                        f"extra: {len(extra)}"
                     )
             self._done.set()
             if self.on_finish:
@@ -522,6 +524,7 @@ class AutoPlayer:
         self.wins        = 0
         self.total_money = 0
         self.total_exp   = 0
+        self.total_extra = []
         self.user_id     = None
         self.pet_id      = None
 
@@ -595,19 +598,22 @@ class AutoPlayer:
                 prize  = result.get("prize", {})
                 money  = prize.get("moneyAmount", 0)
                 exp    = prize.get("experience", 0)
+                extra  = result.get("extraAwards", [])
                 self.total_money += money
                 self.total_exp   += exp
+                self.total_extra.extend(extra)
                 if place == 1:
                     self.wins += 1
             else:
-                place, money, exp = "?", 0, 0
+                place, money, exp, extra = "?", 0, 0, []
 
             self._notify("game_done", {
-                "played": self.played,
-                "total":  self.target_count,
-                "place":  place,
-                "money":  money,
-                "exp":    exp,
+                "played":       self.played,
+                "total":        self.target_count,
+                "place":        place,
+                "money":        money,
+                "exp":          exp,
+                "extra_awards": extra,
             })
 
             if self.played < self.target_count and not self._stop.is_set():
@@ -618,6 +624,7 @@ class AutoPlayer:
             "wins":        self.wins,
             "total_money": self.total_money,
             "total_exp":   self.total_exp,
+            "total_extra": self.total_extra,
         })
 
     def _notify(self, event: str, data: dict):
