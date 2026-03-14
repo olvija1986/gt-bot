@@ -140,26 +140,34 @@ class SioClient:
             logger.warning(f"WS send error: {e}")
 
     def _on_open(self, ws):
-        # Auth
-        self._ws_send(f'40{{"token":"Bearer {self.token}"}}')
+        logger.info(f"[SioClient] WS opened: {self.url}")
+        auth_msg = f'40{{"token":"Bearer {self.token}"}}'
+        logger.info(f"[SioClient] → {auth_msg[:80]}…")
+        self._ws_send(auth_msg)
         self.emit("x-info", "Amsterdam")
+        logger.info(f"[SioClient] → x-info sent")
         if self._handlers.get("_open"):
             self._handlers["_open"]()
 
     def _on_message(self, ws, msg: str):
-        if msg == "2":          # ping
-            self._ws_send("3")  # pong
+        logger.info(f"[SioClient] ← raw: {msg[:300]}")
+        if msg == "2":
+            self._ws_send("3")
             return
-        if msg.startswith("40"):  # namespace ack
+        if msg.startswith("40"):
+            logger.info(f"[SioClient] namespace ack received")
             return
         event, data = sio_parse(msg)
+        if event:
+            logger.info(f"[SioClient] ← event: {event}")
         if event and event in self._handlers:
             self._handlers[event](data)
 
     def _on_error(self, ws, err):
-        logger.error(f"WS error: {err}")
+        logger.error(f"[SioClient] WS error: {err!r}")
 
     def _on_close(self, ws, code, msg):
+        logger.warning(f"[SioClient] WS closed: code={code!r} msg={msg!r}")
         self._done.set()
 
     def connect(self):
@@ -210,27 +218,26 @@ class WaitroomSession:
         client = SioClient(WAITROOM_WS, TG_TOKEN)
 
         def on_open():
-            logger.info(f"[waitroom] Подключились, ищем {self.game_type}…")
-            client.emit_ack("waitroom:connect", {
-                "petId":    self.pet_id,
-                "gameType": self.game_type,
-            })
+            payload = {"petId": self.pet_id, "gameType": self.game_type}
+            logger.info(f"[waitroom] → waitroom:connect {payload}")
+            client.emit_ack("waitroom:connect", payload)
 
         def on_game_new(data: dict):
             game = data.get("game", {})
             game_id  = game.get("id") or game.get("_id")
             lobby_url = game.get("lobbyUrl", "")
+            logger.info(f"[waitroom] game.new: id={game_id} lobbyUrl={lobby_url}")
             if not lobby_url.endswith("/socket.io/?EIO=4&transport=websocket"):
                 if not lobby_url.endswith("/"):
                     lobby_url += "/"
                 lobby_url += "socket.io/?EIO=4&transport=websocket"
-            logger.info(f"[waitroom] Игра найдена! id={game_id} url={lobby_url}")
+            logger.info(f"[waitroom] full WS URL: {lobby_url}")
             self._result = {"game_id": str(game_id), "lobby_url": lobby_url}
             self._done.set()
 
         def on_list_update(data):
             count = len(data) if isinstance(data, list) else "?"
-            logger.info(f"[waitroom] Игроков в очереди: {count}")
+            logger.info(f"[waitroom] list.update: {count} игроков: {[u.get('userId') for u in data] if isinstance(data, list) else data}")
 
         client.on("_open",                  on_open)
         client.on("waitroom.game.new",      on_game_new)
