@@ -168,23 +168,54 @@ def make_game_callback(mode: str, count: int):
     return on_update
 
 # ================= Запуск / остановка авто-игры =================
-def start_auto_play(mode: str, count: int):
-    from game_player import AutoPlayer
+def start_auto_play(mode: str, count: int, pet_id: str = None):
+    from game_player import AutoPlayer, get_all_pets, get_best_pet_for_mode
 
     existing = get_auto_player()
     if existing and existing.is_running():
         send_telegram("⚠️ Авто-игра уже запущена! Сначала останови её — /stopgame")
         return
 
+    # Если пет не указан явно — выбираем лучшего автоматически
+    if not pet_id:
+        pet_id = get_best_pet_for_mode(mode)
+
     player = AutoPlayer(
         mode=mode,
         count=count,
         on_update=make_game_callback(mode, count),
+        pet_id=pet_id,
     )
     set_auto_player(player)
 
     if not player.start():
         send_telegram("❌ Не удалось запустить авто-игру")
+
+
+def show_pet_selection(mode: str, count: int):
+    """Показывает список петов для выбора перед запуском."""
+    from game_player import get_all_pets
+
+    pets = get_all_pets()
+    if not pets:
+        send_telegram("❌ Не удалось получить список петов.")
+        return
+
+    mode_label = "🏁 Забег" if mode == "race" else "🌊 Заплыв"
+    stat_key = "agility" if mode == "race" else "swim"
+
+    keyboard = []
+    for pet in pets:
+        stat = pet[stat_key]
+        label = f"{pet['name']} lv{pet['level']} ({pet['kind']}) {stat_key}={stat}"
+        keyboard.append([{
+            "text": label,
+            "callback_data": f"play:{mode}:{count}:{pet['id']}"
+        }])
+    keyboard.append([{"text": "⚡ Лучший авто", "callback_data": f"play:{mode}:{count}:auto"}])
+    keyboard.append([{"text": "❌ Отмена",      "callback_data": "play:cancel:0"}])
+
+    tg_send_keyboard(f"{mode_label} × {count}\nВыбери пета:", keyboard)
 
 
 def stop_auto_play():
@@ -530,7 +561,7 @@ def handle_game_command(mode: str, text: str):
         try:
             count = int(parts[1])
             if 1 <= count <= 100:
-                Thread(target=start_auto_play, args=(mode, count), daemon=True).start()
+                Thread(target=show_pet_selection, args=(mode, count), daemon=True).start()
                 return
             else:
                 send_telegram("⚠️ Укажи число от 1 до 100.")
@@ -541,19 +572,18 @@ def handle_game_command(mode: str, text: str):
     mode_label = "🏁 Забегов" if mode == "race" else "🌊 Заплывов"
     keyboard = [
         [
-            {"text": "1",  "callback_data": f"play:{mode}:1"},
-            {"text": "5",  "callback_data": f"play:{mode}:5"},
-            {"text": "10", "callback_data": f"play:{mode}:10"},
+            {"text": "1",  "callback_data": f"pick_count:{mode}:1"},
+            {"text": "5",  "callback_data": f"pick_count:{mode}:5"},
+            {"text": "10", "callback_data": f"pick_count:{mode}:10"},
         ],
         [
-            {"text": "20",  "callback_data": f"play:{mode}:20"},
-            {"text": "50",  "callback_data": f"play:{mode}:50"},
-            {"text": "100", "callback_data": f"play:{mode}:100"},
+            {"text": "20",  "callback_data": f"pick_count:{mode}:20"},
+            {"text": "50",  "callback_data": f"pick_count:{mode}:50"},
+            {"text": "100", "callback_data": f"pick_count:{mode}:100"},
         ],
         [{"text": "❌ Отмена", "callback_data": "play:cancel:0"}],
     ]
     tg_send_keyboard(f"Сколько {mode_label} сыграть?\nИли: /{mode} [число]", keyboard)
-
 
 # ================= Flask =================
 app = Flask(__name__)
@@ -579,21 +609,29 @@ def webhook():
 
         parts = cq_data.split(":")
 
-        # play:race:10 — сразу запуск
+        # play:race:10 или play:race:10:petId — запуск
         if parts[0] == "play":
             mode = parts[1] if len(parts) > 1 else ""
             if mode == "cancel":
                 send_telegram("Отменено.")
-            elif mode in ("race", "swim") and len(parts) == 3:
+            elif mode in ("race", "swim") and len(parts) >= 3:
                 try:
                     count = int(parts[2])
-                    Thread(target=start_auto_play, args=(mode, count), daemon=True).start()
+                    pet_id = parts[3] if len(parts) >= 4 and parts[3] != "auto" else None
+                    Thread(target=start_auto_play, args=(mode, count, pet_id), daemon=True).start()
                 except ValueError:
                     send_telegram("❌ Ошибка.")
 
         # pick_mode:race — показать выбор количества
         elif parts[0] == "pick_mode" and len(parts) == 2:
             handle_game_command(parts[1], f"/{parts[1]}")
+
+        # pick_count:race:10 — показать выбор пета
+        elif parts[0] == "pick_count" and len(parts) == 3:
+            try:
+                Thread(target=show_pet_selection, args=(parts[1], int(parts[2])), daemon=True).start()
+            except ValueError:
+                send_telegram("❌ Ошибка.")
 
         # action:box / action:essence / action:status / action:stop
         elif parts[0] == "action" and len(parts) == 2:
