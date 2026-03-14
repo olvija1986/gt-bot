@@ -78,6 +78,7 @@ def validate_token() -> bool:
 
 
 def ticks_to_reach_height(jump_power: float, gravity: float, target_height: float) -> int:
+    """Порт physics.ts::ticksToReachHeight — для прыжка (race)."""
     y, speed_y = 0.0, jump_power
     for tick in range(1, 200):
         speed_y -= 0.6
@@ -89,6 +90,19 @@ def ticks_to_reach_height(jump_power: float, gravity: float, target_height: floa
         else:
             return tick
         if y >= target_height:
+            return tick
+    return 200
+
+
+def ticks_to_reach_depth(dive_power: float, target_depth: float) -> int:
+    """Порт physics.ts::ticksToReachDepth — для нырка (swim)."""
+    depth, speed_y = 0.0, dive_power
+    for tick in range(1, 200):
+        speed_y -= 0.3
+        if speed_y < 0:
+            speed_y = 0.0
+        depth += speed_y
+        if depth >= target_depth:
             return tick
     return 200
 
@@ -333,16 +347,27 @@ class GameSession:
 
     def _ai_loop(self):
         while not self._done.is_set():
-            if self.started and self.barriers and self.mode == "race":
-                if self._should_jump():
-                    self._client.emit("engine.jump", self._make_jump_payload())
-                    logger.debug(f"[{self.game_id}] JUMP x={self.pet_x:.0f}")
+            if self.started and self.barriers:
+                if self.mode == "race" and self._should_act("race"):
+                    self._client.emit("engine.jump", self._make_action_payload())
+                    logger.info(f"[{self.game_id}] → JUMP x={self.pet_x:.0f}")
+                    time.sleep(0.35)
+                elif self.mode == "swim" and self._should_act("swim"):
+                    self._client.emit("engine.dive", self._make_action_payload())
+                    logger.info(f"[{self.game_id}] → DIVE x={self.pet_x:.0f} y={self.pet_y:.1f}")
                     time.sleep(0.35)
             time.sleep(0.08)
 
-    def _should_jump(self) -> bool:
-        if self.pet_status == "jumping" or not self.barriers:
+    def _should_act(self, mode: str) -> bool:
+        # Race: не прыгаем если уже в прыжке
+        if mode == "race" and self.pet_status in ("jumping",):
             return False
+        # Swim: не ныряем если уже под водой
+        if mode == "swim" and self.pet_status in ("diving", "underwater"):
+            return False
+        if not self.barriers:
+            return False
+
         pet_front = self.pet_x + self.width_pet
         next_b = next(
             (b for b in self.barriers if b["x"] + self.width_barrier > pet_front),
@@ -350,14 +375,28 @@ class GameSession:
         )
         if not next_b:
             return False
+
         dist = next_b["x"] - pet_front
         if dist <= 0:
             return False
-        ticks = ticks_to_reach_height(self.jump_power, self.gravity, 50)
-        ideal_dist = self.speed_x * (ticks + 2)
-        return dist <= ideal_dist * 0.85
 
-    def _make_jump_payload(self) -> dict:
+        intelligence = 0.85
+        if mode == "race":
+            ticks = ticks_to_reach_height(self.jump_power, self.gravity, 50)
+            ideal_dist = self.speed_x * (ticks + 2)
+        else:
+            # swim: нырок — barrier high обычно тоже ~50 (глубина)
+            ticks = ticks_to_reach_depth(self.jump_power, 50)
+            ideal_dist = self.speed_x * (ticks + 2)
+
+        trigger = ideal_dist * intelligence
+        should = dist <= trigger
+        if should:
+            logger.debug(f"[{self.game_id}] ACT dist={dist:.0f} trigger={trigger:.0f} "
+                         f"speed_x={self.speed_x:.2f} status={self.pet_status}")
+        return should
+
+    def _make_action_payload(self) -> dict:
         return {
             "lastUpdate":    self.last_update,
             "coordinates":   {"x": self.pet_x, "y": self.pet_y},
@@ -452,11 +491,50 @@ class GameSession:
             if self.on_finish:
                 self.on_finish(self.result)
 
+        def on_dive(data: dict):
+            """engine.dive от других игроков — обновляем наш статус если это мы."""
+            if data.get("userId") == self.user_id:
+                self.pet_status = "diving"
+                coords = data.get("coordinates", {})
+                self.pet_x = coords.get("x", self.pet_x)
+                self.pet_y = coords.get("y", self.pet_y)
+                speed = data.get("speed", {})
+                self.speed_x = speed.get("x", self.speed_x)
+                self.speed_y = speed.get("y", self.speed_y)
+                self.last_update = data.get("lastUpdate", self.last_update)
+
+        def on_emerge(data: dict):
+            """engine.emerge — пет вынырнул."""
+            if data.get("userId") == self.user_id:
+                self.pet_status = "running"
+                coords = data.get("coordinates", {})
+                self.pet_x = coords.get("x", self.pet_x)
+                self.pet_y = coords.get("y", self.pet_y)
+                speed = data.get("speed", {})
+                self.speed_x = speed.get("x", self.speed_x)
+                self.speed_y = speed.get("y", self.speed_y)
+                self.last_update = data.get("lastUpdate", self.last_update)
+
+        def on_jump(data: dict):
+            """engine.jump — пет в прыжке."""
+            if data.get("userId") == self.user_id:
+                self.pet_status = "jumping"
+                coords = data.get("coordinates", {})
+                self.pet_x = coords.get("x", self.pet_x)
+                self.pet_y = coords.get("y", self.pet_y)
+                speed = data.get("speed", {})
+                self.speed_x = speed.get("x", self.speed_x)
+                self.speed_y = speed.get("y", self.speed_y)
+                self.last_update = data.get("lastUpdate", self.last_update)
+
         client.on("_open",                  on_open)
         client.on("engine.user.connected",  on_user_connected)
         client.on("engine.sync",            on_sync)
         client.on("engine.game.started",    on_started)
         client.on("engine.game.ended",      on_ended)
+        client.on("engine.dive",            on_dive)
+        client.on("engine.emerge",          on_emerge)
+        client.on("engine.jump",            on_jump)
 
         threading.Thread(target=self._ai_loop, daemon=True).start()
 
@@ -492,27 +570,59 @@ def get_my_user_id() -> int | None:
     return None
 
 
-def get_my_pet_id() -> str | None:
-    """Возвращает _id первого пета пользователя."""
+def get_all_pets() -> list:
+    """Возвращает список всех петов пользователя: [{id, name, region, level, chars}]"""
     data = _post(f"{API_BASE}/user.getSelf", {})
     if not data:
-        return None
+        return []
+    pets = []
     try:
         regions = data.get("user", {}).get("regions", [])
         for region in regions:
             pet = region.get("pet")
             if pet and pet.get("_id"):
-                return str(pet["_id"])
-    except Exception:
-        pass
-    return None
+                base = pet.get("basePet", {})
+                chars = pet.get("chars", {})
+                pets.append({
+                    "id":     str(pet["_id"]),
+                    "name":   pet.get("name", "?"),
+                    "region": base.get("allowedRegion", "?"),
+                    "kind":   base.get("kind", "?"),
+                    "rarity": base.get("rarity", "?"),
+                    "level":  pet.get("level", 0),
+                    "evolution": pet.get("evolution", 0),
+                    "agility":   chars.get("agility", 0),
+                    "swim":      chars.get("swim", 0),
+                    "fly":       chars.get("fly", 0),
+                    "stamina":   chars.get("stamina", 0),
+                })
+    except Exception as e:
+        logger.error(f"get_all_pets error: {e}")
+    return pets
+
+
+def get_best_pet_for_mode(mode: str) -> str | None:
+    """Выбирает лучшего пета для режима по характеристикам."""
+    pets = get_all_pets()
+    if not pets:
+        return None
+    if mode == "swim":
+        pets.sort(key=lambda p: p["swim"], reverse=True)
+    elif mode == "race":
+        pets.sort(key=lambda p: p["agility"], reverse=True)
+    else:
+        pets.sort(key=lambda p: p["level"], reverse=True)
+    best = pets[0]
+    logger.info(f"Выбран пет для {mode}: {best['name']} ({best['kind']}) "
+                f"lv{best['level']} swim={best['swim']} agility={best['agility']}")
+    return best["id"]
 
 
 # ══════════════════════════════════════════════════════════
 #  AutoPlayer — серия игр
 # ══════════════════════════════════════════════════════════
 class AutoPlayer:
-    def __init__(self, mode: str = "race", count: int = 5, on_update=None):
+    def __init__(self, mode: str = "race", count: int = 5, on_update=None, pet_id: str = None):
         self.mode         = mode
         self.target_count = count
         self.on_update    = on_update
@@ -526,7 +636,7 @@ class AutoPlayer:
         self.total_exp   = 0
         self.total_extra = []
         self.user_id     = None
-        self.pet_id      = None
+        self.pet_id      = pet_id  # можно передать явно, иначе выберется лучший
 
     def start(self) -> bool:
         if self._thread and self._thread.is_alive():
@@ -549,7 +659,7 @@ class AutoPlayer:
             return
 
         self.user_id = get_my_user_id()
-        self.pet_id  = get_my_pet_id()
+        self.pet_id  = self.pet_id or get_best_pet_for_mode(self.mode)
 
         if not self.user_id or not self.pet_id:
             self._notify("error", {"msg": "❌ Не удалось получить user_id / pet_id. Проверь TG_TOKEN."})
