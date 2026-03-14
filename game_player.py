@@ -332,7 +332,7 @@ class GameSession:
         self.pet_x         = 0.0
         self.pet_y         = 0.0
         self.pet_status    = "running"
-        self.speed_x       = 6.5
+        self.speed_x       = 1.6   # реальная скорость из логов (~1.6)
         self.speed_y       = 0.0
         self.jump_power    = 12.0
         self.gravity       = 1.5
@@ -368,10 +368,9 @@ class GameSession:
             time.sleep(0.08)
 
     def _should_act(self, mode: str) -> bool:
-        # Race: не прыгаем если уже в прыжке
-        if mode == "race" and self.pet_status in ("jumping",):
+        # Не действуем если уже в действии
+        if mode == "race" and self.pet_status == "jumping":
             return False
-        # Swim: не ныряем если уже под водой
         if mode == "swim" and self.pet_status in ("diving", "underwater"):
             return False
         if not self.barriers:
@@ -386,24 +385,25 @@ class GameSession:
             return False
 
         dist = next_b["x"] - pet_front
-        if dist <= 0:
+        if dist < 0:
             return False
 
-        intelligence = 1.1  # чуть раньше чем идеально — лучше прыгнуть рано чем поздно
+        # Вычисляем trigger на основе физики
+        spx = max(self.speed_x, 0.5)  # защита от нулевой скорости
         if mode == "race":
             ticks = ticks_to_reach_height(self.jump_power, self.gravity, 50)
-            ideal_dist = self.speed_x * (ticks + 2)
         else:
-            # swim: нырок — barrier high обычно тоже ~50 (глубина)
             ticks = ticks_to_reach_depth(self.jump_power, 50)
-            ideal_dist = self.speed_x * (ticks + 2)
+        
+        # trigger = расстояние, при котором нужно начать действие
+        # +4 тика запаса сверх физического минимума
+        trigger = spx * (ticks + 4)
 
-        trigger = ideal_dist * intelligence
-        should = dist <= trigger
-        if should:
-            logger.debug(f"[{self.game_id}] ACT dist={dist:.0f} trigger={trigger:.0f} "
-                         f"speed_x={self.speed_x:.2f} status={self.pet_status}")
-        return should
+        logger.info(f"[{self.game_id}] CHECK dist={dist:.0f} trigger={trigger:.0f} "
+                    f"spx={spx:.3f} barrier_x={next_b['x']} pet_x={self.pet_x:.0f} "
+                    f"status={self.pet_status} barriers={len(self.barriers)}")
+
+        return dist <= trigger
 
     def _make_action_payload(self) -> dict:
         return {
@@ -456,7 +456,22 @@ class GameSession:
                 logger.info(f"[{self.game_id}] Барьеры применены после connected: "
                             f"{len(self.barriers)} на row={self.pet_row}")
 
+        _sync_count = [0]
+
         def on_sync(data: dict):
+            _sync_count[0] += 1
+            # Дампим первые 2 синка полностью для диагностики
+            if _sync_count[0] <= 2:
+                users_preview = []
+                for u in data.get("users", []):
+                    users_preview.append({
+                        "uid": u.get("user", {}).get("_id"),
+                        "keys": list(u.keys()),
+                        "coords": u.get("coordinates"),
+                        "pet_keys": list(u.get("pet", {}).keys()) if u.get("pet") else [],
+                    })
+                logger.info(f"[{self.game_id}] SYNC#{_sync_count[0]} users={users_preview}")
+
             found = False
             for u in data.get("users", []):
                 uid = u.get("user", {}).get("_id")
@@ -621,11 +636,14 @@ def get_my_user_id() -> int | None:
 
 
 def get_all_pets() -> list:
-    """Возвращает список всех петов пользователя: [{id, name, region, level, chars}]"""
+    """
+    Возвращает лучшего пета для каждой эволюции.
+    Сортировка: по эволюции (убыв.), внутри эволюции — лучший по нужной стате.
+    """
     data = _post(f"{API_BASE}/user.getSelf", {})
     if not data:
         return []
-    pets = []
+    raw_pets = []
     try:
         regions = data.get("user", {}).get("regions", [])
         for region in regions:
@@ -633,38 +651,64 @@ def get_all_pets() -> list:
             if pet and pet.get("_id"):
                 base = pet.get("basePet", {})
                 chars = pet.get("chars", {})
-                pets.append({
-                    "id":     str(pet["_id"]),
-                    "name":   pet.get("name", "?"),
-                    "region": base.get("allowedRegion", "?"),
-                    "kind":   base.get("kind", "?"),
-                    "rarity": base.get("rarity", "?"),
-                    "level":  pet.get("level", 0),
+                raw_pets.append({
+                    "id":        str(pet["_id"]),
+                    "name":      pet.get("name", "?"),
+                    "region":    base.get("allowedRegion", "?"),
+                    "kind":      base.get("kind", "?"),
+                    "rarity":    base.get("rarity", "?"),
+                    "level":     pet.get("level", 0),
                     "evolution": pet.get("evolution", 0),
                     "agility":   chars.get("agility", 0),
                     "swim":      chars.get("swim", 0),
                     "fly":       chars.get("fly", 0),
                     "stamina":   chars.get("stamina", 0),
+                    "strength":  chars.get("strength", 0),
                 })
     except Exception as e:
         logger.error(f"get_all_pets error: {e}")
-    return pets
+    return raw_pets
+
+
+def get_best_pets_by_evolution(mode: str) -> list:
+    """
+    Возвращает список лучших петов — по одному на каждую эволюцию.
+    Внутри эволюции выбирает лучшего по статe режима.
+    Сортировка итогового списка: эволюция по убыванию.
+    """
+    pets = get_all_pets()
+    if not pets:
+        return []
+
+    stat_key = "swim" if mode == "swim" else "agility"
+
+    # Группируем по эволюции
+    by_evo = {}
+    for p in pets:
+        evo = p["evolution"]
+        if evo not in by_evo:
+            by_evo[evo] = []
+        by_evo[evo].append(p)
+
+    # Лучший в каждой эволюции
+    result = []
+    for evo in sorted(by_evo.keys(), reverse=True):
+        group = by_evo[evo]
+        best = max(group, key=lambda p: p[stat_key])
+        result.append(best)
+
+    return result
 
 
 def get_best_pet_for_mode(mode: str) -> str | None:
-    """Выбирает лучшего пета для режима по характеристикам."""
-    pets = get_all_pets()
+    """Выбирает лучшего пета для режима (наивысшая эволюция + лучшая стата)."""
+    pets = get_best_pets_by_evolution(mode)
     if not pets:
         return None
-    if mode == "swim":
-        pets.sort(key=lambda p: p["swim"], reverse=True)
-    elif mode == "race":
-        pets.sort(key=lambda p: p["agility"], reverse=True)
-    else:
-        pets.sort(key=lambda p: p["level"], reverse=True)
-    best = pets[0]
-    logger.info(f"Выбран пет для {mode}: {best['name']} ({best['kind']}) "
-                f"lv{best['level']} swim={best['swim']} agility={best['agility']}")
+    best = pets[0]  # первый = наивысшая эволюция
+    stat_key = "swim" if mode == "swim" else "agility"
+    logger.info(f"Авто-выбор для {mode}: {best['name']} evo{best['evolution']} "
+                f"lv{best['level']} {stat_key}={best[stat_key]}")
     return best["id"]
 
 
