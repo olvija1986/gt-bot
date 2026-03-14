@@ -110,15 +110,26 @@ def sio_parse(message: str):
 
 
 class SioClient:
-    """Минимальная обёртка над websocket-client с поддержкой Engine.IO."""
+    """
+    Минимальная обёртка над websocket-client с поддержкой Engine.IO.
+
+    Правильный порядок handshake (из реального трафика):
+      <- 0{sid,pingInterval,...}   Engine.IO open
+      -> 40{token:...}             Socket.IO namespace connect с авторизацией
+      -> 42["x-info","Amsterdam"]  доп. инфо
+      <- 40{sid}                   Socket.IO namespace ack
+      -> 420["command", ...]       теперь можно слать команды
+    """
 
     def __init__(self, url: str, token: str):
         self.url    = url
-        self.token  = token
+        self.token  = token[7:] if token.lower().startswith("bearer ") else token
         self._ws    = None
         self._ack   = 0
         self._done  = threading.Event()
-        self._handlers = {}   # event → callable(data)
+        self._handlers = {}
+        self._eio_open_received = False
+        self._sio_ack_received  = False
 
     def on(self, event: str, fn):
         self._handlers[event] = fn
@@ -127,7 +138,6 @@ class SioClient:
         self._ws_send(sio_pack(event, data))
 
     def emit_ack(self, event: str, data):
-        """420["event", data] — с нарастающим ACK-номером."""
         n = 420 + self._ack
         self._ack += 1
         self._ws_send(str(n) + json.dumps([event, data], ensure_ascii=False, separators=(',', ':')))
@@ -136,38 +146,57 @@ class SioClient:
         try:
             if self._ws:
                 self._ws.send(raw)
+                import logging as _l
+                _l.getLogger("game_player").debug(f"[SioClient] -> {raw[:120]}")
         except Exception as e:
-            logger.warning(f"WS send error: {e}")
+            import logging as _l
+            _l.getLogger("game_player").warning(f"[SioClient] send error: {e}")
 
     def _on_open(self, ws):
-        logger.info(f"[SioClient] WS opened: {self.url}")
-        auth_msg = f'40{{"token":"Bearer {self.token}"}}'
-        logger.info(f"[SioClient] → {auth_msg[:80]}…")
-        self._ws_send(auth_msg)
-        self.emit("x-info", "Amsterdam")
-        logger.info(f"[SioClient] → x-info sent")
-        if self._handlers.get("_open"):
-            self._handlers["_open"]()
+        # TCP соединение установлено — ждём 0{sid} от сервера, ничего не шлём
+        import logging as _l
+        _l.getLogger("game_player").info(f"[SioClient] TCP open: {self.url}")
 
     def _on_message(self, ws, msg: str):
-        logger.info(f"[SioClient] ← raw: {msg[:300]}")
+        import logging as _l
+        log = _l.getLogger("game_player")
+        log.info(f"[SioClient] <- {msg[:200]}")
+
         if msg == "2":
             self._ws_send("3")
             return
-        if msg.startswith("40"):
-            logger.info(f"[SioClient] namespace ack received")
+
+        # Engine.IO open: 0{sid, pingInterval, ...}
+        if msg.startswith("0") and not self._eio_open_received:
+            self._eio_open_received = True
+            log.info("[SioClient] EIO open received, sending SIO auth...")
+            self._ws_send(f'40{{"token":"Bearer {self.token}"}}')
+            self.emit("x-info", "Amsterdam")
             return
+
+        # Socket.IO namespace ack: 40 или 40{sid}
+        if msg.startswith("40"):
+            if not self._sio_ack_received:
+                self._sio_ack_received = True
+                log.info("[SioClient] SIO namespace ack — ready, calling _open handler")
+                if self._handlers.get("_open"):
+                    self._handlers["_open"]()
+            return
+
+        # Обычные события: 42["event", data]
         event, data = sio_parse(msg)
         if event:
-            logger.info(f"[SioClient] ← event: {event}")
-        if event and event in self._handlers:
-            self._handlers[event](data)
+            log.info(f"[SioClient] event: {event}")
+            if event in self._handlers:
+                self._handlers[event](data)
 
     def _on_error(self, ws, err):
-        logger.error(f"[SioClient] WS error: {err!r}")
+        import logging as _l
+        _l.getLogger("game_player").error(f"[SioClient] WS error: {err!r}")
 
     def _on_close(self, ws, code, msg):
-        logger.warning(f"[SioClient] WS closed: code={code!r} msg={msg!r}")
+        import logging as _l
+        _l.getLogger("game_player").warning(f"[SioClient] WS closed: code={code!r} msg={msg!r}")
         self._done.set()
 
     def connect(self):
