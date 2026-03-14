@@ -97,30 +97,43 @@ def set_auto_player(player):
 
 # ================= Callback от AutoPlayer → Telegram =================
 def format_extra_awards(extra_awards: list) -> str:
-    """Стакает extraAwards как предметы из лутбокса."""
+    """
+    Стакает extraAwards.
+    Реальная структура: [{type: "essence", item: {name, itemType, ...}}, ...]
+    """
     from collections import defaultdict
     if not extra_awards:
         return ""
 
-    def item_key(item):
-        t = item.get("itemType", "")
-        if t == "egg":               return f"🥚 {item.get('allowedRegion','')} {item.get('rarity','')}".strip()
-        if t == "skin":              return f"🎨 {item.get('itemName') or item.get('name','?')}"
-        if t == "food":              return f"🍖 {item.get('name','?')}"
-        if t == "mutagen":           return f"🧪 {item.get('probability','?')}"
-        if t == "essence":           return f"✨ {item.get('type','?')}"
-        if t == "lootBox":           return f"🎁 {item.get('name','?')}"
-        if t == "premiumItem":       return f"💎 {item.get('name','?')}"
-        if t == "extraItem":         return f"📦 {item.get('name','?')}"
-        if t == "promotionPromocode":return f"🎟 {item.get('name','?')}"
-        for key in ["soft","ton","gton","eventCurrency","experience"]:
-            if key in item:
-                return f"💰 {key}"
-        return f"❓ {item.get('name') or t or 'unknown'}"
+    EMOJI = {
+        "essence": "✨", "egg": "🥚", "skin": "🎨", "food": "🍖",
+        "mutagen": "🧪", "lootBox": "🎁", "premiumItem": "💎",
+        "extraItem": "📦", "promotionPromocode": "🎟",
+        "soft": "💰", "ton": "💎", "gton": "💎",
+        "eventCurrency": "🎫", "experience": "⭐",
+    }
+
+    def award_key(award: dict) -> str:
+        # Новая структура: {type, item:{name, itemType, ...}}
+        item = award.get("item") or award  # fallback на старую структуру
+        item_type = item.get("itemType") or award.get("type", "")
+        name = item.get("name") or item.get("itemName") or ""
+        emoji = EMOJI.get(item_type, "❓")
+
+        if item_type == "egg":
+            return f"{emoji} {item.get('allowedRegion','')} {item.get('rarity','')}".strip()
+        if item_type == "mutagen":
+            return f"{emoji} {item.get('probability', name or '?')}"
+        if item_type == "essence":
+            return f"{emoji} {name or item.get('type','?')}"
+        if name:
+            return f"{emoji} {name}"
+        return f"{emoji} {item_type}"
 
     counts = defaultdict(int)
-    for item in extra_awards:
-        counts[item_key(item)] += item.get("count", 1)
+    for award in extra_awards:
+        key = award_key(award)
+        counts[key] += award.get("count", 1)
 
     lines = ["🎁 Доп. награды:"]
     for k, c in counts.items():
