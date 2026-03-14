@@ -96,6 +96,38 @@ def set_auto_player(player):
 
 
 # ================= Callback от AutoPlayer → Telegram =================
+def format_extra_awards(extra_awards: list) -> str:
+    """Стакает extraAwards как предметы из лутбокса."""
+    from collections import defaultdict
+    if not extra_awards:
+        return ""
+
+    def item_key(item):
+        t = item.get("itemType", "")
+        if t == "egg":               return f"🥚 {item.get('allowedRegion','')} {item.get('rarity','')}".strip()
+        if t == "skin":              return f"🎨 {item.get('itemName') or item.get('name','?')}"
+        if t == "food":              return f"🍖 {item.get('name','?')}"
+        if t == "mutagen":           return f"🧪 {item.get('probability','?')}"
+        if t == "essence":           return f"✨ {item.get('type','?')}"
+        if t == "lootBox":           return f"🎁 {item.get('name','?')}"
+        if t == "premiumItem":       return f"💎 {item.get('name','?')}"
+        if t == "extraItem":         return f"📦 {item.get('name','?')}"
+        if t == "promotionPromocode":return f"🎟 {item.get('name','?')}"
+        for key in ["soft","ton","gton","eventCurrency","experience"]:
+            if key in item:
+                return f"💰 {key}"
+        return f"❓ {item.get('name') or t or 'unknown'}"
+
+    counts = defaultdict(int)
+    for item in extra_awards:
+        counts[item_key(item)] += item.get("count", 1)
+
+    lines = ["🎁 Доп. награды:"]
+    for k, c in counts.items():
+        lines.append(f"  • {k}" + (f" x{c}" if c > 1 else ""))
+    return "\n".join(lines)
+
+
 def make_game_callback(mode: str, count: int):
     def on_update(event: str, data: dict):
         if event == "started":
@@ -106,26 +138,34 @@ def make_game_callback(mode: str, count: int):
             )
         elif event == "game_done":
             place_emoji = {1: "🥇", 2: "🥈", 3: "🥉"}.get(data["place"], "🏅")
-            send_telegram(
-                f"{place_emoji} Игра {data['played']}/{data['total']}\n"
-                f"Место: {data['place']} | Монет: {data['money']} | Опыт: {data['exp']}"
-            )
+            lines = [
+                f"{place_emoji} Игра {data['played']}/{data['total']}",
+                f"Место: {data['place']} | Монет: {data['money']} | Опыт: {data['exp']}",
+            ]
+            extra_text = format_extra_awards(data.get("extra_awards", []))
+            if extra_text:
+                lines.append(extra_text)
+            send_telegram("\n".join(lines))
         elif event == "finished":
-            send_telegram(
-                f"✅ Серия завершена!\n"
-                f"-------------------------------------\n"
-                f"🎮 Сыграно: {data['played']}\n"
-                f"🥇 Побед: {data['wins']}\n"
-                f"💰 Монет: {data['total_money']}\n"
-                f"⭐ Опыта: {data['total_exp']}"
-            )
+            lines = [
+                "✅ Серия завершена!",
+                "-------------------------------------",
+                f"🎮 Сыграно: {data['played']}",
+                f"🥇 Побед: {data['wins']}",
+                f"💰 Монет: {data['total_money']}",
+                f"⭐ Опыта: {data['total_exp']}",
+            ]
+            extra_text = format_extra_awards(data.get("total_extra", []))
+            if extra_text:
+                lines.append("-------------------------------------")
+                lines.append(extra_text)
+            send_telegram("\n".join(lines))
             set_auto_player(None)
         elif event == "error":
             send_telegram(f"❌ Ошибка авто-игры: {data.get('msg', '?')}")
             set_auto_player(None)
 
     return on_update
-
 
 # ================= Запуск / остановка авто-игры =================
 def start_auto_play(mode: str, count: int):
@@ -538,6 +578,8 @@ def webhook():
             return "ok"
 
         parts = cq_data.split(":")
+
+        # play:race:10 — сразу запуск
         if parts[0] == "play":
             mode = parts[1] if len(parts) > 1 else ""
             if mode == "cancel":
@@ -548,6 +590,37 @@ def webhook():
                     Thread(target=start_auto_play, args=(mode, count), daemon=True).start()
                 except ValueError:
                     send_telegram("❌ Ошибка.")
+
+        # pick_mode:race — показать выбор количества
+        elif parts[0] == "pick_mode" and len(parts) == 2:
+            handle_game_command(parts[1], f"/{parts[1]}")
+
+        # action:box / action:essence / action:status / action:stop
+        elif parts[0] == "action" and len(parts) == 2:
+            act = parts[1]
+            if act == "box":
+                Thread(target=open_boxes, daemon=True).start()
+                send_telegram("📦 Открываю боксы…")
+            elif act == "essence":
+                Thread(target=apply_essences_to_pets, daemon=True).start()
+                send_telegram("✨ Применяю эссенции…")
+            elif act == "stop":
+                Thread(target=stop_auto_play, daemon=True).start()
+            elif act == "status":
+                player = get_auto_player()
+                if player and player.is_running():
+                    mode_label = "🏁 Забег" if player.mode == "race" else "🌊 Заплыв"
+                    send_telegram(
+                        f"▶️ Авто-игра активна\n"
+                        f"Режим: {mode_label}\n"
+                        f"Сыграно: {player.played}/{player.target_count}\n"
+                        f"Побед: {player.wins}\n"
+                        f"Монет: {player.total_money}\n"
+                        f"Опыта: {player.total_exp}"
+                    )
+                else:
+                    send_telegram("⏹ Авто-игра не запущена.")
+
         return "ok"
 
     # Текстовые команды
@@ -562,25 +635,29 @@ def webhook():
         return "ok"
 
     if text == "/start":
+        player = get_auto_player()
+        status_line = ""
+        if player and player.is_running():
+            mode_label = "🏁 Забег" if player.mode == "race" else "🌊 Заплыв"
+            status_line = f"\n▶️ Активно: {mode_label} {player.played}/{player.target_count}"
         keyboard = [
             [
-                {"text": "🏁 Забег (5)",  "callback_data": "play:race:5"},
-                {"text": "🌊 Заплыв (5)", "callback_data": "play:swim:5"},
+                {"text": "🏁 Забег",   "callback_data": "pick_mode:race"},
+                {"text": "🌊 Заплыв",  "callback_data": "pick_mode:swim"},
             ],
             [
-                {"text": "📦 Боксы",     "callback_data": "play:boxes:0"},
-                {"text": "✨ Эссенции",  "callback_data": "play:essence:0"},
+                {"text": "📦 Боксы",        "callback_data": "action:box"},
+                {"text": "✨ Эссенции",     "callback_data": "action:essence"},
+            ],
+            [
+                {"text": "📊 Статус игры",  "callback_data": "action:status"},
+                {"text": "🛑 Стоп",         "callback_data": "action:stop"},
             ],
         ]
         tg_send_keyboard(
-            "🐾 Gatto Bot\n\n"
-            "/race [N] — забеги\n"
-            "/swim [N] — заплывы\n"
-            "/stopgame — остановить\n"
-            "/gamestatus — статус",
+            f"🐾 Gatto Bot{status_line}\n\nВыбери действие:",
             keyboard
         )
-
     elif text.startswith("/race"):
         handle_game_command("race", text)
 
