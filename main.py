@@ -182,7 +182,7 @@ def make_game_callback(mode: str, count: int):
 
 # ================= Запуск / остановка авто-игры =================
 def start_auto_play(mode: str, count: int, pet_id: str = None):
-    from game_player import AutoPlayer, get_all_pets, get_best_pet_for_mode
+    from game_player import AutoPlayer, get_best_pet_for_mode
 
     existing = get_auto_player()
     if existing and existing.is_running():
@@ -206,30 +206,30 @@ def start_auto_play(mode: str, count: int, pet_id: str = None):
 
 
 def show_pet_selection(mode: str, count: int):
-    """Показывает список петов для выбора перед запуском."""
-    from game_player import get_all_pets
+    """Показывает лучшего пета каждой эволюции для выбора."""
+    from game_player import get_best_pets_by_evolution
 
-    pets = get_all_pets()
+    pets = get_best_pets_by_evolution(mode)
     if not pets:
         send_telegram("❌ Не удалось получить список петов.")
         return
 
     mode_label = "🏁 Забег" if mode == "race" else "🌊 Заплыв"
     stat_key = "agility" if mode == "race" else "swim"
+    stat_emoji = "🏃" if mode == "race" else "🏊"
 
     keyboard = []
     for pet in pets:
         stat = pet[stat_key]
-        label = f"{pet['name']} lv{pet['level']} ({pet['kind']}) {stat_key}={stat}"
+        label = f"evo{pet['evolution']} | {pet['name']} lv{pet['level']} | {stat_emoji}{stat}  "
         keyboard.append([{
             "text": label,
             "callback_data": f"play:{mode}:{count}:{pet['id']}"
         }])
-    keyboard.append([{"text": "⚡ Лучший авто", "callback_data": f"play:{mode}:{count}:auto"}])
-    keyboard.append([{"text": "❌ Отмена",      "callback_data": "play:cancel:0"}])
+    keyboard.append([{"text": "⚡ Авто (лучший)", "callback_data": f"play:{mode}:{count}:auto"}])
+    keyboard.append([{"text": "❌ Отмена",         "callback_data": "play:cancel:0"}])
 
-    tg_send_keyboard(f"{mode_label} × {count}\nВыбери пета:", keyboard)
-
+    tg_send_keyboard(f"{mode_label} × {count} игр\nВыбери пета:", keyboard)
 
 def stop_auto_play():
     player = get_auto_player()
