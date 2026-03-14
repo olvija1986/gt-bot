@@ -333,18 +333,27 @@ class GameSession:
         self.pet_y         = 0.0
         self.pet_status    = "running"
         self.speed_x       = 1.6   # реальная скорость из логов (~1.6)
+        # Координата клика — из реального трафика (центр игрового поля)
+        self.click_x       = 673.9921875
+        self.click_y       = 346.53125
         self.speed_y       = 0.0
         self.jump_power    = 12.0
         self.gravity       = 1.5
         self.width_pet     = 40
         self.width_barrier = 30
 
-        self.barriers         = []
-        self._all_barriers_raw = []   # все барьеры до того как известен row
-        self.last_update  = 0
-        self.started      = False
-        self.result       = None
-        self._done        = threading.Event()
+        self.barriers          = []
+        self._all_barriers_raw = []
+        self.last_update   = 0
+        self.started       = False
+        self.game_started_at = None  # timestamp (ms) когда игра началась
+        # Средняя скорость px/ms из реального трафика:
+        # бот с agility=77 проходит ~600px за ~1сек = 0.6px/ms
+        # бот с agility=86 проходит ~600px за ~0.8сек = 0.75px/ms  
+        # наш пет agility~53 → примерно 0.45px/ms
+        self.speed_per_ms  = 0.45
+        self.result        = None
+        self._done         = threading.Event()
 
     def _ai_loop(self):
         while not self._done.is_set():
@@ -354,14 +363,14 @@ class GameSession:
                 elif self.mode == "race" and self._should_act("race"):
                     payload = self._make_action_payload()
                     self._client.emit("engine.jump", payload)
-                    logger.info(f"[{self.game_id}] → JUMP x={self.pet_x:.0f} speed_x={self.speed_x:.2f}")
+                    logger.info(f"[{self.game_id}] → JUMP sent: {payload}")
                     setattr(self, '_first_jump_done', True)
                     self.pet_status = "jumping"
                     time.sleep(0.4)
                 elif self.mode == "swim" and self._should_act("swim"):
                     payload = self._make_action_payload()
                     self._client.emit("engine.dive", payload)
-                    logger.info(f"[{self.game_id}] → DIVE x={self.pet_x:.0f} y={self.pet_y:.1f}")
+                    logger.info(f"[{self.game_id}] → DIVE sent: {payload}")
                     setattr(self, '_first_jump_done', True)
                     self.pet_status = "diving"
                     time.sleep(0.4)
@@ -373,10 +382,16 @@ class GameSession:
             return False
         if mode == "swim" and self.pet_status in ("diving", "underwater"):
             return False
-        if not self.barriers:
+        if not self.barriers or not self.game_started_at:
             return False
 
-        pet_front = self.pet_x + self.width_pet
+        # pet_x не обновляется из синков — считаем позицию по времени
+        elapsed_ms = (time.time() * 1000) - self.game_started_at
+        # Реальная скорость ботов ~4-7 px/tick, тик ~16ms → ~4px/ms на старте
+        # Используем среднее из реального трафика
+        estimated_x = 118 + elapsed_ms * self.speed_per_ms
+        pet_front = estimated_x + self.width_pet
+
         next_b = next(
             (b for b in self.barriers if b["x"] + self.width_barrier > pet_front),
             None
@@ -386,34 +401,30 @@ class GameSession:
 
         dist = next_b["x"] - pet_front
         if dist < 0:
+            # Уже прошли барьер — убираем его из списка
+            self.barriers = [b for b in self.barriers if b["x"] + self.width_barrier > pet_front]
             return False
 
-        # Вычисляем trigger на основе физики
-        spx = max(self.speed_x, 0.5)  # защита от нулевой скорости
-        if mode == "race":
-            ticks = ticks_to_reach_height(self.jump_power, self.gravity, 50)
-        else:
-            ticks = ticks_to_reach_depth(self.jump_power, 50)
-        
-        # trigger = расстояние, при котором нужно начать действие
-        # +4 тика запаса сверх физического минимума
-        trigger = spx * (ticks + 4)
+        # trigger: за сколько px до барьера надо прыгать
+        # Из реального трафика: прыжок при x≈560-588 к барьеру x=593 → dist≈5-33
+        # Возьмём ~80px запаса
+        trigger = 100
 
-        logger.info(f"[{self.game_id}] CHECK dist={dist:.0f} trigger={trigger:.0f} "
-                    f"spx={spx:.3f} barrier_x={next_b['x']} pet_x={self.pet_x:.0f} "
-                    f"status={self.pet_status} barriers={len(self.barriers)}")
+        logger.info(f"[{self.game_id}] CHECK est_x={estimated_x:.0f} dist={dist:.0f} "
+                    f"trigger={trigger} barrier_x={next_b['x']} elapsed={elapsed_ms:.0f}ms "
+                    f"status={self.pet_status}")
 
         return dist <= trigger
 
     def _make_action_payload(self) -> dict:
+        """
+        Реальный клиентский формат прыжка/нырка из DevTools:
+        42["engine.jump", {"clickPosition":{"x":...,"y":...}, "jumpedAt":timestamp}, null]
+        Сервер сам считает координаты и рассылает развёрнутый результат.
+        """
         return {
-            "lastUpdate":    self.last_update,
-            "coordinates":   {"x": self.pet_x, "y": self.pet_y},
-            "speed":         {"x": self.speed_x, "y": self.speed_y},
-            "petLastUpdate": self.last_update,
-            "userId":        self.user_id,
-            "petId":         self.pet_id or "",
-            "serverTime":    int(time.time() * 1000),
+            "clickPosition": {"x": self.click_x, "y": self.click_y},
+            "jumpedAt":      int(time.time() * 1000),
         }
 
     def run(self, timeout: int = GAME_TIMEOUT):
@@ -435,9 +446,14 @@ class GameSession:
             info = pet_wrap.get("info", {})
             self.pet_id  = str(info.get("_id", ""))
             self.pet_row = pet_wrap.get("row")
+            # Вычисляем скорость из agility
+            agility = info.get("chars", {}).get("agility", 53)
+            # Линейная аппроксимация: agility=53 → 0.45px/ms, agility=86 → 0.75px/ms
+            self.speed_per_ms = 0.45 + (agility - 53) * (0.75 - 0.45) / (86 - 53)
+            self.speed_per_ms = max(0.3, min(1.5, self.speed_per_ms))
             logger.info(
                 f"[{self.game_id}] Наш пет: {info.get('name')} "
-                f"row={self.pet_row} id={self.pet_id}"
+                f"row={self.pet_row} agility={agility} speed_per_ms={self.speed_per_ms:.3f}"
             )
             # Применяем барьеры если они уже пришли до нашего connected
             if self._all_barriers_raw and self.pet_row and not self.barriers:
@@ -510,10 +526,7 @@ class GameSession:
 
             self.last_update = data.get("lastUpdatedAt", self.last_update)
             
-            # Логируем наш стейт при каждом синке пока не прыгнули
-            if self.started and not getattr(self, '_first_jump_done', False):
-                logger.info(f"[{self.game_id}] SYNC state: x={self.pet_x:.0f} speed_x={self.speed_x:.2f} "
-                            f"barriers={len(self.barriers)} status={self.pet_status} row={self.pet_row}")
+
 
             # Барьеры — только в первом синке
             barriers_raw = (
@@ -536,9 +549,11 @@ class GameSession:
                     logger.info(f"[{self.game_id}] Барьеры получены но row ещё неизвестен, ждём connected")
 
         def on_started(data: dict):
-            self.last_update = data.get("lastUpdate", self.last_update)
-            self.started = True
-            logger.info(f"[{self.game_id}] 🏁 Игра началась!")
+            self.last_update   = data.get("lastUpdate", self.last_update)
+            self.started       = True
+            self.game_started_at = time.time() * 1000
+            # Вычисляем speed_per_ms из chars пета если знаем
+            logger.info(f"[{self.game_id}] 🏁 Игра началась! speed_per_ms={self.speed_per_ms:.3f}")
 
         def on_ended(data: dict):
             for p in data.get("usersPrizes", []):
