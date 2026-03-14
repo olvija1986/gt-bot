@@ -339,23 +339,32 @@ class GameSession:
         self.width_pet     = 40
         self.width_barrier = 30
 
-        self.barriers    = []
-        self.last_update = 0
-        self.started     = False
-        self.result      = None
-        self._done       = threading.Event()
+        self.barriers         = []
+        self._all_barriers_raw = []   # все барьеры до того как известен row
+        self.last_update  = 0
+        self.started      = False
+        self.result       = None
+        self._done        = threading.Event()
 
     def _ai_loop(self):
         while not self._done.is_set():
-            if self.started and self.barriers:
-                if self.mode == "race" and self._should_act("race"):
-                    self._client.emit("engine.jump", self._make_action_payload())
-                    logger.info(f"[{self.game_id}] → JUMP x={self.pet_x:.0f}")
-                    time.sleep(0.35)
+            if self.started:
+                if not self.barriers:
+                    pass  # ждём карту
+                elif self.mode == "race" and self._should_act("race"):
+                    payload = self._make_action_payload()
+                    self._client.emit("engine.jump", payload)
+                    logger.info(f"[{self.game_id}] → JUMP x={self.pet_x:.0f} speed_x={self.speed_x:.2f}")
+                    setattr(self, '_first_jump_done', True)
+                    self.pet_status = "jumping"
+                    time.sleep(0.4)
                 elif self.mode == "swim" and self._should_act("swim"):
-                    self._client.emit("engine.dive", self._make_action_payload())
+                    payload = self._make_action_payload()
+                    self._client.emit("engine.dive", payload)
                     logger.info(f"[{self.game_id}] → DIVE x={self.pet_x:.0f} y={self.pet_y:.1f}")
-                    time.sleep(0.35)
+                    setattr(self, '_first_jump_done', True)
+                    self.pet_status = "diving"
+                    time.sleep(0.4)
             time.sleep(0.08)
 
     def _should_act(self, mode: str) -> bool:
@@ -380,7 +389,7 @@ class GameSession:
         if dist <= 0:
             return False
 
-        intelligence = 0.85
+        intelligence = 1.1  # чуть раньше чем идеально — лучше прыгнуть рано чем поздно
         if mode == "race":
             ticks = ticks_to_reach_height(self.jump_power, self.gravity, 50)
             ideal_dist = self.speed_x * (ticks + 2)
@@ -430,29 +439,66 @@ class GameSession:
                 f"[{self.game_id}] Наш пет: {info.get('name')} "
                 f"row={self.pet_row} id={self.pet_id}"
             )
+            # Применяем барьеры если они уже пришли до нашего connected
+            if self._all_barriers_raw and self.pet_row and not self.barriers:
+                self.barriers = sorted(
+                    [b for b in self._all_barriers_raw if b.get("row") == self.pet_row],
+                    key=lambda b: b["x"]
+                )
+                logger.info(f"[{self.game_id}] Барьеры применены после connected: "
+                            f"{len(self.barriers)} на row={self.pet_row}")
+            # Применяем барьеры если они уже пришли до нашего connected
+            if self._all_barriers_raw and self.pet_row and not self.barriers:
+                self.barriers = sorted(
+                    [b for b in self._all_barriers_raw if b.get("row") == self.pet_row],
+                    key=lambda b: b["x"]
+                )
+                logger.info(f"[{self.game_id}] Барьеры применены после connected: "
+                            f"{len(self.barriers)} на row={self.pet_row}")
 
         def on_sync(data: dict):
-            # Координаты нашего пета
+            found = False
             for u in data.get("users", []):
-                if u.get("user", {}).get("_id") != self.user_id:
+                uid = u.get("user", {}).get("_id")
+                if uid != self.user_id:
                     continue
+                found = True
                 coords = u.get("coordinates", {})
-                self.pet_x = coords.get("x", self.pet_x)
-                self.pet_y = coords.get("y", self.pet_y)
+                if coords.get("x") is not None:
+                    self.pet_x = coords["x"]
+                if coords.get("y") is not None:
+                    self.pet_y = coords["y"]
 
                 pet_wrap = u.get("pet", {})
                 if pet_wrap.get("row"):
                     self.pet_row = pet_wrap["row"]
 
-                speed = u.get("speed", {})
-                if speed:
-                    self.speed_x = speed.get("x", self.speed_x)
-                    self.speed_y = speed.get("y", self.speed_y)
-                if "status" in u:
-                    self.pet_status = u["status"]
+                # speed может быть внутри pet или на верхнем уровне
+                speed = u.get("speed") or pet_wrap.get("speed") or {}
+                if speed.get("x") is not None:
+                    self.speed_x = speed["x"]
+                if speed.get("y") is not None:
+                    self.speed_y = speed["y"]
+
+                # jumpPower и gravity из pet.info
+                info = pet_wrap.get("info", {})
+                if info.get("jumpPower"):
+                    self.jump_power = info["jumpPower"]
+
+                status = u.get("status") or pet_wrap.get("status")
+                if status:
+                    self.pet_status = status
                 break
 
+            if not found and self.started:
+                logger.warning(f"[{self.game_id}] Наш пет не найден в синке! users count={len(data.get('users',[]))}")
+
             self.last_update = data.get("lastUpdatedAt", self.last_update)
+            
+            # Логируем наш стейт при каждом синке пока не прыгнули
+            if self.started and not getattr(self, '_first_jump_done', False):
+                logger.info(f"[{self.game_id}] SYNC state: x={self.pet_x:.0f} speed_x={self.speed_x:.2f} "
+                            f"barriers={len(self.barriers)} status={self.pet_status} row={self.pet_row}")
 
             # Барьеры — только в первом синке
             barriers_raw = (
@@ -460,15 +506,19 @@ class GameSession:
                     .get("mapInfo", {})
                     .get("barriers")
             )
-            if barriers_raw is not None and self.pet_row is not None and not self.barriers:
-                self.barriers = sorted(
-                    [b for b in barriers_raw if b.get("row") == self.pet_row],
-                    key=lambda b: b["x"]
-                )
-                logger.info(
-                    f"[{self.game_id}] Карта: {len(self.barriers)} барьеров "
-                    f"на row={self.pet_row}, первый x={self.barriers[0]['x'] if self.barriers else '—'}"
-                )
+            if barriers_raw is not None:
+                self._all_barriers_raw = barriers_raw   # всегда сохраняем
+                if self.pet_row is not None and not self.barriers:
+                    self.barriers = sorted(
+                        [b for b in barriers_raw if b.get("row") == self.pet_row],
+                        key=lambda b: b["x"]
+                    )
+                    logger.info(
+                        f"[{self.game_id}] Карта: {len(self.barriers)} барьеров "
+                        f"на row={self.pet_row}, первый x={self.barriers[0]['x'] if self.barriers else '—'}"
+                    )
+                elif self.pet_row is None:
+                    logger.info(f"[{self.game_id}] Барьеры получены но row ещё неизвестен, ждём connected")
 
         def on_started(data: dict):
             self.last_update = data.get("lastUpdate", self.last_update)
