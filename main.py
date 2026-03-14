@@ -181,6 +181,37 @@ def make_game_callback(mode: str, count: int):
     return on_update
 
 # ================= Запуск / остановка авто-игры =================
+def cmd_list_pets():
+    """Показывает всех петов пользователя с кнопками для выбора."""
+    from game_player import get_all_pets
+    pets = get_all_pets()
+    if not pets:
+        send_telegram("❌ Не удалось получить список петов.")
+        return
+
+    fp = get_forced_pet_id()
+    lines = ["🐾 Твои питомцы:"]
+    for p in pets:
+        marker = " ✅" if fp == p["id"] else ""
+        lines.append(
+            f"evo{p['evolution']} | {p['name']} lv{p['level']} | "
+            f"🏃{p['agility']} 🏊{p['swim']}{marker}"
+        )
+        lines.append(f"  id: {p['id']}")
+
+    keyboard = []
+    for p in pets:
+        label = (
+            f"{'✅' if fp == p['id'] else ''}"
+            f"evo{p['evolution']} {p['name']} "
+            f"agi={p['agility']} swim={p['swim']}"
+        )
+        keyboard.append([{"text": label, "callback_data": f"setpet:{p['id']}"}])
+    keyboard.append([{"text": "🔄 Авто-выбор", "callback_data": "setpet:clear"}])
+
+    tg_send_keyboard("\n".join(lines), keyboard)
+
+
 def start_auto_play(mode: str, count: int, pet_id: str = None):
     from game_player import AutoPlayer, get_best_pet_for_mode
 
@@ -189,9 +220,9 @@ def start_auto_play(mode: str, count: int, pet_id: str = None):
         send_telegram("⚠️ Авто-игра уже запущена! Сначала останови её — /stopgame")
         return
 
-    # Если пет не указан явно — выбираем лучшего автоматически
+    # Приоритет: явный аргумент → принудительный → автовыбор
     if not pet_id:
-        pet_id = get_best_pet_for_mode(mode)
+        pet_id = get_forced_pet_id() or get_best_pet_for_mode(mode)
 
     player = AutoPlayer(
         mode=mode,
@@ -546,6 +577,9 @@ def set_bot_commands():
         {"command": "swim",       "description": "Заплывы /swim [кол-во]"},
         {"command": "stopgame",   "description": "Остановить авто-игру"},
         {"command": "gamestatus", "description": "Статус авто-игры"},
+        {"command": "mypets",     "description": "Список питомцев и выбор"},
+        {"command": "setpet",     "description": "Установить пета /setpet <id>"},
+        {"command": "clearpet",   "description": "Сбросить пета (авто)"},
         {"command": "box",        "description": "Открыть боксы"},
         {"command": "essence",    "description": "Применить эссенции"},
     ]
@@ -634,6 +668,15 @@ def webhook():
                     Thread(target=start_auto_play, args=(mode, count, pet_id), daemon=True).start()
                 except ValueError:
                     send_telegram("❌ Ошибка.")
+
+        # setpet:<id> — установить принудительного пета
+        elif parts[0] == "setpet" and len(parts) == 2:
+            if parts[1] == "clear":
+                set_forced_pet_id(None)
+                send_telegram("✅ Пет сброшен — будет выбираться автоматически.")
+            else:
+                set_forced_pet_id(parts[1])
+                send_telegram(f"✅ Пет установлен: {parts[1]}")
 
         # pick_mode:race — показать выбор количества
         elif parts[0] == "pick_mode" and len(parts) == 2:
@@ -732,6 +775,26 @@ def webhook():
             )
         else:
             send_telegram("⏹ Авто-игра не запущена.")
+
+    elif text == "/mypets":
+        Thread(target=cmd_list_pets, daemon=True).start()
+
+    elif text.startswith("/setpet"):
+        parts = text.strip().split()
+        if len(parts) >= 2:
+            pid = parts[1].strip()
+            set_forced_pet_id(pid)
+            send_telegram(f"✅ Пет установлен: {pid}\nТеперь все игры будут с этим петом.")
+        else:
+            fp = get_forced_pet_id()
+            if fp:
+                send_telegram(f"Текущий пет: {fp}\nЧтобы сбросить: /clearpet")
+            else:
+                send_telegram("Принудительный пет не установлен. Используй /setpet <petId>")
+
+    elif text == "/clearpet":
+        set_forced_pet_id(None)
+        send_telegram("✅ Принудительный пет сброшен. Будет выбираться автоматически.")
 
     elif text == "/essence":
         Thread(target=apply_essences_to_pets, daemon=True).start()
