@@ -346,6 +346,28 @@ def _agility_to_speed_per_ms(agility: int) -> float:
     return ys[-1]
 
 
+def _estimate_running_speed_px_tick(chars: dict) -> tuple[float, str, int]:
+    """
+    Оценивает горизонтальную скорость (px/tick) по статам пета.
+
+    По наблюдениям из матчей race:
+    - strength сильнее влияет на горизонтальную скорость,
+    - agility чаще влияет на траекторию/высоту прыжка.
+
+    Поэтому для скорости берём strength как основной сигнал,
+    но оставляем fallback на agility для совместимости со старыми данными.
+    """
+    strength = int(chars.get("strength", 0) or 0)
+    agility = int(chars.get("agility", 0) or 0)
+
+    speed_source = "strength" if strength > 0 else "agility"
+    speed_stat = strength if strength > 0 else agility
+
+    # Квадратичная аппроксимация скорости (px/tick) на диапазоне 0..100.
+    speed = 0.000624 * speed_stat**2 - 0.016927 * speed_stat + 1.754893
+    return max(0.5, speed), speed_source, speed_stat
+
+
 def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity: float = 1.5) -> float:
     """Симулирует физику прыжка и возвращает x где пет приземлится."""
     y, sy = 0.0, jump_power
@@ -691,22 +713,14 @@ class GameSession:
             if "power" in info:
                 self.gravity = float(info["power"].get("gravity", self.gravity))
 
-            # Квадратичная формула скорости из реальных измерений:
-            # (10→1.648, 53→2.610, 77→4.150 px/tick)
-            # speed = 0.000624*agi^2 - 0.016927*agi + 1.754893
-            agility = info.get("chars", {}).get("agility", 53)
-            self.current_speed_x = (
-                0.000624 * agility**2
-                - 0.016927 * agility
-                + 1.754893
-            )
-            self.current_speed_x = max(0.5, self.current_speed_x)
+            chars = info.get("chars", {})
+            self.current_speed_x, speed_source, speed_stat = _estimate_running_speed_px_tick(chars)
 
             logger.info(
                 f"[{self.game_id}] Наш пет: {info.get('name')} "
-                f"row={self.pet_row} agility={agility} "
+                f"row={self.pet_row} agi={chars.get('agility', 0)} str={chars.get('strength', 0)} "
                 f"speed={self.current_speed_x:.3f}px/tick "
-                f"(тик=10ms → {self.current_speed_x/10:.4f}px/ms) "
+                f"(тик=10ms → {self.current_speed_x/10:.4f}px/ms, by {speed_source}={speed_stat}) "
                 f"jp={self.jump_power:.1f} g={self.gravity:.2f}"
             )
             # Применяем барьеры если они уже пришли до нашего connected
@@ -1038,7 +1052,7 @@ def get_best_pets_by_evolution(mode: str) -> list:
     if not pets:
         return []
 
-    stat_key = "swim" if mode == "swim" else "agility"
+    stat_key = "swim" if mode == "swim" else "strength"
 
     # Группируем по эволюции
     by_evo = {}
@@ -1064,9 +1078,9 @@ def get_best_pet_for_mode(mode: str) -> str | None:
     if not pets:
         return None
     best = pets[0]  # первый = наивысшая эволюция
-    stat_key = "swim" if mode == "swim" else "agility"
+    stat_key = "swim" if mode == "swim" else "strength"
     logger.info(f"Авто-выбор для {mode}: {best['name']} evo{best['evolution']} "
-                f"lv{best['level']} {stat_key}={best[stat_key]}")
+                f"lv{best['level']} {stat_key}={best[stat_key]} agi={best['agility']}")
     return best["id"]
 
 
