@@ -59,7 +59,7 @@ SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", True)
 AI_POLL_INTERVAL_MS = 30
 # Дополнительное упреждение до идеальной точки прыжка.
 # Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
-JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "22"))
+JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "14"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -778,44 +778,51 @@ class GameSession:
             """engine.jump — сервер подтвердил прыжок, обновляем состояние."""
             if data.get("userId") != self.user_id:
                 return
-
+        
             self.pet_status = "jumping"
             coords = data.get("coordinates", {})
             real_x = coords.get("x")
+        
             speed_data = data.get("speed", {}) or {}
             arc_spx = speed_data.get("x", 0)
-
-            # Оценка фактической задержки между jumpedAt и serverTime.
-            jumped_at = self._last_sent_jumped_at
+        
             server_time = data.get("serverTime")
-            if jumped_at and server_time:
-                sample = max(0.0, min(600.0, float(server_time) - float(jumped_at)))
-                self._jump_latency_ms = self._jump_latency_ms * 0.7 + sample * 0.3
-
+        
+            # 🔧 обновляем latency
+            if self._last_sent_jumped_at and server_time:
+                sample = float(server_time) - float(self._last_sent_jumped_at)
+        
+                # фильтр от мусора
+                if 0 < sample < 600:
+                    self._jump_latency_ms = (
+                        self._jump_latency_ms * 0.7 +
+                        sample * 0.3
+                    )
+        
             if real_x is not None:
                 self.pet_x = real_x
                 self._anchor_x = real_x
-                # Обновляем скорость из ответа сервера
+        
                 if arc_spx > 0.5:
                     self.current_speed_x = arc_spx
-                jump_server_time = data.get("serverTime") or self._now_server_ms()
+        
+                jump_server_time = server_time or self._now_server_ms()
                 self._anchor_server_time = jump_server_time
-                # Калибруем game_started_at по реальной позиции
-                if self.current_speed_x > 0:
-                    ticks = (real_x - 118.0) / self.current_speed_x
-                    self.game_started_at = time.time() * 1000 - ticks * 10
+        
                 logger.info(
                     f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
-                    f"spx={self.current_speed_x:.4f} lag_ms≈{self._jump_latency_ms:.0f}"
+                    f"speed={self.current_speed_x:.3f} "
+                    f"latency={self._jump_latency_ms:.0f}ms"
                 )
-
+        
             self.last_update = data.get("lastUpdate", self.last_update)
-
-            # Автосброс статуса — ai_loop сам обнаружит когда можно прыгать снова
+        
+            # автоматический возврат в running
             def reset_after_jump():
                 time.sleep(1.2)
                 if self.pet_status == "jumping":
                     self.pet_status = "running"
+        
             threading.Thread(target=reset_after_jump, daemon=True).start()
 
         client.on("_open",                  on_open)
