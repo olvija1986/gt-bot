@@ -780,60 +780,38 @@ class GameSession:
             self.pet_status = "jumping"
             coords = data.get("coordinates", {})
             real_x = coords.get("x")
+            speed_data = data.get("speed", {}) or {}
+            arc_spx = speed_data.get("x", 0)
+            speed_y = speed_data.get("y", 1.0)
 
             if real_x is not None:
                 self.pet_x = real_x
-                # Вычисляем реальную скорость БЕГА из jumpedAt и confirmed_x
-                # petLastUpdate — время когда сервер вычислил позицию (≈ jumpedAt)
-                jumped_at = data.get("petLastUpdate") or data.get("serverTime")
-                if jumped_at and self.physics_start_at > 0:
-                    running_spx = self._running_speed_from_jump(real_x, jumped_at)
-                    old_spx = self.current_speed_x
-                    ratio = running_spx / max(old_spx, 0.001)
-                    # Якорь: наш отправленный jumpedAt точнее чем petLastUpdate (~150ms позже)
-                    anchor = float(self._last_sent_jumped_at) if self._last_sent_jumped_at > 0 else float(jumped_at)
+                # speed.x из ответа = мгновенная горизонтальная скорость дуги
+                # Стабильна, точна, не требует вычислений
+                anchor = float(self._last_sent_jumped_at or
+                               data.get("petLastUpdate") or
+                               data.get("serverTime") or 0)
 
-                    if 0.3 <= ratio <= 5.0:
-                        self.current_speed_x = running_spx
-                        logger.info(
-                            f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
-                            f"run_spx={running_spx:.4f} "
-                        )
-                        # Сохраняем для следующей дельты
-                        self._prev_confirmed_x  = real_x
-                        self._prev_confirmed_at = float(
-                            self._last_sent_jumped_at if self._last_sent_jumped_at > 0 else jumped_at
-                        )
-                        self._schedule_next_jump(
-                            from_x=real_x, speed=running_spx,
-                            anchor_srv_time=anchor
-                        )
-                    else:
-                        logger.warning(
-                            f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
-                            f"run_spx={running_spx:.4f} подозрительна (ratio={ratio:.2f})"
-                        )
-                        self._prev_confirmed_x  = real_x
-                        self._prev_confirmed_at = float(
-                            self._last_sent_jumped_at if self._last_sent_jumped_at > 0 else jumped_at
-                        )
-                        self._schedule_next_jump(
-                            from_x=real_x, speed=old_spx,
-                            anchor_srv_time=anchor
-                        )
+                if arc_spx > 0.5:
+                    self.current_speed_x = arc_spx
+                    logger.info(
+                        f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} spx={arc_spx:.4f}"
+                    )
+                    self._schedule_next_jump(
+                        from_x=real_x, speed=arc_spx, anchor_srv_time=anchor
+                    )
                 else:
-                    self._schedule_next_jump(from_x=real_x, speed=self.current_speed_x)
+                    self._schedule_next_jump(
+                        from_x=real_x, speed=self.current_speed_x, anchor_srv_time=anchor
+                    )
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
             # Retry только если пет ПРИЗЕМЛИЛСЯ (speed.y ≈ 0) до барьера
-            speed_data = data.get("speed", {})
-            speed_y = speed_data.get("y", 1.0) if speed_data else 1.0
             if abs(speed_y) < 0.5 and real_x is not None and self.barriers:
                 pet_front = real_x + self.width_pet
                 current_barrier = next(
-                    (b for b in self.barriers if b["x"] > real_x),
-                    None
+                    (b for b in self.barriers if b["x"] > real_x), None
                 )
                 if current_barrier and pet_front < current_barrier["x"]:
                     logger.info(
