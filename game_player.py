@@ -442,6 +442,14 @@ class GameSession:
         self.result             = None
         self._done         = threading.Event()
 
+    def _cleanup_jump_timers(self):
+        """Удаляет завершённые/отменённые таймеры из списка."""
+        self._jump_timers = [t for t in self._jump_timers if t.is_alive()]
+
+    def _has_active_jump_timer(self) -> bool:
+        self._cleanup_jump_timers()
+        return bool(self._jump_timers)
+
     def _estimate_pet_x_now(self, now_srv: float) -> float:
         """
         Оценка текущей позиции пета на серверной временной шкале.
@@ -832,6 +840,31 @@ class GameSession:
                     logger.info(
                         f"[{self.game_id}] Карта: {len(self.barriers)} барьеров "
                         f"на row={self.pet_row}, первый x={self.barriers[0]['x'] if self.barriers else '—'}"
+                    )
+
+            # Fallback против рассинхрона:
+            # если по какой-то причине потеряли engine.jump confirm и планировщик
+            # остался без таймера, перепланируем прыжок от текущей позиции.
+            if (
+                self.started
+                and self.mode == "race"
+                and self.barriers
+                and self.current_speed_x > 0
+                and self.pet_status == "running"
+                and not self._has_active_jump_timer()
+            ):
+                now_srv = time.time() * 1000 + self.server_time_offset
+                est_x = self._estimate_pet_x_now(now_srv)
+                next_b = next((b for b in self.barriers if b["x"] > est_x + self.width_pet), None)
+                if next_b:
+                    logger.info(
+                        f"[{self.game_id}] SYNC fallback: no active jump timer, "
+                        f"replan from x≈{est_x:.0f} to barrier={next_b['x']}"
+                    )
+                    self._schedule_next_jump(
+                        from_x=est_x,
+                        speed=self.current_speed_x,
+                        anchor_srv_time=now_srv,
                     )
 
         def on_started(data: dict):
