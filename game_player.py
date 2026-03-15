@@ -492,8 +492,11 @@ class GameSession:
             ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
         ideal_dist = self.current_speed_x * (ticks + 2)
 
-        # intelligence=1.0 → triggerDist = idealDist (без jitter)
-        if dist <= ideal_dist:
+        # Запас на polling lag (80ms) + сетевую задержку (~150ms) + погрешность позиции
+        # При speed=2.0: 230ms * 2.0/10ms_per_tick = 46px движения до реального прыжка
+        poll_lag_px = self.current_speed_x * 23  # 230ms / 10ms
+
+        if dist <= ideal_dist + poll_lag_px:
             now_srv = int(time.time() * 1000 + self.server_time_offset)
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
