@@ -573,13 +573,20 @@ class GameSession:
             est_front = est_x + self.width_pet
             distance_to_barrier = bx - est_front
 
-            desired_jump_dist = ideal_dist + BUFFER
-            tolerance = 15.0
-            min_jump_dist = 55.0
+            # Компенсируем задержку между решением и фактическим применением прыжка сервером.
+            # По логам обычно 150-220ms, поэтому добавляем запас по дистанции.
+            estimated_delay_ticks = 18.0
+            latency_comp_px = speed_now * estimated_delay_ticks
+            desired_jump_dist = ideal_dist + BUFFER + latency_comp_px
+
+            # Коридор принятия решения: прыгаем немного раньше, чем «впритык». 
+            tolerance = 8.0
+            min_jump_dist = 70.0
 
             if distance_to_barrier > desired_jump_dist + tolerance and speed_now > 0:
                 extra_ticks = (distance_to_barrier - (desired_jump_dist + tolerance)) / speed_now
-                extra_delay_s = min(0.2, max(0.02, extra_ticks * 0.01))
+                # Маленькие шаги перепроверки не дают перескочить окно прыжка.
+                extra_delay_s = min(0.12, max(0.015, extra_ticks * 0.01))
                 logger.info(
                     f"[{self.game_id}] EARLY jump guard: dist={distance_to_barrier:.1f}px "
                     f"target={desired_jump_dist:.1f}px barrier={bx}, postpone {extra_delay_s*1000:.0f}ms"
