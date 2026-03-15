@@ -30,6 +30,7 @@ import time
 import json
 import logging
 import threading
+from collections import deque
 import requests
 import websocket   # pip install websocket-client
 
@@ -433,7 +434,11 @@ class GameSession:
         self._last_sent_jumped_at = 0.0   # jumpedAt который мы отправили последним
         self._prev_confirmed_x   = 0.0   # x предыдущего подтверждённого прыжка
         self._prev_confirmed_at  = 0.0   # jumpedAt предыдущего подтверждённого прыжка
+        self._prev_confirmed_ground_x = 0.0  # ground-x предыдущего подтверждённого прыжка
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
+        # История отправленных прыжков для матчинга с delayed engine.jump confirm.
+        # Храним короткий хвост: (jumped_at, target_x, barrier_x).
+        self._sent_jumps = deque(maxlen=16)
         self.result             = None
         self._done         = threading.Event()
 
@@ -452,30 +457,22 @@ class GameSession:
 
     def _running_speed_from_jump(self, confirmed_x: float, jumped_at: int, ground_x: float | None = None) -> float:
         """
-        Вычисляет скорость бега по дельте target_x между соседними прыжками.
+        Вычисляет скорость бега по дельте ground_x между соседними прыжками.
 
         confirmed_x — позиция в середине дуги, не подходит для скорости.
-        target_x предыдущего и текущего прыжков — оба на земле → точная дельта.
+        ground_x — якорь на земле (обычно target_x соответствующего прыжка).
         """
         use_at = jumped_at
         current_ground_x = ground_x if ground_x is not None else confirmed_x
 
-        # Дельта target_x / delta_time между соседними прыжками
-        if self._prev_target_x > 0 and self._prev_confirmed_at > 0:
-            # _prev_target_x — где пет был при предыдущем прыжке (на земле)
-            # сейчас пет тоже на земле в районе текущего target_x
-            # Но мы не знаем текущий target_x здесь, используем confirmed_x как приближение
-            # Лучше: используем delta_jumpedAt и prev_target_x как anchor
+        # Дельта ground_x / delta_time между соседними подтверждёнными прыжками.
+        if self._prev_confirmed_ground_x > 0 and self._prev_confirmed_at > 0:
             dt = (use_at - self._prev_confirmed_at) / 10.0
             if dt > 5:  # минимум 5 тиков между прыжками
-                # За dt тиков пет прошёл от prev_target_x до ~confirmed_x
-                # Но confirmed_x неточен (дуга). Используем avg speed от prev_target_x
-                # как лучшую оценку: скорость = (confirmed_x - prev_target_x + jump_dist) / dt
-                # Упрощение: average speed over full interval
-                dx = current_ground_x - self._prev_target_x
+                dx = current_ground_x - self._prev_confirmed_ground_x
                 if dx > 0:
                     speed = dx / dt
-                    logger.info(f"run_speed delta: prev_x={self._prev_target_x:.0f} "
+                    logger.info(f"run_speed delta: prev_x={self._prev_confirmed_ground_x:.0f} "
                                f"curr_x={confirmed_x:.0f} dt={dt:.0f}t → {speed:.4f}")
                     return speed
 
@@ -688,6 +685,7 @@ class GameSession:
             # Запоминаем jumpedAt который отправили — для точного расчёта скорости
             self._last_sent_jumped_at = actual_jumped_at
             self._prev_target_x = target_ref  # target_x этого прыжка
+            self._sent_jumps.append((actual_jumped_at, float(target_ref), float(bx)))
             logger.info(
                 f"[{self.game_id}] ⏱ JUMP jumpedAt={actual_jumped_at} "
                 f"barrier={bx} dist={distance_to_barrier:.1f}px "
@@ -921,7 +919,7 @@ class GameSession:
                 # поэтому real_x не равен позиции на земле в момент jumpedAt.
                 # Для планирования следующего прыжка используем target_x предыдущего
                 # отправленного прыжка (если есть), а не mid-air координату.
-                anchor = float(
+                confirm_time = float(
                     data.get("petLastUpdate")
                     or data.get("lastUpdate")
                     or data.get("serverTime")
@@ -929,19 +927,30 @@ class GameSession:
                     or 0
                 )
 
-                # target_x полезен как якорь на земле, но иногда подтверждение приходит
-                # не для самого свежего отправленного прыжка. Если разъезд большой,
-                # считаем _prev_target_x устаревшим и используем фактический real_x.
+                # Ищем какой из отправленных нами jumpedAt ближе всего к confirm.
+                # Это лечит ситуацию, когда confirm приходит с заметной задержкой
+                # и _prev_target_x уже относится к следующему прыжку.
+                matched_jump = None
+                if self._sent_jumps:
+                    matched_jump = min(
+                        self._sent_jumps,
+                        key=lambda item: abs(item[0] - confirm_time),
+                    )
+
+                anchor = confirm_time
                 anchor_x = real_x
-                if self._prev_target_x > 0:
-                    drift = abs(self._prev_target_x - real_x)
-                    max_drift = max(180.0, self.current_speed_x * 120.0)
+                if matched_jump is not None:
+                    sent_at, sent_target_x, sent_barrier_x = matched_jump
+                    anchor = float(sent_at)
+                    drift = abs(sent_target_x - real_x)
+                    max_drift = max(240.0, self.current_speed_x * 160.0)
                     if drift <= max_drift:
-                        anchor_x = self._prev_target_x
+                        anchor_x = sent_target_x
                     else:
                         logger.info(
                             f"[{self.game_id}] jump anchor drift too large: "
-                            f"target_x={self._prev_target_x:.0f} real_x={real_x:.0f} drift={drift:.1f}px"
+                            f"target_x={sent_target_x:.0f} real_x={real_x:.0f} drift={drift:.1f}px "
+                            f"barrier={sent_barrier_x:.0f}"
                         )
 
                 # Оцениваем реальную скорость бега (по земле), не подменяя её
@@ -963,6 +972,7 @@ class GameSession:
                 # Обновляем историю подтверждённых прыжков для расчёта speed на следующем.
                 self._prev_confirmed_x = real_x
                 self._prev_confirmed_at = anchor
+                self._prev_confirmed_ground_x = anchor_x
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
