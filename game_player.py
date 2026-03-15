@@ -59,7 +59,7 @@ SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", True)
 AI_POLL_INTERVAL_MS = 30
 # Дополнительное упреждение до идеальной точки прыжка.
 # Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
-JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "16"))
+JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "22"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -509,17 +509,16 @@ class GameSession:
         # Обновляем оценку позиции (тик = 10ms)
         self.pet_x = self._estimate_pet_x()
 
-        pet_front = self.pet_x + self.width_pet
 
         # findNextBarrier: первый барьер чья правая грань ещё впереди пета
         barrier = next(
-            (b for b in self.barriers if b["x"] + self.width_barrier > pet_front),
+            (b for b in self.barriers if b["x"] > self.pet_x),
             None
         )
         if not barrier:
             return
 
-       dist = barrier["x"] - pet_x
+       dist = barrier["x"] - self.pet_x
         if dist <= 0:
             return
 
@@ -546,7 +545,7 @@ class GameSession:
             jumpedAt = now_srv - self._jump_latency_ms
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
-                "jumpedAt": now_srv,
+                "jumpedAt": int(jumpedAt),
             }
             event = "engine.jump" if self.mode == "race" else "engine.dive"
             self._client.emit_with_null(event, payload)
