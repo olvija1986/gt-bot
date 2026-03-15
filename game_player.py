@@ -52,6 +52,8 @@ JUMP_SEND_AHEAD_MS = float(os.environ.get("JUMP_SEND_AHEAD_MS", "120"))
 # Глобальный доп. сдвиг влево для более раннего старта прыжка.
 # Полезно если питомец всё ещё иногда "упирается" в край барьера.
 JUMP_EARLY_EXTRA_PX = float(os.environ.get("JUMP_EARLY_EXTRA_PX", "16"))
+# Доп. сдвиг по барьерам №2+ (помогает на сериях препятствий 2/3/4).
+JUMP_CHAIN_EXTRA_PX = float(os.environ.get("JUMP_CHAIN_EXTRA_PX", "8"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -514,6 +516,8 @@ class GameSession:
         self._prev_confirmed_x   = 0.0   # x предыдущего подтверждённого прыжка
         self._prev_confirmed_at  = 0.0   # jumpedAt предыдущего подтверждённого прыжка
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
+        self._last_fire_local_ms = 0.0   # локальное время отправки jump-пакета
+        self._tx_latency_ms      = 0.0   # EWMA оценка send->server latency
         self.result             = None
         self._done         = threading.Event()
 
@@ -586,12 +590,16 @@ class GameSession:
             # (включая _last_jumped_barrier снова если нужно)
             search_from = pet_front
 
-        next_b = next(
-            (b for b in self.barriers
-             if b["x"] > search_from
-             and (landing_x > self._last_jumped_barrier or b["x"] >= self._last_jumped_barrier)),
-            None
-        )
+        next_idx = None
+        next_b = None
+        for i, b in enumerate(self.barriers):
+            if (
+                b["x"] > search_from
+                and (landing_x > self._last_jumped_barrier or b["x"] >= self._last_jumped_barrier)
+            ):
+                next_idx = i
+                next_b = b
+                break
         if not next_b:
             logger.info(f"[{self.game_id}] Все барьеры пройдены (from_x={from_x:.0f})")
             return
@@ -636,6 +644,9 @@ class GameSession:
 
         # Пользовательская тонкая настройка: ранний старт в пикселях.
         PRE_JUMP_OFFSET += max(0.0, JUMP_EARLY_EXTRA_PX)
+        # На барьерах 2/3/4 оставляем немного больший запас (цепочка препятствий).
+        if next_idx is not None and next_idx >= 1:
+            PRE_JUMP_OFFSET += min(28.0, JUMP_CHAIN_EXTRA_PX * float(next_idx))
         # Авто-подстройка: если подтверждения прыжка приходят слишком поздно,
         # постепенно увеличиваем ранний старт в on_jump.
         PRE_JUMP_OFFSET += max(0.0, self._adaptive_prejump_px)
@@ -659,6 +670,8 @@ class GameSession:
         # Локальное время отправки
         now_local = time.time() * 1000
         send_ahead_ms = JUMP_SEND_AHEAD_MS + min(120.0, slow_factor * 150.0)
+        # Добавляем сетевую поправку по реальным подтверждениям сервера.
+        send_ahead_ms += min(180.0, max(0.0, self._tx_latency_ms))
         fire_local = jump_server_time - self.server_time_offset - send_ahead_ms
         delay_s = max(0.0, (fire_local - now_local) / 1000.0)
 
@@ -681,6 +694,7 @@ class GameSession:
             }
             event = "engine.jump" if self.mode == "race" else "engine.dive"
             self._client.emit_with_null(event, payload)
+            self._last_fire_local_ms = time.time() * 1000
             self.pet_status = "jumping"
             self._last_jumped_barrier = bx  # фиксируем только при реальной отправке
             # Запоминаем jumpedAt который отправили — для точного расчёта скорости
@@ -948,21 +962,32 @@ class GameSession:
                     # понемногу откатываем добавку.
                     if self._last_jumped_barrier > 0:
                         clearance = self._last_jumped_barrier - (real_x + self.width_pet)
-                        if clearance < 8.0:
+                        target_clearance = 20.0
+                        if clearance < target_clearance:
                             self._adaptive_prejump_px = min(
                                 110.0,
-                                self._adaptive_prejump_px + (8.0 - clearance) * 0.55,
+                                self._adaptive_prejump_px + (target_clearance - clearance) * 0.60,
                             )
-                        elif clearance > 72.0:
+                        elif clearance > 80.0:
                             self._adaptive_prejump_px = max(
                                 0.0,
                                 self._adaptive_prejump_px
-                                - min(10.0, (clearance - 72.0) * 0.2),
+                                - min(12.0, (clearance - 80.0) * 0.22),
                             )
+
+                    # Оцениваем задержку отправка->сервер и сглаживаем её.
+                    if self._last_fire_local_ms > 0:
+                        ack_local_ms = time.time() * 1000
+                        sample = max(0.0, ack_local_ms - self._last_fire_local_ms)
+                        if self._tx_latency_ms <= 0:
+                            self._tx_latency_ms = sample
+                        else:
+                            self._tx_latency_ms = self._tx_latency_ms * 0.75 + sample * 0.25
 
                     logger.info(
                         f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} spx={arc_spx:.4f} "
-                        f"adapt_pre={self._adaptive_prejump_px:.1f}px"
+                        f"adapt_pre={self._adaptive_prejump_px:.1f}px "
+                        f"txLag≈{self._tx_latency_ms:.0f}ms"
                     )
                     self._schedule_next_jump(
                         from_x=real_x, speed=arc_spx, anchor_srv_time=anchor
