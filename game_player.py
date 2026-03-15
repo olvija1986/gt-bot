@@ -450,14 +450,15 @@ class GameSession:
         dt_ticks = max(0.0, (now_srv - self.last_update) / 10.0)
         return base_x + dt_ticks * self.current_speed_x
 
-    def _running_speed_from_jump(self, confirmed_x: float, jumped_at: int) -> float:
+    def _running_speed_from_jump(self, confirmed_x: float, jumped_at: int, ground_x: float | None = None) -> float:
         """
         Вычисляет скорость бега по дельте target_x между соседними прыжками.
 
         confirmed_x — позиция в середине дуги, не подходит для скорости.
         target_x предыдущего и текущего прыжков — оба на земле → точная дельта.
         """
-        use_at = self._last_sent_jumped_at if self._last_sent_jumped_at > 0 else jumped_at
+        use_at = jumped_at
+        current_ground_x = ground_x if ground_x is not None else confirmed_x
 
         # Дельта target_x / delta_time между соседними прыжками
         if self._prev_target_x > 0 and self._prev_confirmed_at > 0:
@@ -471,7 +472,7 @@ class GameSession:
                 # Но confirmed_x неточен (дуга). Используем avg speed от prev_target_x
                 # как лучшую оценку: скорость = (confirmed_x - prev_target_x + jump_dist) / dt
                 # Упрощение: average speed over full interval
-                dx = confirmed_x - self._prev_target_x
+                dx = current_ground_x - self._prev_target_x
                 if dx > 0:
                     speed = dx / dt
                     logger.info(f"run_speed delta: prev_x={self._prev_target_x:.0f} "
@@ -484,7 +485,7 @@ class GameSession:
         elapsed = (use_at - self.physics_start_at) / 10.0
         if elapsed <= 0:
             return self.current_speed_x
-        return (confirmed_x - 118.0) / elapsed
+        return (current_ground_x - 118.0) / elapsed
 
     def _schedule_next_jump(self, from_x: float, speed: float,
                             anchor_srv_time: float = 0.0):
@@ -898,19 +899,34 @@ class GameSession:
                 # поэтому real_x не равен позиции на земле в момент jumpedAt.
                 # Для планирования следующего прыжка используем target_x предыдущего
                 # отправленного прыжка (если есть), а не mid-air координату.
-                anchor = float(self._last_sent_jumped_at or
-                               data.get("petLastUpdate") or
-                               data.get("serverTime") or 0)
+                anchor = float(
+                    data.get("petLastUpdate")
+                    or data.get("lastUpdate")
+                    or data.get("serverTime")
+                    or self._last_sent_jumped_at
+                    or 0
+                )
+
+                # target_x полезен как якорь на земле, но иногда подтверждение приходит
+                # не для самого свежего отправленного прыжка. Если разъезд большой,
+                # считаем _prev_target_x устаревшим и используем фактический real_x.
+                anchor_x = real_x
+                if self._prev_target_x > 0:
+                    drift = abs(self._prev_target_x - real_x)
+                    max_drift = max(180.0, self.current_speed_x * 120.0)
+                    if drift <= max_drift:
+                        anchor_x = self._prev_target_x
+                    else:
+                        logger.info(
+                            f"[{self.game_id}] jump anchor drift too large: "
+                            f"target_x={self._prev_target_x:.0f} real_x={real_x:.0f} drift={drift:.1f}px"
+                        )
 
                 # Оцениваем реальную скорость бега (по земле), не подменяя её
                 # мгновенной дуговой speed.x из engine.jump.
-                running_spx = self._running_speed_from_jump(real_x, int(anchor))
+                running_spx = self._running_speed_from_jump(real_x, int(anchor), ground_x=anchor_x)
                 if running_spx > 0.5:
                     self.current_speed_x = running_spx
-
-                # anchor_x — позиция на земле в момент jumpedAt.
-                # Если есть target предыдущего прыжка, он заметно стабильнее real_x.
-                anchor_x = self._prev_target_x if self._prev_target_x > 0 else real_x
 
                 logger.info(
                     f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
