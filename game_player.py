@@ -422,8 +422,14 @@ class GameSession:
             ticks_up = ticks_to_reach_depth(self.dive_power, barrier_high)
 
         # Позиция пета при прыжке: нужно быть за ideal_dist до барьера
+        # + BUFFER: компенсация ошибки формулы скорости (~7.5% занижение)
+        # Первый вызов (from_x=118) — скорость из формулы, буфер 50px
+        # После калибровки (from_x=real_x) — скорость реальная, буфер 10px
+        is_calibrated = from_x > 200.0
+        BUFFER = 10.0 if is_calibrated else 50.0
+
         ideal_dist = speed * (ticks_up + 2)
-        target_x = next_b["x"] - ideal_dist - self.width_pet
+        target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER
         target_x = max(target_x, from_x + speed)  # минимум 1 тик вперёд
 
         # Серверное время прыжка через elapsed_ticks от physics_start
@@ -437,9 +443,8 @@ class GameSession:
 
         logger.info(
             f"[{self.game_id}] NEXT JUMP: barrier={next_b['x']} "
-            f"from_x={from_x:.0f} target_x={target_x:.0f} "
-            f"ideal={ideal_dist:.1f}px speed={speed:.4f} "
-            f"fire_in={delay_s*1000:.0f}ms jumpedAt={int(jump_server_time)}"
+            f"target_x={target_x:.0f} ideal={ideal_dist:.1f}+buf={BUFFER:.0f} "
+            f"speed={speed:.4f} fire_in={delay_s*1000:.0f}ms"
         )
 
         def fire(srv_time=jump_server_time, bx=next_b["x"]):
@@ -718,8 +723,6 @@ class GameSession:
         client.on("engine.dive",            on_dive)
         client.on("engine.emerge",          on_emerge)
         client.on("engine.jump",            on_jump)
-
-        threading.Thread(target=self._ai_loop, daemon=True).start()
 
         ws_thread = client.connect()
 
