@@ -47,6 +47,8 @@ WAITROOM_WS    = "wss://waitroom.nl.gatto.pw/socket.io/?EIO=4&transport=websocke
 SCREEN         = {"w": 1182, "h": 468}
 WAITROOM_TIMEOUT = 60    # сек ждём матч
 GAME_TIMEOUT     = 120   # сек максимум на игру
+# Отправляем jump немного заранее для компенсации сети/обработки на сервере.
+JUMP_SEND_AHEAD_MS = float(os.environ.get("JUMP_SEND_AHEAD_MS", "120"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -636,13 +638,14 @@ class GameSession:
 
         # Локальное время отправки
         now_local = time.time() * 1000
-        fire_local = jump_server_time - self.server_time_offset
+        fire_local = jump_server_time - self.server_time_offset - JUMP_SEND_AHEAD_MS
         delay_s = max(0.0, (fire_local - now_local) / 1000.0)
 
         logger.info(
             f"[{self.game_id}] NEXT JUMP: barrier={next_b['x']} "
             f"target_x={target_x:.0f} ideal={ideal_dist:.1f}+buf={BUFFER:.0f}+pre={PRE_JUMP_OFFSET:.0f} "
-            f"speed={speed:.4f} fire_in={delay_s*1000:.0f}ms"
+            f"speed={speed:.4f} fire_in={delay_s*1000:.0f}ms "
+            f"send_ahead={JUMP_SEND_AHEAD_MS:.0f}ms"
         )
 
         def fire(srv_time=jump_server_time, bx=next_b["x"], target_ref=target_x):
@@ -842,8 +845,10 @@ class GameSession:
                 f"[{self.game_id}] 🏁 Игра! physics_start={server_time} "
                 f"speed={self.current_speed_x:.4f}px/tick"
             )
-            # Планируем первый прыжок от стартовой позиции
-            self._schedule_next_jump(from_x=118.0, speed=self.current_speed_x)
+            # Планируем первый прыжок от актуальной позиции из sync.
+            # Жёсткая 118 иногда даёт поздний тайминг в начале заезда.
+            start_x = float(self.pet_x) if self.pet_x is not None else 118.0
+            self._schedule_next_jump(from_x=start_x, speed=self.current_speed_x)
 
         def on_ended(data: dict):
             for p in data.get("usersPrizes", []):
