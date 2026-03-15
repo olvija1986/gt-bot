@@ -52,6 +52,8 @@ JUMP_SEND_AHEAD_MS = float(os.environ.get("JUMP_SEND_AHEAD_MS", "120"))
 # Глобальный доп. сдвиг влево для более раннего старта прыжка.
 # Полезно если питомец всё ещё иногда "упирается" в край барьера.
 JUMP_EARLY_EXTRA_PX = float(os.environ.get("JUMP_EARLY_EXTRA_PX", "16"))
+# Минимальный запас между носом пета и барьером в момент отправки прыжка.
+JUMP_MIN_FRONT_CLEARANCE_PX = float(os.environ.get("JUMP_MIN_FRONT_CLEARANCE_PX", "38"))
 # Доп. сдвиг по барьерам №2+ (помогает на сериях препятствий 2/3/4).
 JUMP_CHAIN_EXTRA_PX = float(os.environ.get("JUMP_CHAIN_EXTRA_PX", "8"))
 # Минимальная пауза между отправками jump/dive, чтобы исключить дребезг
@@ -723,6 +725,10 @@ class GameSession:
         else:
             target_dist = safe_dx + network_pad
 
+        # Не прыгаем впритык: фиксируем минимальный запас до барьера по координате.
+        min_target_dist = self.width_pet + max(0.0, JUMP_MIN_FRONT_CLEARANCE_PX)
+        target_dist = max(target_dist, min_target_dist)
+
         target_x = next_b["x"] - target_dist
         target_x = max(target_x, from_x + speed)
 
@@ -1063,7 +1069,7 @@ class GameSession:
                     # понемногу откатываем добавку.
                     if self._last_jumped_barrier > 0:
                         clearance = self._last_jumped_barrier - (real_x + self.width_pet)
-                        target_clearance = 20.0
+                        target_clearance = 34.0
                         if clearance < target_clearance:
                             self._adaptive_prejump_px = min(
                                 110.0,
