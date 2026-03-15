@@ -515,11 +515,10 @@ class GameSession:
 
         ideal_dist = speed * (ticks_up + 2)
 
-        # BUFFER: сколько px до барьера должен быть пет в момент прыжка
-        # Для надёжного перелёта нужно dist ≥ 40px при jump_x
-        # Initial: скорость откорректирована *1.18, буфер небольшой
-        # Calibrated: скорость реальная из подтверждённого прыжка
-        BUFFER = 130.0
+        # BUFFER: сколько px до барьера должен быть пет в момент прыжка.
+        # На реальном сервере (RTT + обработка input) команда применятся с
+        # задержкой, поэтому прыгаем ощутимо раньше.
+        BUFFER = 160.0
 
         target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER
         target_x = max(target_x, from_x + speed)
@@ -574,14 +573,22 @@ class GameSession:
             distance_to_barrier = bx - est_front
 
             # Компенсируем задержку между решением и фактическим применением прыжка сервером.
-            # По логам обычно 150-220ms, поэтому добавляем запас по дистанции.
-            estimated_delay_ticks = 18.0
+            # На загруженных лобби доходит до ~250ms, поэтому берём более консервативный запас.
+            estimated_delay_ticks = 24.0
             latency_comp_px = speed_now * estimated_delay_ticks
             desired_jump_dist = ideal_dist + BUFFER + latency_comp_px
 
-            # Коридор принятия решения: прыгаем немного раньше, чем «впритык». 
-            tolerance = 8.0
+            # Коридор принятия решения: прыгаем немного раньше, чем «впритык».
+            tolerance = 5.0
             min_jump_dist = 70.0
+
+            # Защита от «позднего» прыжка: если почти у барьера — шлём сразу
+            # и не переносим таймер (иначе упираемся в барьер до применения input).
+            if distance_to_barrier <= min_jump_dist:
+                logger.info(
+                    f"[{self.game_id}] LATE jump guard: dist={distance_to_barrier:.1f}px "
+                    f"barrier={bx}, fire immediately"
+                )
 
             if distance_to_barrier > desired_jump_dist + tolerance and speed_now > 0:
                 extra_ticks = (distance_to_barrier - (desired_jump_dist + tolerance)) / speed_now
