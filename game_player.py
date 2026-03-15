@@ -391,6 +391,19 @@ class GameSession:
         self.result             = None
         self._done         = threading.Event()
 
+    def _running_speed_from_jump(self, confirmed_x: float, jumped_at: int) -> float:
+        """
+        Вычисляет реальную скорость БЕГА пета из подтверждённого прыжка.
+        running_speed = (x - 118) / elapsed_ticks
+        Это скорость до прыжка (горизонтальная), не скорость во время дуги прыжка.
+        """
+        if not self.physics_start_at or self.physics_start_at <= 0:
+            return self.current_speed_x
+        elapsed_ticks = (jumped_at - self.physics_start_at) / 10.0
+        if elapsed_ticks <= 0:
+            return self.current_speed_x
+        return (confirmed_x - 118.0) / elapsed_ticks
+
     def _schedule_next_jump(self, from_x: float, speed: float):
         """
         Планирует ОДИН следующий прыжок на основе текущей позиции и скорости.
@@ -434,7 +447,10 @@ class GameSession:
         # Первый вызов (from_x=118) — скорость из формулы, буфер 50px
         # После калибровки (from_x=real_x) — скорость реальная, буфер 10px
         is_calibrated = from_x > 200.0
-        BUFFER = 10.0 if is_calibrated else 50.0
+        # Initial: formula underestimates speed by ~15%, need 90px buffer
+        # Calibrated: speed is accurate running speed, but pet accelerates
+        # so add 30px buffer for safety
+        BUFFER = 30.0 if is_calibrated else 90.0
 
         ideal_dist = speed * (ticks_up + 2)
         target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER
@@ -706,19 +722,33 @@ class GameSession:
             self.pet_status = "jumping"
             coords = data.get("coordinates", {})
             real_x = coords.get("x")
-            speed = data.get("speed", {})
-            real_spx = speed.get("x") if speed else None
 
-            if real_x is not None and real_spx and real_spx > 0:
+            if real_x is not None:
                 self.pet_x = real_x
-                self.current_speed_x = real_spx
-                logger.info(
-                    f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} spx={real_spx:.4f}"
-                )
-                # Планируем СЛЕДУЮЩИЙ прыжок с реальными данными
-                self._schedule_next_jump(from_x=real_x, speed=real_spx)
-            elif real_x is not None:
-                self.pet_x = real_x
+                # Вычисляем реальную скорость БЕГА из jumpedAt и confirmed_x
+                # petLastUpdate — время когда сервер вычислил позицию (≈ jumpedAt)
+                jumped_at = data.get("petLastUpdate") or data.get("serverTime")
+                if jumped_at and self.physics_start_at > 0:
+                    running_spx = self._running_speed_from_jump(real_x, jumped_at)
+                    old_spx = self.current_speed_x
+                    ratio = running_spx / max(old_spx, 0.001)
+
+                    if 0.3 <= ratio <= 5.0:
+                        self.current_speed_x = running_spx
+                        logger.info(
+                            f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
+                            f"run_spx={running_spx:.4f} "
+                            f"(ticks={(jumped_at-self.physics_start_at)/10:.0f})"
+                        )
+                        self._schedule_next_jump(from_x=real_x, speed=running_spx)
+                    else:
+                        logger.warning(
+                            f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
+                            f"run_spx={running_spx:.4f} подозрительна (ratio={ratio:.2f})"
+                        )
+                        self._schedule_next_jump(from_x=real_x, speed=old_spx)
+                else:
+                    self._schedule_next_jump(from_x=real_x, speed=self.current_speed_x)
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
