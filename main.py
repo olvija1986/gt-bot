@@ -84,6 +84,7 @@ def send_telegram(text):
 
 # ================= AutoPlayer состояние =================
 _auto_player = None
+_forced_pet_id = None
 
 
 def get_auto_player():
@@ -93,6 +94,15 @@ def get_auto_player():
 def set_auto_player(player):
     global _auto_player
     _auto_player = player
+
+
+def get_forced_pet_id():
+    return _forced_pet_id
+
+
+def set_forced_pet_id(pid):
+    global _forced_pet_id
+    _forced_pet_id = pid
 
 
 # ================= Callback от AutoPlayer → Telegram =================
@@ -649,9 +659,12 @@ def webhook():
         cq_data = cq.get("data", "")
         chat_id = cq.get("message", {}).get("chat", {}).get("id")
 
+        log(f"CALLBACK: chat_id={chat_id!r} ({type(chat_id).__name__}) CHAT_ID={CHAT_ID!r} data={cq_data!r}")
+
         tg_answer_callback(cq_id)
 
-        if chat_id != CHAT_ID:
+        if int(chat_id) != int(CHAT_ID):
+            log(f"CALLBACK IGNORED: chat_id mismatch")
             return "ok"
 
         parts = cq_data.split(":")
