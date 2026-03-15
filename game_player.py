@@ -61,6 +61,10 @@ JUMP_CHAIN_EXTRA_PX = float(os.environ.get("JUMP_CHAIN_EXTRA_PX", "8"))
 JUMP_RETRY_COOLDOWN_MS = float(os.environ.get("JUMP_RETRY_COOLDOWN_MS", "220"))
 # Дедупликация повторных engine.jump с одинаковыми lastUpdate/x.
 JUMP_CONFIRM_DEDUP_MS = float(os.environ.get("JUMP_CONFIRM_DEDUP_MS", "120"))
+# Сервер позволяет прислать jumpedAt немного в прошлом (rewind до 2с).
+# Это помогает компенсировать сетевую/очередную задержку и начать дугу раньше.
+JUMP_RETRO_BASE_MS = float(os.environ.get("JUMP_RETRO_BASE_MS", "95"))
+JUMP_RETRO_MAX_MS = float(os.environ.get("JUMP_RETRO_MAX_MS", "240"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -775,9 +779,13 @@ class GameSession:
                     f"Δ={now_local_ms - self._last_fire_local_ms:.0f}ms"
                 )
                 return
-            # Если время прыжка уже прошло — используем текущее серверное время
+            # jumpedAt можно дать немного в прошлом: сервер откатит состояние
+            # и применит jump в тот момент (по аналогии с клиентом игры).
             now_srv = time.time() * 1000 + self.server_time_offset
-            actual_jumped_at = int(max(srv_time, now_srv))
+            retro_ms = JUMP_RETRO_BASE_MS + min(90.0, max(0.0, self._tx_latency_ms) * 0.8)
+            retro_ms = min(JUMP_RETRO_MAX_MS, retro_ms)
+            planned_jumped_at = min(float(srv_time), now_srv)
+            actual_jumped_at = int(max(now_srv - 1900.0, planned_jumped_at - retro_ms))
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
                 "jumpedAt": actual_jumped_at,
@@ -793,7 +801,7 @@ class GameSession:
             self._prev_target_x = target_ref  # target_x этого прыжка
             logger.info(
                 f"[{self.game_id}] ⏱ JUMP jumpedAt={actual_jumped_at} "
-                f"barrier={bx} (planned={int(srv_time)})"
+                f"barrier={bx} (planned={int(srv_time)} retro={retro_ms:.0f}ms)"
             )
 
         t = threading.Timer(delay_s, fire)
