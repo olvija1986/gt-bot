@@ -579,27 +579,36 @@ class GameSession:
         landing_x = _simulate_landing(from_x, speed, self.jump_power, self.gravity)
         logger.info(f"[{self.game_id}] from_x={from_x:.0f} landing≈{landing_x:.0f} spx={speed:.3f}")
 
-        # Ищем следующий барьер:
-        # - если пет приземлится ПОСЛЕ _last_jumped_barrier → он его уже перелетел, ищем дальше
-        # - если пет приземлится ДО _last_jumped_barrier → он ещё не перелетел, нужен этот барьер
-        if landing_x > self._last_jumped_barrier:
-            # Барьер _last_jumped_barrier уже будет пройден — ищем после приземления
-            search_from = max(pet_front, landing_x)
-        else:
-            # Пет ещё не перелетит _last_jumped_barrier — ищем с текущей позиции
-            # (включая _last_jumped_barrier снова если нужно)
-            search_from = pet_front
+        # Ищем следующий барьер устойчиво к «отскокам» от препятствий:
+        # если после предыдущего прыжка мы всё ещё заметно ДО того же барьера,
+        # не перескакиваем его в планировании, а повторяем именно его.
+        retry_last_barrier = (
+            self._last_jumped_barrier > 0
+            and pet_front + 12.0 < self._last_jumped_barrier
+        )
 
         next_idx = None
         next_b = None
-        for i, b in enumerate(self.barriers):
-            if (
-                b["x"] > search_from
-                and (landing_x > self._last_jumped_barrier or b["x"] >= self._last_jumped_barrier)
-            ):
-                next_idx = i
-                next_b = b
-                break
+        if retry_last_barrier:
+            for i, b in enumerate(self.barriers):
+                if b["x"] >= self._last_jumped_barrier - 1.0:
+                    next_idx = i
+                    next_b = b
+                    break
+            logger.info(
+                f"[{self.game_id}] retry target barrier={self._last_jumped_barrier:.0f} "
+                f"(pet_front={pet_front:.0f}, landing≈{landing_x:.0f})"
+            )
+        else:
+            # Обычный режим: берём ближайший барьер впереди текущего фронта пета.
+            # Не опираемся только на landing_x: в матчах с лагом он иногда
+            # переоценивает дальность и приводит к пропуску нужного барьера.
+            search_from = max(pet_front, self._last_jumped_barrier + 1.0)
+            for i, b in enumerate(self.barriers):
+                if b["x"] > search_from:
+                    next_idx = i
+                    next_b = b
+                    break
         if not next_b:
             logger.info(f"[{self.game_id}] Все барьеры пройдены (from_x={from_x:.0f})")
             return
