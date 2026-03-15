@@ -378,6 +378,12 @@ class GameSession:
         self.last_update   = 0
         self.started       = False
         self.game_started_at = None
+        # lag_px: насколько наша оценка позиции отстаёт от серверной (px).
+        # Калибруется после каждого подтверждённого прыжка.
+        # Начальное значение 60px — из реальных логов (было ~68px при agi=10).
+        # После первого прыжка обновится до реального значения.
+        self.lag_px        = 60.0
+        self._lag_samples  = []  # для усреднения
         self.result        = None
         self._done         = threading.Event()
 
@@ -420,61 +426,60 @@ class GameSession:
         return self.current_speed_x * (ticks + 2)
 
     def _should_act(self, mode: str) -> bool:
-        """Порт RaceBot.tickBot / SwimBot.tickBot логики."""
+        """
+        Физически точная логика прыжка/нырка.
+
+        Используем реальные jumpPower и gravity от сервера → ideal_dist.
+        После первого подтверждённого прыжка (on_jump) lag_px калибруется
+        автоматически и используется для компенсации отставания позиции.
+        """
         if mode == "race" and self.pet_status == "jumping":
             return False
         if mode == "swim" and self.pet_status in ("diving",):
             return False
-        if not self.barriers:
+        if not self.barriers or not self.game_started_at:
+            return False
+        if self.current_speed_x <= 0:
             return False
 
-        # Позиция пета — считаем по времени если нет обновлений из синка
-        if self.game_started_at:
-            elapsed_ms = (time.time() * 1000) - self.game_started_at
-            # Используем current_speed_x (px/tick) * тиков прошло
-            # 1 тик ≈ 16ms
-            ticks_elapsed = elapsed_ms / 16.0
-            self.pet_x = 118.0 + self.current_speed_x * ticks_elapsed
+        # Оцениваем позицию по времени (тик = 10ms)
+        elapsed_ms = (time.time() * 1000) - self.game_started_at
+        self.pet_x = 118.0 + self.current_speed_x * (elapsed_ms / 10.0)
 
         pet_front = self.pet_x + self.width_pet
 
-        # Чистим пройденные барьеры
+        # Убираем пройденные барьеры
         self.barriers = [b for b in self.barriers if b["x"] + self.width_barrier > pet_front]
         if not self.barriers:
-            logger.debug(f"[{self.game_id}] Все барьеры пройдены")
             return False
 
         next_b = self.barriers[0]
         dist = next_b["x"] - pet_front
-
         if dist <= 0:
             return False
 
-        # Точная формула из RaceBot/SwimBot исходников:
-        # idealDist = currentSpeed.x * (ticks + 2)
-        # intelligence = 1.0 (идеальная реакция)
+        # Физически точный trigger из исходников RaceBot:
+        # ideal_dist = speed * (ticks_to_clear_barrier + 2)
+        barrier_high = next_b.get("high", 50)
         if mode == "race":
-            ideal_dist = self._calc_ideal_jump_distance()
+            ticks = ticks_to_reach_height(self.jump_power, self.gravity, barrier_high)
         else:
-            ideal_dist = self._calc_ideal_dive_distance(next_b.get("high", 50))
+            ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
 
-        # Нужно учесть что наша оценка позиции отстаёт от реальной ~68px
-        # Поэтому прыгаем при dist = real_trigger + lag_correction
-        # real_trigger ≈ 50px (из DevTools реальных игроков)
-        # lag_correction ≈ 70px (систематическое отставание позиции)
-        # итого: 120px, или ~65 тиков при speed=1.841
-        # Лаг нашей позиции относительно сервера ~60-70px
-        # Хотим прыгать когда реальный dist ≈ 80px
-        # Значит наш trigger = 80 + 65 = 145px ≈ 88 тиков при speed=1.648
-        trigger_dist = self.current_speed_x * 90  # 90 тиков ≈ 900ms
+        ideal_dist = self.current_speed_x * (ticks + 2)
+
+        # Компенсация лага: наша позиция всегда отстаёт от серверной.
+        # lag_px накапливается из калибровок в on_jump.
+        # Без калибровки используем консервативный дефолт = 2 * ideal_dist
+        total_trigger = ideal_dist + self.lag_px
 
         logger.info(
-            f"[{self.game_id}] CHECK pet_x={self.pet_x:.0f} dist={dist:.0f} "
-            f"trigger={trigger_dist:.1f} barrier_x={next_b['x']} "
-            f"spx={self.current_speed_x:.3f} status={self.pet_status}"
+            f"[{self.game_id}] CHECK x={self.pet_x:.0f} dist={dist:.0f} "
+            f"ideal={ideal_dist:.1f} lag={self.lag_px:.0f} trigger={total_trigger:.1f} "
+            f"jp={self.jump_power:.1f} ticks={ticks} spx={self.current_speed_x:.3f}"
         )
 
-        return dist <= trigger_dist
+        return dist <= total_trigger
 
     def _make_action_payload(self) -> dict:
         """
@@ -683,32 +688,46 @@ class GameSession:
 
         def on_jump(data: dict):
             """engine.jump — сервер подтвердил прыжок."""
-            if data.get("userId") == self.user_id:
-                self.pet_status = "jumping"
-                coords = data.get("coordinates", {})
-                real_x = coords.get("x")
-                if real_x is not None:
-                    old_est = self.pet_x
-                    if self.current_speed_x > 0:
-                        ticks_real = (real_x - 118) / self.current_speed_x
-                        self.game_started_at = time.time() * 1000 - ticks_real * 10
-                    self.pet_x = real_x
-                    logger.info(
-                        f"[{self.game_id}] Калибровка: est={old_est:.0f} → real={real_x:.0f} "
-                        f"(лаг {real_x - old_est:.0f}px)"
-                    )
-                speed = data.get("speed", {})
-                if speed.get("x") is not None:
-                    self.current_speed_x = speed["x"]
-                if speed.get("y") is not None:
-                    self.current_speed_y = speed["y"]
-                self.last_update = data.get("lastUpdate", self.last_update)
-                # Автосброс статуса через 1.2с (длительность прыжка)
-                def reset_after_jump():
-                    time.sleep(1.2)
-                    if self.pet_status == "jumping":
-                        self.pet_status = "running"
-                threading.Thread(target=reset_after_jump, daemon=True).start()
+            if data.get("userId") != self.user_id:
+                return
+
+            self.pet_status = "jumping"
+            coords = data.get("coordinates", {})
+            real_x = coords.get("x")
+            if real_x is not None and self.game_started_at and self.current_speed_x > 0:
+                # Вычисляем наш текущий estimate в момент получения ответа
+                elapsed_ms = (time.time() * 1000) - self.game_started_at
+                our_est = 118.0 + self.current_speed_x * (elapsed_ms / 10.0)
+                # Лаг = разница между реальной позицией и нашей оценкой
+                # Реальная позиция немного позади (сервер обрабатывает с задержкой)
+                lag = our_est - real_x
+                self._lag_samples.append(lag)
+                # Скользящее среднее последних 3 прыжков
+                if len(self._lag_samples) > 3:
+                    self._lag_samples.pop(0)
+                self.lag_px = max(0, sum(self._lag_samples) / len(self._lag_samples))
+
+                # Пересчитываем game_started_at по реальной позиции
+                ticks_real = (real_x - 118) / self.current_speed_x
+                self.game_started_at = time.time() * 1000 - ticks_real * 10
+                self.pet_x = real_x
+
+                logger.info(
+                    f"[{self.game_id}] JUMP confirmed: real_x={real_x:.0f} "
+                    f"our_est={our_est:.0f} lag={lag:.0f}px avg_lag={self.lag_px:.0f}px"
+                )
+
+            speed = data.get("speed", {})
+            if speed.get("x") is not None:
+                self.current_speed_x = speed["x"]
+            self.last_update = data.get("lastUpdate", self.last_update)
+
+            # Автосброс статуса через 1.2с
+            def reset_after_jump():
+                time.sleep(1.2)
+                if self.pet_status == "jumping":
+                    self.pet_status = "running"
+            threading.Thread(target=reset_after_jump, daemon=True).start()
 
         client.on("_open",                  on_open)
         client.on("engine.user.connected",  on_user_connected)
