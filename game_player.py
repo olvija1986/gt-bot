@@ -425,8 +425,31 @@ class GameSession:
         self._prev_confirmed_x   = 0.0   # x предыдущего подтверждённого прыжка
         self._prev_confirmed_at  = 0.0   # jumpedAt предыдущего подтверждённого прыжка
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
+        self._anchor_x           = 118.0 # последняя подтверждённая x
+        self._anchor_server_time = 0.0   # serverTime для anchor_x
         self.result             = None
         self._done         = threading.Event()
+
+    def _now_server_ms(self) -> float:
+        """Оценивает текущее serverTime по локальным часам + offset."""
+        return time.time() * 1000 + self.server_time_offset
+
+    def _estimate_pet_x(self) -> float:
+        """
+        Предсказывает x по последней опорной точке (x, serverTime).
+
+        Это точнее, чем "локальный game_started_at", т.к. не накапливает
+        сетевую задержку момента получения engine.game.started.
+        """
+        if self._anchor_server_time > 0 and self.current_speed_x > 0:
+            dt_ticks = max(0.0, (self._now_server_ms() - self._anchor_server_time) / 10.0)
+            return self._anchor_x + self.current_speed_x * dt_ticks
+
+        if self.game_started_at and self.current_speed_x > 0:
+            elapsed_ms = time.time() * 1000 - self.game_started_at
+            return 118.0 + self.current_speed_x * (elapsed_ms / 10.0)
+
+        return self.pet_x
 
     def _running_speed_from_jump(self, confirmed_x: float, jumped_at: int) -> float:
         """
@@ -479,9 +502,7 @@ class GameSession:
     def _tick_bot(self):
         """Порт raceBot.tickBot — вызывается каждые 80ms."""
         # Обновляем оценку позиции (тик = 10ms)
-        if self.game_started_at:
-            elapsed_ms = time.time() * 1000 - self.game_started_at
-            self.pet_x = 118.0 + self.current_speed_x * (elapsed_ms / 10.0)
+        self.pet_x = self._estimate_pet_x()
 
         pet_front = self.pet_x + self.width_pet
 
@@ -615,6 +636,7 @@ class GameSession:
                 coords = u.get("coordinates", {})
                 if coords.get("x") is not None:
                     self.pet_x = coords["x"]
+                    self._anchor_x = self.pet_x
                 if coords.get("y") is not None:
                     self.pet_y = coords["y"]
 
@@ -658,6 +680,8 @@ class GameSession:
             if server_time_sync:
                 local_now_ms = time.time() * 1000
                 self.server_time_offset = server_time_sync - local_now_ms
+                if found:
+                    self._anchor_server_time = server_time_sync
 
             if barriers_raw is not None:
                 self._all_barriers_raw = barriers_raw
@@ -682,6 +706,8 @@ class GameSession:
             # physics_start_at = serverTime из engine.game.started
             # Проверено из DevTools: jumpedAt - physics_start = elapsed тиков * 10ms
             self.physics_start_at = server_time
+            self._anchor_server_time = server_time
+            self._anchor_x = self.pet_x
 
             logger.info(
                 f"[{self.game_id}] 🏁 Игра! physics_start={server_time} "
@@ -750,9 +776,12 @@ class GameSession:
 
             if real_x is not None:
                 self.pet_x = real_x
+                self._anchor_x = real_x
                 # Обновляем скорость из ответа сервера
                 if arc_spx > 0.5:
                     self.current_speed_x = arc_spx
+                jump_server_time = data.get("serverTime") or self._now_server_ms()
+                self._anchor_server_time = jump_server_time
                 # Калибруем game_started_at по реальной позиции
                 if self.current_speed_x > 0:
                     ticks = (real_x - 118.0) / self.current_speed_x
