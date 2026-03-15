@@ -390,206 +390,80 @@ class GameSession:
         self.result             = None
         self._done         = threading.Event()
 
-    def _ai_loop(self):
+    def _schedule_next_jump(self, from_x: float, speed: float):
         """
-        Резервный polling loop — срабатывает если scheduled jump не отработал
-        (например барьеры пришли ПОСЛЕ game.started).
-        Основная логика теперь в _schedule_jumps().
+        Планирует ОДИН следующий прыжок на основе текущей позиции и скорости.
+        Вызывается: 1) при старте игры  2) после каждого подтверждённого прыжка.
+        
+        Формула (проверена из DevTools):
+          target_x = next_barrier_x - ideal_dist - pet_width
+          elapsed_ticks = (target_x - 118) / speed
+          jump_server_time = physics_start_at + elapsed_ticks * 10ms
         """
-        last_action_time = 0
-        COOLDOWN_MS = 1500
-
-        while not self._done.is_set():
-            if self.started and self.barriers and not self._jump_timers:
-                # Таймеры ещё не запланированы (барьеры пришли после started)
-                self._schedule_jumps()
-
-            now_ms = time.time() * 1000
-            if (self.started and self.barriers
-                    and now_ms - last_action_time >= COOLDOWN_MS
-                    and not self._jump_timers):
-                # Fallback: нет таймеров, прыгаем по старой логике
-                if self.mode == "race" and self._should_act("race"):
-                    payload = self._make_action_payload()
-                    self._client.emit_with_null("engine.jump", payload)
-                    logger.info(f"[{self.game_id}] → FALLBACK JUMP")
-                    self.pet_status = "jumping"
-                    last_action_time = now_ms
-                elif self.mode == "swim" and self._should_act("swim"):
-                    payload = self._make_action_payload()
-                    self._client.emit_with_null("engine.dive", payload)
-                    logger.info(f"[{self.game_id}] → FALLBACK DIVE")
-                    self.pet_status = "diving"
-                    last_action_time = now_ms
-
-            time.sleep(0.1)
-
-    def _calc_ideal_jump_distance(self) -> float:
-        """Порт RaceBot.calcIdealJumpDistance — точная формула из исходников."""
-        barrier_high = 50
-        ticks = ticks_to_reach_height(self.jump_power, self.gravity, barrier_high)
-        return self.current_speed_x * (ticks + 2)
-
-    def _calc_ideal_dive_distance(self, barrier_high: float = 50) -> float:
-        """Порт SwimBot.calcIdealDiveDistance."""
-        ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
-        return self.current_speed_x * (ticks + 2)
-
-    def _should_act(self, mode: str) -> bool:
-        """
-        Физически точная логика прыжка/нырка.
-
-        Используем реальные jumpPower и gravity от сервера → ideal_dist.
-        После первого подтверждённого прыжка (on_jump) lag_px калибруется
-        автоматически и используется для компенсации отставания позиции.
-        """
-        if mode == "race" and self.pet_status == "jumping":
-            return False
-        if mode == "swim" and self.pet_status in ("diving",):
-            return False
-        if not self.barriers or not self.game_started_at:
-            return False
-        if self.current_speed_x <= 0:
-            return False
-
-        # Оцениваем позицию по времени (тик = 10ms)
-        elapsed_ms = (time.time() * 1000) - self.game_started_at
-        self.pet_x = 118.0 + self.current_speed_x * (elapsed_ms / 10.0)
-
-        pet_front = self.pet_x + self.width_pet
-
-        # Убираем пройденные барьеры
-        self.barriers = [b for b in self.barriers if b["x"] + self.width_barrier > pet_front]
-        if not self.barriers:
-            return False
-
-        next_b = self.barriers[0]
-        dist = next_b["x"] - pet_front
-        if dist <= 0:
-            return False
-
-        # Физически точный trigger:
-        # 1. ideal_dist = тиков чтобы взлететь выше барьера * скорость
-        # 2. lag_px = на сколько реальная позиция опережает нашу оценку
-        # 3. safety = запас 25px чтобы точно перелететь
-        # Итого: когда наша оценка показывает dist = ideal + lag + safety,
-        # реальная dist на сервере = ideal + safety ≈ 33-45px — оптимально
-        barrier_high = next_b.get("high", 50)
-        if mode == "race":
-            ticks = ticks_to_reach_height(self.jump_power, self.gravity, barrier_high)
-        else:
-            ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
-
-        ideal_dist = self.current_speed_x * (ticks + 2)
-        safety = 25.0
-        total_trigger = ideal_dist + self.lag_px + safety
-
-        logger.info(
-            f"[{self.game_id}] CHECK x={self.pet_x:.0f} dist={dist:.0f} "
-            f"trigger={total_trigger:.1f} (ideal={ideal_dist:.1f}+lag={self.lag_px:.0f}+safe=25) "
-            f"jp={self.jump_power:.1f} ticks={ticks} spx={self.current_speed_x:.3f}"
-        )
-
-        return dist <= total_trigger
-
-    def _make_action_payload(self) -> dict:
-        """
-        Реальный клиентский формат прыжка/нырка из DevTools:
-        42["engine.jump", {"clickPosition":{"x":...,"y":...}, "jumpedAt":timestamp}, null]
-        Сервер сам считает координаты и рассылает развёрнутый результат.
-        """
-        return {
-            "clickPosition": {"x": self.click_x, "y": self.click_y},
-            "jumpedAt":      int(time.time() * 1000),
-        }
-
-    def _schedule_jumps(self, speed: float = None, from_barrier_idx: int = 0):
-        """
-        Планирует прыжки через threading.Timer.
-
-        Формула (из реального трафика):
-          target_x = barrier_x - ideal_dist - pet_width
-          ideal_dist = speed * (ticks_to_clear_barrier + 2)
-          jumpedAt = physics_start_at + (target_x - 118) / speed * 10
-
-        speed можно передать после первого прыжка (реальная скорость с сервера).
-        from_barrier_idx — пропускаем уже обработанные барьеры.
-        """
-        # Отменяем старые незапущенные таймеры
+        # Отменяем предыдущий запланированный прыжок
         for t in self._jump_timers:
             t.cancel()
         self._jump_timers.clear()
 
-        spx = speed if speed and speed > 0 else self.current_speed_x
-        if not self.barriers or spx <= 0 or not self.physics_start_at:
-            logger.warning(f"[{self.game_id}] _schedule_jumps: нет данных (barriers={len(self.barriers)} spx={spx} start={self.physics_start_at})")
+        if not self.barriers or speed <= 0 or not self.physics_start_at:
             return
 
-        barrier_high = 50
-        if self.mode == "race":
-            ticks = ticks_to_reach_height(self.jump_power, self.gravity, barrier_high)
-        else:
-            ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
+        # Находим следующий непройденный барьер
+        pet_front = from_x + self.width_pet
+        next_b = next((b for b in self.barriers if b["x"] > pet_front), None)
+        if not next_b:
+            logger.info(f"[{self.game_id}] Все барьеры пройдены")
+            return
 
-        ideal_dist = spx * (ticks + 2)
-        now_local_ms = time.time() * 1000
+        barrier_high = next_b.get("high", 50)
+        if self.mode == "race":
+            ticks_up = ticks_to_reach_height(self.jump_power, self.gravity, barrier_high)
+        else:
+            ticks_up = ticks_to_reach_depth(self.dive_power, barrier_high)
+
+        # Позиция пета при прыжке: нужно быть за ideal_dist до барьера
+        ideal_dist = speed * (ticks_up + 2)
+        target_x = next_b["x"] - ideal_dist - self.width_pet
+        target_x = max(target_x, from_x + speed)  # минимум 1 тик вперёд
+
+        # Серверное время прыжка через elapsed_ticks от physics_start
+        elapsed_ticks = (target_x - 118.0) / speed
+        jump_server_time = self.physics_start_at + elapsed_ticks * 10.0
+
+        # Локальное время отправки
+        now_local = time.time() * 1000
+        fire_local = jump_server_time - self.server_time_offset
+        delay_s = max(0.0, (fire_local - now_local) / 1000.0)
 
         logger.info(
-            f"[{self.game_id}] Планирую прыжки: speed={spx:.4f}px/tick "
-            f"ideal_dist={ideal_dist:.1f}px ticks_to_clear={ticks} jp={self.jump_power:.1f}"
+            f"[{self.game_id}] NEXT JUMP: barrier={next_b['x']} "
+            f"from_x={from_x:.0f} target_x={target_x:.0f} "
+            f"ideal={ideal_dist:.1f}px speed={speed:.4f} "
+            f"fire_in={delay_s*1000:.0f}ms jumpedAt={int(jump_server_time)}"
         )
 
-        scheduled = 0
-        for i, barrier in enumerate(self.barriers[from_barrier_idx:], start=from_barrier_idx):
-            # Позиция пета В МОМЕНТ прыжка (чтобы перелететь барьер)
-            # Пет должен начать прыжок за ideal_dist до ПЕРЕДНЕЙ ГРАНИ барьера
-            target_x = barrier["x"] - ideal_dist - self.width_pet
-            target_x = max(target_x, 119.0)  # не раньше старта
+        def fire(srv_time=jump_server_time, bx=next_b["x"]):
+            if self._done.is_set():
+                return
+            payload = {
+                "clickPosition": {"x": self.click_x, "y": self.click_y},
+                "jumpedAt": int(srv_time),
+            }
+            event = "engine.jump" if self.mode == "race" else "engine.dive"
+            self._client.emit_with_null(event, payload)
+            self.pet_status = "jumping"
+            logger.info(f"[{self.game_id}] ⏱ JUMP jumpedAt={int(srv_time)} barrier={bx}")
 
-            # Серверное время прыжка
-            ticks_to_target = (target_x - 118.0) / spx
-            jump_server_time = self.physics_start_at + ticks_to_target * 10.0
+        t = threading.Timer(delay_s, fire)
+        t.daemon = True
+        t.start()
+        self._jump_timers.append(t)
 
-            # Локальное время отправки
-            fire_local_ms = jump_server_time - self.server_time_offset
-            delay_ms = fire_local_ms - now_local_ms
-
-            logger.info(
-                f"[{self.game_id}] Барьер {i+1}: x={barrier['x']} "
-                f"target_x={target_x:.0f} "
-                f"jump_at={jump_server_time:.0f} fire_in={delay_ms:.0f}ms"
-            )
-
-            if delay_ms < -200:
-                logger.warning(f"[{self.game_id}] Барьер {i+1}: опоздали, пропускаем")
-                continue
-
-            delay_s = max(0.0, delay_ms / 1000.0)
-
-            def make_fn(b_idx, srv_time, barrier_x):
-                def fire():
-                    if self._done.is_set():
-                        return
-                    payload = {
-                        "clickPosition": {"x": self.click_x, "y": self.click_y},
-                        "jumpedAt": int(srv_time),
-                    }
-                    event = "engine.jump" if self.mode == "race" else "engine.dive"
-                    self._client.emit_with_null(event, payload)
-                    self.pet_status = "jumping"
-                    logger.info(
-                        f"[{self.game_id}] ⏱ JUMP #{b_idx+1} jumpedAt={int(srv_time)} "
-                        f"barrier_x={barrier_x}"
-                    )
-                return fire
-
-            t = threading.Timer(delay_s, make_fn(i, jump_server_time, barrier["x"]))
-            t.daemon = True
-            t.start()
-            self._jump_timers.append(t)
-            scheduled += 1
-
-        logger.info(f"[{self.game_id}] Запланировано {scheduled} прыжков")
+    def _make_action_payload(self) -> dict:
+        return {
+            "clickPosition": {"x": self.click_x, "y": self.click_y},
+            "jumpedAt":      int(time.time() * 1000),
+        }
 
     def run(self, timeout: int = GAME_TIMEOUT):
         client = SioClient(self.lobby_url, TG_TOKEN)
@@ -752,9 +626,10 @@ class GameSession:
 
             logger.info(
                 f"[{self.game_id}] 🏁 Игра! physics_start={server_time} "
-                f"speed={self.current_speed_x:.3f}px/tick"
+                f"speed={self.current_speed_x:.4f}px/tick"
             )
-            self._schedule_jumps()
+            # Планируем первый прыжок от стартовой позиции
+            self._schedule_next_jump(from_x=118.0, speed=self.current_speed_x)
 
         def on_ended(data: dict):
             for p in data.get("usersPrizes", []):
@@ -812,34 +687,19 @@ class GameSession:
             self.pet_status = "jumping"
             coords = data.get("coordinates", {})
             real_x = coords.get("x")
-            if real_x is not None:
-                self.pet_x = real_x
-                logger.info(f"[{self.game_id}] JUMP confirmed: real_x={real_x:.0f}")
-
             speed = data.get("speed", {})
             real_spx = speed.get("x") if speed else None
-            if real_spx and real_spx > 0:
-                old_spx = self.current_speed_x
-                # Обновляем скорость только если разница разумная (не более 3x)
-                # Слишком большие скачки = данные из чужого прыжка попали сюда
-                ratio = real_spx / max(old_spx, 0.001)
-                if 0.5 <= ratio <= 3.0:
-                    self.current_speed_x = real_spx
-                    if abs(real_spx - old_spx) / max(old_spx, 0.001) > 0.05:
-                        logger.info(
-                            f"[{self.game_id}] Скорость: {old_spx:.4f} → {real_spx:.4f}, "
-                            f"пересчитываю расписание"
-                        )
-                        pet_front = (real_x or self.pet_x) + self.width_pet
-                        next_idx = next(
-                            (i for i, b in enumerate(self.barriers) if b["x"] > pet_front),
-                            len(self.barriers)
-                        )
-                        self._schedule_jumps(speed=real_spx, from_barrier_idx=next_idx)
-                else:
-                    logger.warning(
-                        f"[{self.game_id}] Скорость {real_spx:.4f} подозрительна (ratio={ratio:.2f}), игнорирую"
-                    )
+
+            if real_x is not None and real_spx and real_spx > 0:
+                self.pet_x = real_x
+                self.current_speed_x = real_spx
+                logger.info(
+                    f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} spx={real_spx:.4f}"
+                )
+                # Планируем СЛЕДУЮЩИЙ прыжок с реальными данными
+                self._schedule_next_jump(from_x=real_x, speed=real_spx)
+            elif real_x is not None:
+                self.pet_x = real_x
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
