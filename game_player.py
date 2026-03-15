@@ -30,7 +30,6 @@ import time
 import json
 import logging
 import threading
-from collections import deque
 import requests
 import websocket   # pip install websocket-client
 
@@ -332,83 +331,6 @@ _SPEED_TABLE = [
     (100, 0.540),  # экстраполяция
 ]
 
-def _classify_pet_speed(speed: float) -> str:
-    """Классифицирует пета по скорости для адаптивных параметров."""
-    if speed < 2.0:
-        return "slow"      # Медленный (str < 10)
-    elif speed < 3.5:
-        return "medium"    # Средний (str 10-30)
-    else:
-        return "fast"      # Быстрый (str > 30)
-
-
-def _get_adaptive_params(speed: float) -> dict:
-    """Возвращает адаптивные параметры в зависимости от скорости пета."""
-    pet_type = _classify_pet_speed(speed)
-    
-    params = {
-        "slow": {
-            # Медленные петы: ОЧЕНЬ консервативно
-            "first_jump": {
-                "reaction_ticks": 18.0,     # ← ещё больше времени
-                "safety_margin_px": 85.0,
-                "min_gap_px": 280.0,        # ← ОЧЕНЬ консервативно (было 220)
-                "max_gap_px": 320.0,
-                "speed_correction": 1.02,   # ← минимум (было 1.05)
-                "arc_speed_mult": 0.75,     # ← более консервативно (было 0.80)
-            },
-            "other_jumps": {
-                "reaction_ticks": 14.0,
-                "safety_margin_px": 60.0,
-                "min_gap_px": 180.0,
-                "max_gap_px": 240.0,
-                "speed_correction": 1.05,
-                "arc_speed_mult": 0.80,
-            },
-        },
-        "medium": {
-            # Средние петы: нормально
-            "first_jump": {
-                "reaction_ticks": 16.0,
-                "safety_margin_px": 75.0,
-                "min_gap_px": 240.0,        # ← нормально (было 220)
-                "max_gap_px": 300.0,
-                "speed_correction": 1.05,
-                "arc_speed_mult": 0.82,
-            },
-            "other_jumps": {
-                "reaction_ticks": 12.0,
-                "safety_margin_px": 50.0,
-                "min_gap_px": 170.0,
-                "max_gap_px": 230.0,
-                "speed_correction": 1.08,
-                "arc_speed_mult": 0.85,
-            },
-        },
-        "fast": {
-            # Быстрые петы: можем быть агрессивнее
-            "first_jump": {
-                "reaction_ticks": 14.0,
-                "safety_margin_px": 60.0,
-                "min_gap_px": 200.0,        # ← может быть меньше
-                "max_gap_px": 260.0,
-                "speed_correction": 1.08,
-                "arc_speed_mult": 0.85,
-            },
-            "other_jumps": {
-                "reaction_ticks": 10.0,     # ← быстрее
-                "safety_margin_px": 40.0,
-                "min_gap_px": 150.0,        # ← агрессивнее
-                "max_gap_px": 210.0,
-                "speed_correction": 1.10,
-                "arc_speed_mult": 0.88,
-            },
-        },
-    }
-    
-    return params[pet_type]
-
-
 def _agility_to_speed_per_ms(agility: int) -> float:
     """Интерполирует скорость px/ms по agility из таблицы реальных измерений."""
     xs = [x for x, _ in _SPEED_TABLE]
@@ -424,36 +346,9 @@ def _agility_to_speed_per_ms(agility: int) -> float:
     return ys[-1]
 
 
-def _estimate_running_speed_px_tick(chars: dict) -> tuple[float, str, int]:
-    """
-    Оценивает горизонтальную скорость (px/tick) по статам пета.
-
-    По наблюдениям из матчей race:
-    - strength сильнее влияет на горизонтальную скорость,
-    - agility чаще влияет на траекторию/высоту прыжка.
-
-    Поэтому для скорости берём strength как основной сигнал,
-    но оставляем fallback на agility для совместимости со старыми данными.
-    """
-    strength = int(chars.get("strength", 0) or 0)
-    agility = int(chars.get("agility", 0) or 0)
-
-    speed_source = "strength" if strength > 0 else "agility"
-    speed_stat = strength if strength > 0 else agility
-
-    # Квадратичная аппроксимация скорости (px/tick) на диапазоне 0..100.
-    # НЕ используем фиксированную коррекцию - она слишком агрессивна для медленных петов
-    speed = 0.000624 * speed_stat**2 - 0.016927 * speed_stat + 1.754893
-    return max(0.5, speed), speed_source, speed_stat
-
-
-def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity: float = 1.5, arc_speed_mult: float = 0.85) -> float:
-    """Симулирует физику прыжка и возвращает x где пет приземлится.
-    
-    arc_speed_mult: коэффициент скорости в воздухе (адаптивный в зависимости от пета)
-    """
+def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity: float = 1.5) -> float:
+    """Симулирует физику прыжка и возвращает x где пет приземлится."""
     y, sy = 0.0, jump_power
-    arc_speed = speed_x * arc_speed_mult
     x = float(start_x)
     for _ in range(500):
         sy -= 0.6
@@ -466,7 +361,7 @@ def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity
             y = max(0.0, y - gravity)
             if y <= 0:
                 return x
-        x += arc_speed
+        x += speed_x
     return x
 
 
@@ -511,58 +406,39 @@ class GameSession:
         self.physics_start_at   = 0.0   # serverTime из engine.game.started
         self.server_time_offset = 0.0   # local → server time offset
         self._jump_timers       = []    # список Timer объектов
-        self._jump_plan_seq     = 0     # поколение плана прыжка (для отбрасывания устаревших fire)
         self._last_jumped_barrier = 0.0  # x барьера для которого уже запланирован/выполнен прыжок
         self._last_sent_jumped_at = 0.0   # jumpedAt который мы отправили последним
         self._prev_confirmed_x   = 0.0   # x предыдущего подтверждённого прыжка
         self._prev_confirmed_at  = 0.0   # jumpedAt предыдущего подтверждённого прыжка
-        self._prev_confirmed_ground_x = 0.0  # ground-x предыдущего подтверждённого прыжка
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
-        # История отправленных прыжков для матчинга с delayed engine.jump confirm.
-        # Храним короткий хвост: (jumped_at, target_x, barrier_x).
-        self._sent_jumps = deque(maxlen=16)
         self.result             = None
         self._done         = threading.Event()
 
-    def _cleanup_jump_timers(self):
-        """Удаляет завершённые/отменённые таймеры из списка."""
-        self._jump_timers = [t for t in self._jump_timers if t.is_alive()]
-
-    def _has_active_jump_timer(self) -> bool:
-        self._cleanup_jump_timers()
-        return bool(self._jump_timers)
-
-    def _estimate_pet_x_now(self, now_srv: float) -> float:
+    def _running_speed_from_jump(self, confirmed_x: float, jumped_at: int) -> float:
         """
-        Оценка текущей позиции пета на серверной временной шкале.
-
-        Берём последнюю подтверждённую позицию из sync/jump и докидываем
-        пройденную дистанцию по текущей горизонтальной скорости.
-        """
-        base_x = float(self.pet_x or 0.0)
-        if self.last_update <= 0 or self.current_speed_x <= 0:
-            return base_x
-        dt_ticks = max(0.0, (now_srv - self.last_update) / 10.0)
-        return base_x + dt_ticks * self.current_speed_x
-
-    def _running_speed_from_jump(self, confirmed_x: float, jumped_at: int, ground_x: float | None = None) -> float:
-        """
-        Вычисляет скорость бега по дельте ground_x между соседними прыжками.
+        Вычисляет скорость бега по дельте target_x между соседними прыжками.
 
         confirmed_x — позиция в середине дуги, не подходит для скорости.
-        ground_x — якорь на земле (обычно target_x соответствующего прыжка).
+        target_x предыдущего и текущего прыжков — оба на земле → точная дельта.
         """
-        use_at = jumped_at
-        current_ground_x = ground_x if ground_x is not None else confirmed_x
+        use_at = self._last_sent_jumped_at if self._last_sent_jumped_at > 0 else jumped_at
 
-        # Дельта ground_x / delta_time между соседними подтверждёнными прыжками.
-        if self._prev_confirmed_ground_x > 0 and self._prev_confirmed_at > 0:
+        # Дельта target_x / delta_time между соседними прыжками
+        if self._prev_target_x > 0 and self._prev_confirmed_at > 0:
+            # _prev_target_x — где пет был при предыдущем прыжке (на земле)
+            # сейчас пет тоже на земле в районе текущего target_x
+            # Но мы не знаем текущий target_x здесь, используем confirmed_x как приближение
+            # Лучше: используем delta_jumpedAt и prev_target_x как anchor
             dt = (use_at - self._prev_confirmed_at) / 10.0
             if dt > 5:  # минимум 5 тиков между прыжками
-                dx = current_ground_x - self._prev_confirmed_ground_x
+                # За dt тиков пет прошёл от prev_target_x до ~confirmed_x
+                # Но confirmed_x неточен (дуга). Используем avg speed от prev_target_x
+                # как лучшую оценку: скорость = (confirmed_x - prev_target_x + jump_dist) / dt
+                # Упрощение: average speed over full interval
+                dx = confirmed_x - self._prev_target_x
                 if dx > 0:
                     speed = dx / dt
-                    logger.info(f"run_speed delta: prev_x={self._prev_confirmed_ground_x:.0f} "
+                    logger.info(f"run_speed delta: prev_x={self._prev_target_x:.0f} "
                                f"curr_x={confirmed_x:.0f} dt={dt:.0f}t → {speed:.4f}")
                     return speed
 
@@ -572,39 +448,7 @@ class GameSession:
         elapsed = (use_at - self.physics_start_at) / 10.0
         if elapsed <= 0:
             return self.current_speed_x
-        return (current_ground_x - 118.0) / elapsed
-
-    def _match_sent_jump(self, confirm_time: float):
-        """
-        Матчит server confirm с реально отправленным прыжком.
-
-        Важный момент: подтверждение для i-го прыжка может прийти уже после
-        отправки (i+1)-го. Если брать просто "ближайший по времени" элемент из
-        хвоста, иногда выбирается неверный target_x и дальше каскадно уезжают
-        координаты 2+ прыжков.
-
-        Поэтому сначала берём самый свежий прыжок, отправленный НЕ позже
-        confirm_time (+ небольшой допуск), и только если такого нет — fallback на
-        ближайший по |dt|.
-        """
-        if not self._sent_jumps:
-            return None
-
-        allow_future_ms = 120.0
-        candidates = [j for j in self._sent_jumps if j[0] <= confirm_time + allow_future_ms]
-        if candidates:
-            matched = max(candidates, key=lambda j: j[0])
-        else:
-            matched = min(self._sent_jumps, key=lambda j: abs(j[0] - confirm_time))
-
-        matched_at = matched[0]
-        # Удаляем использованный и более старые прыжки — чтобы не перематчивать
-        # их на следующих confirm (это и ломало 2-й/3-й прыжок).
-        self._sent_jumps = deque(
-            [j for j in self._sent_jumps if j[0] > matched_at],
-            maxlen=self._sent_jumps.maxlen,
-        )
-        return matched
+        return (confirmed_x - 118.0) / elapsed
 
     def _schedule_next_jump(self, from_x: float, speed: float,
                             anchor_srv_time: float = 0.0):
@@ -616,8 +460,6 @@ class GameSession:
         for t in self._jump_timers:
             t.cancel()
         self._jump_timers.clear()
-        self._jump_plan_seq += 1
-        plan_seq = self._jump_plan_seq
 
         if not self.barriers or speed <= 0 or not self.physics_start_at:
             return
@@ -633,26 +475,13 @@ class GameSession:
         # Ищем следующий барьер:
         # - если пет приземлится ПОСЛЕ _last_jumped_barrier → он его уже перелетел, ищем дальше
         # - если пет приземлится ДО _last_jumped_barrier → он ещё не перелетел, нужен этот барьер
-        # Если предыдущий прыжок не дал фактического пролёта барьера,
-        # нельзя «перескакивать» его в планировщике только потому,
-        # что теоретический landing_x оказался правее.
-        # Пока морда пета реально до last_jumped_barrier — перецеливаемся
-        # в этот же барьер и не сдвигаем расписание дальше.
-        if self._last_jumped_barrier > 0 and pet_front + 5.0 < self._last_jumped_barrier:
-            search_from = pet_front
-        elif landing_x > self._last_jumped_barrier:
+        if landing_x > self._last_jumped_barrier:
             # Барьер _last_jumped_barrier уже будет пройден — ищем после приземления
             search_from = max(pet_front, landing_x)
         else:
             # Пет ещё не перелетит _last_jumped_barrier — ищем с текущей позиции
             # (включая _last_jumped_barrier снова если нужно)
             search_from = pet_front
-
-        # Пока мы в воздухе после отправленного прыжка, нельзя снова целиться
-        # в тот же барьер. Иначе получаем цепочку дублирующих jump по одному
-        # препятствию (в логах это выглядит как fire_in≈0ms и «залипание»).
-        if self.pet_status == "jumping" and self._last_jumped_barrier > 0:
-            search_from = max(search_from, self._last_jumped_barrier + 1.0)
 
         next_b = next(
             (b for b in self.barriers
@@ -673,49 +502,19 @@ class GameSession:
 
         ideal_dist = speed * (ticks_up + 2)
 
-        # SAFE_GAP: целевая дистанция (в px) до барьера в момент отправки прыжка.
-        # Должна быть «перед барьером», но с запасом на сетевую/серверную задержку.
-        # Первый прыжок особо критичен — пет только начинает движение,
-        # позиция ещё не подтверждена сервером, поэтому берём больший запас.
-        is_first_jump = anchor_srv_time <= 0 or from_x <= 120.0
-        
-        if is_first_jump:
-            # Первый прыжок: более консервативно, чтобы не приземлиться ДО барьера
-            reaction_ticks = 13.0   # ~130ms
-            safety_margin_px = 58.0 
-            min_gap_px = 175.0      # чуть больше оригинального 168
-            max_gap_px = 240.0
-        else:
-            # Остальные прыжки: можем быть более агрессивными
-            reaction_ticks = 15.0   # ~150ms
-            safety_margin_px = 70.0
-            min_gap_px = 190.0      # чуть больше оригинального 195
-            max_gap_px = 250.0
-        
-        safe_gap = ideal_dist + speed * reaction_ticks + safety_margin_px
-        safe_gap = max(min_gap_px, min(max_gap_px, safe_gap))
+        # BUFFER: сколько px до барьера должен быть пет в момент прыжка
+        # Для надёжного перелёта нужно dist ≥ 40px при jump_x
+        # Initial: скорость откорректирована *1.18, буфер небольшой
+        # Calibrated: скорость реальная из подтверждённого прыжка
+        BUFFER = 90.0
 
-        target_x = next_b["x"] - self.width_pet - safe_gap
+        target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER
         target_x = max(target_x, from_x + speed)
 
         # jumpedAt: вычисляем через реальную скорость движения пета
-        # arc_spx (speed.x из engine.jump) ≈ 85% от скорости бега
-        # Используем балансированные значения: сниженные относительно оригинала,
-        # но достаточные чтобы не приземлиться перед барьером
-        if is_first_jump:
-            SPEED_CORRECTION = 1.16  # чуть ниже оригинального 1.18
-        else:
-            SPEED_CORRECTION = 1.22  # чуть ниже оригинального 1.28
-        
-        # Применяем калибровку лага если она доступна
-        lag_correction = 1.0
-        if self.lag_px > 0:
-            # Если мы обычно отстаём на lag_px, то нужно начинать прыжок чуть раньше
-            lag_correction = 1.0 + (self.lag_px / max(speed, 1.0)) * 0.05
-            lag_correction = min(1.15, lag_correction)  # не более 15% коррекции лага
-        
-        SPEED_CORRECTION *= lag_correction
-        
+        # arc_spx (speed.x из engine.jump) ≈ 85-88% от скорости бега
+        # Корректируем *1.18 чтобы пет оказался точно в target_x в момент прыжка
+        SPEED_CORRECTION = 1.18
         if anchor_srv_time > 0 and from_x > 118:
             # После первого прыжка — якорный метод с коррекцией
             effective_speed = speed * SPEED_CORRECTION
@@ -734,105 +533,16 @@ class GameSession:
 
         logger.info(
             f"[{self.game_id}] NEXT JUMP: barrier={next_b['x']} "
-            f"target_x={target_x:.0f} ideal={ideal_dist:.1f} safe_gap={safe_gap:.1f} "
+            f"target_x={target_x:.0f} ideal={ideal_dist:.1f}+buf={BUFFER:.0f} "
             f"speed={speed:.4f} fire_in={delay_s*1000:.0f}ms"
         )
 
         def fire(srv_time=jump_server_time, bx=next_b["x"], target_ref=target_x):
             if self._done.is_set():
                 return
-
-            # Этот fire может прилететь из старого таймера (гонка между cancel и callback).
-            # В таком случае просто игнорируем его, чтобы не прыгать по старому барьеру.
-            if plan_seq != self._jump_plan_seq:
-                logger.info(
-                    f"[{self.game_id}] stale jump plan ignored: barrier={bx} plan={plan_seq} current={self._jump_plan_seq}"
-                )
-                return
-
             # Если время прыжка уже прошло — используем текущее серверное время
             now_srv = time.time() * 1000 + self.server_time_offset
-
-            # Перед отправкой прыжка пересчитываем дистанцию до барьера.
-            # Используем максимум из двух оценок позиции:
-            # 1) из последних sync/jump событий,
-            # 2) кинематическая оценка от точки планирования (устойчиво к lag sync).
-            est_x_sync = self._estimate_pet_x_now(now_srv)
-            speed_now = self.current_speed_x if self.current_speed_x > 0 else speed
-            anchor_for_pred = anchor_srv_time if anchor_srv_time > 0 else self.physics_start_at
-            if anchor_for_pred > 0 and speed_now > 0:
-                dt_ticks = max(0.0, (now_srv - anchor_for_pred) / 10.0)
-                est_x_pred = from_x + dt_ticks * speed_now
-            else:
-                est_x_pred = from_x
-
-            est_x = max(est_x_sync, est_x_pred)
-            est_front = est_x + self.width_pet
-            distance_to_barrier = bx - est_front
-
-            # Барьер уже позади/впритык по оценке — этот план устарел, перепланируем с текущей позиции.
-            if distance_to_barrier <= 0:
-                logger.info(
-                    f"[{self.game_id}] skip stale barrier={bx}: est_front={est_front:.1f}, replan"
-                )
-                self._schedule_next_jump(
-                    from_x=est_x,
-                    speed=speed_now,
-                    anchor_srv_time=now_srv,
-                )
-                return
-
-            # Актуальная целевая дистанция до барьера с учётом текущей скорости.
-            # Используем те же параметры что и при планировании
-            is_first = anchor_srv_time <= 0 or from_x <= 120.0
-            if is_first:
-                reaction_ticks = 13.0
-                safety_margin_px = 58.0
-                min_gap_px = 175.0
-                max_gap_px = 240.0
-            else:
-                reaction_ticks = 15.0
-                safety_margin_px = 70.0
-                min_gap_px = 190.0
-                max_gap_px = 250.0
-            
-            desired_jump_dist = ideal_dist + speed_now * reaction_ticks + safety_margin_px
-            desired_jump_dist = max(min_gap_px, min(max_gap_px, desired_jump_dist))
-
-            # Коридор принятия решения: немного больше допуска для стабильности
-            tolerance = 6.0  # (было 8.0, но это слишком много для стабильности)
-            
-            # Если уже слишком близко к барьеру — шлём немедленно.
-            # Порог поднят, чтобы уменьшить случаи «упирания» перед прыжком.
-            min_jump_dist = 155.0
-
-            # Защита от «позднего» прыжка: если почти у барьера — шлём сразу
-            # и не переносим таймер (иначе упираемся в барьер до применения input).
-            if distance_to_barrier <= min_jump_dist:
-                logger.info(
-                    f"[{self.game_id}] LATE jump guard: dist={distance_to_barrier:.1f}px "
-                    f"barrier={bx}, fire immediately"
-                )
-
-            # Проверяем рано ли мы (далеко от барьера)
-            if distance_to_barrier > desired_jump_dist + tolerance and speed_now > 0:
-                extra_ticks = (distance_to_barrier - (desired_jump_dist + tolerance)) / speed_now
-                # Минимальная задержка 20ms для медленных петов, максимальная 120ms
-                extra_delay_s = min(0.120, max(0.020, extra_ticks * 0.008))
-                logger.info(
-                    f"[{self.game_id}] EARLY jump guard: dist={distance_to_barrier:.1f}px "
-                    f"target={desired_jump_dist:.1f}px barrier={bx}, postpone {extra_delay_s*1000:.0f}ms"
-                )
-                t2 = threading.Timer(extra_delay_s, fire)
-                t2.daemon = True
-                t2.start()
-                self._jump_timers.append(t2)
-                return
-
-            # jumpedAt должен отражать момент фактической отправки input.
-            # Если отправить jumpedAt из будущего (плановое srv_time), сервер
-            # может применить действие позже ожидаемого окна и пет упрётся в барьер.
-            actual_jumped_at = int(now_srv)
+            actual_jumped_at = int(max(srv_time, now_srv))
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
                 "jumpedAt": actual_jumped_at,
@@ -844,11 +554,9 @@ class GameSession:
             # Запоминаем jumpedAt который отправили — для точного расчёта скорости
             self._last_sent_jumped_at = actual_jumped_at
             self._prev_target_x = target_ref  # target_x этого прыжка
-            self._sent_jumps.append((actual_jumped_at, float(target_ref), float(bx)))
             logger.info(
                 f"[{self.game_id}] ⏱ JUMP jumpedAt={actual_jumped_at} "
-                f"barrier={bx} dist={distance_to_barrier:.1f}px "
-                f"(planned={int(srv_time)}, min={min_jump_dist:.0f}, desired={desired_jump_dist:.1f})"
+                f"barrier={bx} (planned={int(srv_time)})"
             )
 
         t = threading.Timer(delay_s, fire)
@@ -893,14 +601,22 @@ class GameSession:
             if "power" in info:
                 self.gravity = float(info["power"].get("gravity", self.gravity))
 
-            chars = info.get("chars", {})
-            self.current_speed_x, speed_source, speed_stat = _estimate_running_speed_px_tick(chars)
+            # Квадратичная формула скорости из реальных измерений:
+            # (10→1.648, 53→2.610, 77→4.150 px/tick)
+            # speed = 0.000624*agi^2 - 0.016927*agi + 1.754893
+            agility = info.get("chars", {}).get("agility", 53)
+            self.current_speed_x = (
+                0.000624 * agility**2
+                - 0.016927 * agility
+                + 1.754893
+            )
+            self.current_speed_x = max(0.5, self.current_speed_x)
 
             logger.info(
                 f"[{self.game_id}] Наш пет: {info.get('name')} "
-                f"row={self.pet_row} agi={chars.get('agility', 0)} str={chars.get('strength', 0)} "
+                f"row={self.pet_row} agility={agility} "
                 f"speed={self.current_speed_x:.3f}px/tick "
-                f"(тик=10ms → {self.current_speed_x/10:.4f}px/ms, by {speed_source}={speed_stat}) "
+                f"(тик=10ms → {self.current_speed_x/10:.4f}px/ms) "
                 f"jp={self.jump_power:.1f} g={self.gravity:.2f}"
             )
             # Применяем барьеры если они уже пришли до нашего connected
@@ -993,31 +709,6 @@ class GameSession:
                         f"на row={self.pet_row}, первый x={self.barriers[0]['x'] if self.barriers else '—'}"
                     )
 
-            # Fallback против рассинхрона:
-            # если по какой-то причине потеряли engine.jump confirm и планировщик
-            # остался без таймера, перепланируем прыжок от текущей позиции.
-            if (
-                self.started
-                and self.mode == "race"
-                and self.barriers
-                and self.current_speed_x > 0
-                and self.pet_status == "running"
-                and not self._has_active_jump_timer()
-            ):
-                now_srv = time.time() * 1000 + self.server_time_offset
-                est_x = self._estimate_pet_x_now(now_srv)
-                next_b = next((b for b in self.barriers if b["x"] > est_x + self.width_pet), None)
-                if next_b:
-                    logger.info(
-                        f"[{self.game_id}] SYNC fallback: no active jump timer, "
-                        f"replan from x≈{est_x:.0f} to barrier={next_b['x']}"
-                    )
-                    self._schedule_next_jump(
-                        from_x=est_x,
-                        speed=self.current_speed_x,
-                        anchor_srv_time=now_srv,
-                    )
-
         def on_started(data: dict):
             self.last_update = data.get("lastUpdate", self.last_update)
             self.started     = True
@@ -1099,84 +790,24 @@ class GameSession:
 
             if real_x is not None:
                 self.pet_x = real_x
-                # В engine.jump координата часто приходит уже «в дуге» (y>0),
-                # поэтому real_x не равен позиции на земле в момент jumpedAt.
-                # Для планирования следующего прыжка используем target_x предыдущего
-                # отправленного прыжка (если есть), а не mid-air координату.
-                confirm_time = float(
-                    data.get("petLastUpdate")
-                    or data.get("lastUpdate")
-                    or data.get("serverTime")
-                    or self._last_sent_jumped_at
-                    or 0
-                )
+                # speed.x из ответа = мгновенная горизонтальная скорость дуги
+                # Стабильна, точна, не требует вычислений
+                anchor = float(self._last_sent_jumped_at or
+                               data.get("petLastUpdate") or
+                               data.get("serverTime") or 0)
 
-                # Ищем какой из отправленных нами jumpedAt ближе всего к confirm.
-                # Это лечит ситуацию, когда confirm приходит с заметной задержкой
-                # и _prev_target_x уже относится к следующему прыжку.
-                matched_jump = self._match_sent_jump(confirm_time)
-
-                anchor = confirm_time
-                anchor_x = real_x
-                if matched_jump is not None:
-                    sent_at, sent_target_x, sent_barrier_x = matched_jump
-                    anchor = float(sent_at)
-                    drift = abs(sent_target_x - real_x)
-                    max_drift = max(240.0, self.current_speed_x * 160.0)
-                    if drift <= max_drift:
-                        anchor_x = sent_target_x
-                    else:
-                        logger.info(
-                            f"[{self.game_id}] jump anchor drift too large: "
-                            f"target_x={sent_target_x:.0f} real_x={real_x:.0f} drift={drift:.1f}px "
-                            f"barrier={sent_barrier_x:.0f}"
-                        )
-
-                # Оцениваем реальную скорость бега (по земле), не подменяя её
-                # мгновенной дуговой speed.x из engine.jump.
-                running_spx = self._running_speed_from_jump(real_x, int(anchor), ground_x=anchor_x)
-                if running_spx > 0.5:
-                    self.current_speed_x = running_spx
-                
-                # Калибровка лага: сравниваем ожидаемую позицию с реальной
-                # Это помогает улучшить точность прыжков на нестабильных сетях
-                if matched_jump is not None and self.physics_start_at > 0:
-                    sent_at, sent_target_x, _ = matched_jump
-                    # Сколько тиков прошло с отправки и до подтверждения
-                    time_delta = int(anchor) - int(sent_at)
-                    if time_delta >= 0:
-                        # Насколько реальная позиция отличается от ожидаемой
-                        position_error = real_x - sent_target_x
-                        # Сохраняем последние N отсчётов для усреднения
-                        if not hasattr(self, '_lag_samples'):
-                            self._lag_samples = []
-                        self._lag_samples.append(position_error)
-                        # Держим последние 5 отсчётов
-                        if len(self._lag_samples) > 5:
-                            self._lag_samples.pop(0)
-                        # Вычисляем усреднённый lag
-                        avg_lag = sum(self._lag_samples) / len(self._lag_samples)
-                        self.lag_px = max(0.0, avg_lag)  # lag не может быть отрицательным
-                        if len(self._lag_samples) > 2:  # начинаем применять после 3-го прыжка
-                            logger.info(
-                                f"[{self.game_id}] lag calibration: error={position_error:.1f}px "
-                                f"avg_lag={avg_lag:.1f}px samples={len(self._lag_samples)}"
-                            )
-
-                logger.info(
-                    f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
-                    f"arc_spx={arc_spx:.4f} run_spx={self.current_speed_x:.4f} anchor_x={anchor_x:.0f}"
-                )
-                self._schedule_next_jump(
-                    from_x=anchor_x,
-                    speed=self.current_speed_x,
-                    anchor_srv_time=anchor,
-                )
-
-                # Обновляем историю подтверждённых прыжков для расчёта speed на следующем.
-                self._prev_confirmed_x = real_x
-                self._prev_confirmed_at = anchor
-                self._prev_confirmed_ground_x = anchor_x
+                if arc_spx > 0.5:
+                    self.current_speed_x = arc_spx
+                    logger.info(
+                        f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} spx={arc_spx:.4f}"
+                    )
+                    self._schedule_next_jump(
+                        from_x=real_x, speed=arc_spx, anchor_srv_time=anchor
+                    )
+                else:
+                    self._schedule_next_jump(
+                        from_x=real_x, speed=self.current_speed_x, anchor_srv_time=anchor
+                    )
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
@@ -1304,7 +935,7 @@ def get_best_pets_by_evolution(mode: str) -> list:
     if not pets:
         return []
 
-    stat_key = "swim" if mode == "swim" else "strength"
+    stat_key = "swim" if mode == "swim" else "agility"
 
     # Группируем по эволюции
     by_evo = {}
@@ -1330,9 +961,9 @@ def get_best_pet_for_mode(mode: str) -> str | None:
     if not pets:
         return None
     best = pets[0]  # первый = наивысшая эволюция
-    stat_key = "swim" if mode == "swim" else "strength"
+    stat_key = "swim" if mode == "swim" else "agility"
     logger.info(f"Авто-выбор для {mode}: {best['name']} evo{best['evolution']} "
-                f"lv{best['level']} {stat_key}={best[stat_key]} agi={best['agility']}")
+                f"lv{best['level']} {stat_key}={best[stat_key]}")
     return best["id"]
 
 
