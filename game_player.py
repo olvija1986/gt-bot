@@ -49,6 +49,9 @@ WAITROOM_TIMEOUT = 60    # сек ждём матч
 GAME_TIMEOUT     = 120   # сек максимум на игру
 # Отправляем jump немного заранее для компенсации сети/обработки на сервере.
 JUMP_SEND_AHEAD_MS = float(os.environ.get("JUMP_SEND_AHEAD_MS", "120"))
+# Глобальный доп. сдвиг влево для более раннего старта прыжка.
+# Полезно если питомец всё ещё иногда "упирается" в край барьера.
+JUMP_EARLY_EXTRA_PX = float(os.environ.get("JUMP_EARLY_EXTRA_PX", "16"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -608,23 +611,30 @@ class GameSession:
         )
 
         # BUFFER: запас до барьера в момент прыжка.
-        # Чем точнее скорость, тем меньше можно буферить — это даёт "идеальнее" тайминг.
-        BUFFER = 72.0 if self.speed_up_tick_x > 0 else 90.0
+        # Чуть увеличили для более стабильного перелёта переднего края барьера.
+        BUFFER = 82.0 if self.speed_up_tick_x > 0 else 98.0
 
         # Дополнительный сдвиг старта прыжка влево.
         # После перехода на расчёт distance по физике разгона прыгали слишком "впритык"
         # (визуально прямо на барьере). Делаем ранний триггер по той же схеме, как
         # у встроенных игровых ботов — небольшой pre-jump offset до базового BUFFER.
-        PRE_JUMP_OFFSET = 18.0
+        PRE_JUMP_OFFSET = 22.0
         if self.speed_up_tick_x > 0:
             # При разгоне оставляем чуть больше запаса, чтобы не цеплять верх/край барьера.
-            PRE_JUMP_OFFSET += 6.0
+            PRE_JUMP_OFFSET += 10.0
 
         # Медленные петы (обычно wood-лига) чаще «втыкаются» в барьер из‑за
         # сетевой задержки и квантования serverTime. Для них чуть раньше
         # двигаем точку старта прыжка и отправляем пакет с большим упреждением.
         slow_factor = max(0.0, 2.2 - float(speed))
-        PRE_JUMP_OFFSET += min(30.0, slow_factor * 35.0)
+        PRE_JUMP_OFFSET += min(42.0, slow_factor * 44.0)
+
+        # Чем выше барьер, тем раньше начинаем прыжок.
+        # Это даёт дополнительный запас по высоте траектории в точке барьера.
+        PRE_JUMP_OFFSET += min(18.0, max(0.0, (float(barrier_high) - 50.0) * 0.28))
+
+        # Пользовательская тонкая настройка: ранний старт в пикселях.
+        PRE_JUMP_OFFSET += max(0.0, JUMP_EARLY_EXTRA_PX)
 
         target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER - PRE_JUMP_OFFSET
         target_x = max(target_x, from_x + speed)
@@ -644,7 +654,7 @@ class GameSession:
 
         # Локальное время отправки
         now_local = time.time() * 1000
-        send_ahead_ms = JUMP_SEND_AHEAD_MS + min(90.0, slow_factor * 120.0)
+        send_ahead_ms = JUMP_SEND_AHEAD_MS + min(120.0, slow_factor * 150.0)
         fire_local = jump_server_time - self.server_time_offset - send_ahead_ms
         delay_s = max(0.0, (fire_local - now_local) / 1000.0)
 
