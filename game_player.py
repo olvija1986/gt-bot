@@ -332,6 +332,83 @@ _SPEED_TABLE = [
     (100, 0.540),  # экстраполяция
 ]
 
+def _classify_pet_speed(speed: float) -> str:
+    """Классифицирует пета по скорости для адаптивных параметров."""
+    if speed < 2.0:
+        return "slow"      # Медленный (str < 10)
+    elif speed < 3.5:
+        return "medium"    # Средний (str 10-30)
+    else:
+        return "fast"      # Быстрый (str > 30)
+
+
+def _get_adaptive_params(speed: float) -> dict:
+    """Возвращает адаптивные параметры в зависимости от скорости пета."""
+    pet_type = _classify_pet_speed(speed)
+    
+    params = {
+        "slow": {
+            # Медленные петы: ОЧЕНЬ консервативно
+            "first_jump": {
+                "reaction_ticks": 18.0,     # ← ещё больше времени
+                "safety_margin_px": 85.0,
+                "min_gap_px": 280.0,        # ← ОЧЕНЬ консервативно (было 220)
+                "max_gap_px": 320.0,
+                "speed_correction": 1.02,   # ← минимум (было 1.05)
+                "arc_speed_mult": 0.75,     # ← более консервативно (было 0.80)
+            },
+            "other_jumps": {
+                "reaction_ticks": 14.0,
+                "safety_margin_px": 60.0,
+                "min_gap_px": 180.0,
+                "max_gap_px": 240.0,
+                "speed_correction": 1.05,
+                "arc_speed_mult": 0.80,
+            },
+        },
+        "medium": {
+            # Средние петы: нормально
+            "first_jump": {
+                "reaction_ticks": 16.0,
+                "safety_margin_px": 75.0,
+                "min_gap_px": 240.0,        # ← нормально (было 220)
+                "max_gap_px": 300.0,
+                "speed_correction": 1.05,
+                "arc_speed_mult": 0.82,
+            },
+            "other_jumps": {
+                "reaction_ticks": 12.0,
+                "safety_margin_px": 50.0,
+                "min_gap_px": 170.0,
+                "max_gap_px": 230.0,
+                "speed_correction": 1.08,
+                "arc_speed_mult": 0.85,
+            },
+        },
+        "fast": {
+            # Быстрые петы: можем быть агрессивнее
+            "first_jump": {
+                "reaction_ticks": 14.0,
+                "safety_margin_px": 60.0,
+                "min_gap_px": 200.0,        # ← может быть меньше
+                "max_gap_px": 260.0,
+                "speed_correction": 1.08,
+                "arc_speed_mult": 0.85,
+            },
+            "other_jumps": {
+                "reaction_ticks": 10.0,     # ← быстрее
+                "safety_margin_px": 40.0,
+                "min_gap_px": 150.0,        # ← агрессивнее
+                "max_gap_px": 210.0,
+                "speed_correction": 1.10,
+                "arc_speed_mult": 0.88,
+            },
+        },
+    }
+    
+    return params[pet_type]
+
+
 def _agility_to_speed_per_ms(agility: int) -> float:
     """Интерполирует скорость px/ms по agility из таблицы реальных измерений."""
     xs = [x for x, _ in _SPEED_TABLE]
@@ -370,17 +447,13 @@ def _estimate_running_speed_px_tick(chars: dict) -> tuple[float, str, int]:
     return max(0.5, speed), speed_source, speed_stat
 
 
-def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity: float = 1.5) -> float:
+def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity: float = 1.5, arc_speed_mult: float = 0.85) -> float:
     """Симулирует физику прыжка и возвращает x где пет приземлится.
     
-    Улучшенная версия: учитываем, что arc_spx (горизонтальная скорость в воздухе)
-    примерно на 15-20% ниже скорости бега из-за физики прыжка.
-    Для медленных петов используем более консервативный коэффициент (0.80 вместо 0.85).
+    arc_speed_mult: коэффициент скорости в воздухе (адаптивный в зависимости от пета)
     """
     y, sy = 0.0, jump_power
-    # Корректируем скорость в воздухе — она ниже скорости бега
-    # Для медленных петов консервативнее
-    arc_speed = speed_x * (0.80 if speed_x < 2.0 else 0.85)
+    arc_speed = speed_x * arc_speed_mult
     x = float(start_x)
     for _ in range(500):
         sy -= 0.6
@@ -576,16 +649,16 @@ class GameSession:
         
         if is_first_jump:
             # Первый прыжок: более консервативно, чтобы не приземлиться ДО барьера
-            reaction_ticks = 16.0   # ~160ms (больше времени)
-            safety_margin_px = 75.0  # больший запас
-            min_gap_px = 220.0      # намного больше минимума
-            max_gap_px = 280.0
+            reaction_ticks = 13.0   # ~130ms
+            safety_margin_px = 58.0 
+            min_gap_px = 175.0      # чуть больше оригинального 168
+            max_gap_px = 240.0
         else:
             # Остальные прыжки: можем быть более агрессивными
-            reaction_ticks = 12.0   # ~120ms
-            safety_margin_px = 50.0
-            min_gap_px = 170.0
-            max_gap_px = 230.0
+            reaction_ticks = 15.0   # ~150ms
+            safety_margin_px = 70.0
+            min_gap_px = 190.0      # чуть больше оригинального 195
+            max_gap_px = 250.0
         
         safe_gap = ideal_dist + speed * reaction_ticks + safety_margin_px
         safe_gap = max(min_gap_px, min(max_gap_px, safe_gap))
@@ -595,11 +668,12 @@ class GameSession:
 
         # jumpedAt: вычисляем через реальную скорость движения пета
         # arc_spx (speed.x из engine.jump) ≈ 85% от скорости бега
-        # Коррекция НИЖЕ для первого прыжка (пет только начинает двигаться)
+        # Используем балансированные значения: сниженные относительно оригинала,
+        # но достаточные чтобы не приземлиться перед барьером
         if is_first_jump:
-            SPEED_CORRECTION = 1.05  # ← очень консервативно
+            SPEED_CORRECTION = 1.16  # чуть ниже оригинального 1.18
         else:
-            SPEED_CORRECTION = 1.10  # умеренная коррекция для остальных
+            SPEED_CORRECTION = 1.22  # чуть ниже оригинального 1.28
         
         # Применяем калибровку лага если она доступна
         lag_correction = 1.0
@@ -678,26 +752,23 @@ class GameSession:
 
             # Актуальная целевая дистанция до барьера с учётом текущей скорости.
             # Используем те же параметры что и при планировании
-            if self.pet_status == "running" or not hasattr(self, '_is_first_jump_for_fire'):
-                # Определяем если это всё ещё "первый" прыжок
-                is_first = anchor_srv_time <= 0 or from_x <= 120.0
-                if is_first:
-                    reaction_ticks = 16.0
-                    safety_margin_px = 75.0
-                    min_gap_px = 220.0
-                    max_gap_px = 280.0
-                else:
-                    reaction_ticks = 12.0
-                    safety_margin_px = 50.0
-                    min_gap_px = 170.0
-                    max_gap_px = 230.0
+            is_first = anchor_srv_time <= 0 or from_x <= 120.0
+            if is_first:
+                reaction_ticks = 13.0
+                safety_margin_px = 58.0
+                min_gap_px = 175.0
+                max_gap_px = 240.0
+            else:
+                reaction_ticks = 15.0
+                safety_margin_px = 70.0
+                min_gap_px = 190.0
+                max_gap_px = 250.0
             
             desired_jump_dist = ideal_dist + speed_now * reaction_ticks + safety_margin_px
             desired_jump_dist = max(min_gap_px, min(max_gap_px, desired_jump_dist))
 
-            # Коридор принятия решения: небольшой допуск на колебания позиции.
-            # Слишком маленький допуск приводит к частым переносам таймера (wobbling).
-            tolerance = 8.0  # увеличили с 3.0 для меньшей чувствительности
+            # Коридор принятия решения: немного больше допуска для стабильности
+            tolerance = 6.0  # (было 8.0, но это слишком много для стабильности)
             
             # Если уже слишком близко к барьеру — шлём немедленно.
             # Порог поднят, чтобы уменьшить случаи «упирания» перед прыжком.
