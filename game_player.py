@@ -529,6 +529,12 @@ class GameSession:
             # (включая _last_jumped_barrier снова если нужно)
             search_from = pet_front
 
+        # Пока мы в воздухе после отправленного прыжка, нельзя снова целиться
+        # в тот же барьер. Иначе получаем цепочку дублирующих jump по одному
+        # препятствию (в логах это выглядит как fire_in≈0ms и «залипание»).
+        if self.pet_status == "jumping" and self._last_jumped_barrier > 0:
+            search_from = max(search_from, self._last_jumped_barrier + 1.0)
+
         next_b = next(
             (b for b in self.barriers
              if b["x"] > search_from
