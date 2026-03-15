@@ -440,7 +440,7 @@ class GameSession:
         if not next_b:
             logger.info(f"[{self.game_id}] Все барьеры пройдены (from_x={from_x:.0f})")
             return
-        self._last_jumped_barrier = next_b["x"]
+        # НЕ устанавливаем _last_jumped_barrier здесь — только когда реально прыгнем
 
         barrier_high = next_b.get("high", 50)
         if self.mode == "race":
@@ -494,6 +494,7 @@ class GameSession:
             event = "engine.jump" if self.mode == "race" else "engine.dive"
             self._client.emit_with_null(event, payload)
             self.pet_status = "jumping"
+            self._last_jumped_barrier = bx  # фиксируем только при реальной отправке
             # Запоминаем jumpedAt который отправили — для точного расчёта скорости
             self._last_sent_jumped_at = actual_jumped_at
             logger.info(
