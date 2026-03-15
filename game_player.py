@@ -620,6 +620,12 @@ class GameSession:
             # При разгоне оставляем чуть больше запаса, чтобы не цеплять верх/край барьера.
             PRE_JUMP_OFFSET += 6.0
 
+        # Медленные петы (обычно wood-лига) чаще «втыкаются» в барьер из‑за
+        # сетевой задержки и квантования serverTime. Для них чуть раньше
+        # двигаем точку старта прыжка и отправляем пакет с большим упреждением.
+        slow_factor = max(0.0, 2.2 - float(speed))
+        PRE_JUMP_OFFSET += min(30.0, slow_factor * 35.0)
+
         target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER - PRE_JUMP_OFFSET
         target_x = max(target_x, from_x + speed)
 
@@ -638,15 +644,16 @@ class GameSession:
 
         # Локальное время отправки
         now_local = time.time() * 1000
-        fire_local = jump_server_time - self.server_time_offset - JUMP_SEND_AHEAD_MS
+        send_ahead_ms = JUMP_SEND_AHEAD_MS + min(90.0, slow_factor * 120.0)
+        fire_local = jump_server_time - self.server_time_offset - send_ahead_ms
         delay_s = max(0.0, (fire_local - now_local) / 1000.0)
 
         logger.info(
             f"[{self.game_id}] NEXT JUMP: barrier={next_b['x']} "
-            f"target_x={target_x:.0f} ideal={ideal_dist:.1f}+buf={BUFFER:.0f}+pre={PRE_JUMP_OFFSET:.0f} "
-            f"speed={speed:.4f} fire_in={delay_s*1000:.0f}ms "
-            f"send_ahead={JUMP_SEND_AHEAD_MS:.0f}ms"
-        )
+                f"target_x={target_x:.0f} ideal={ideal_dist:.1f}+buf={BUFFER:.0f}+pre={PRE_JUMP_OFFSET:.0f} "
+                f"speed={speed:.4f} fire_in={delay_s*1000:.0f}ms "
+                f"send_ahead={send_ahead_ms:.0f}ms"
+            )
 
         def fire(srv_time=jump_server_time, bx=next_b["x"], target_ref=target_x):
             if self._done.is_set():
