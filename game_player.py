@@ -40,6 +40,14 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Читает bool-флаг из env: 1/true/yes/on = True."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 # ── конфиг ──────────────────────────────────────────────
 TG_TOKEN       = os.environ.get("TG_TOKEN", "")
 API_BASE       = "https://api.nl.gatto.pw"
@@ -47,6 +55,7 @@ WAITROOM_WS    = "wss://waitroom.nl.gatto.pw/socket.io/?EIO=4&transport=websocke
 SCREEN         = {"w": 1182, "h": 468}
 WAITROOM_TIMEOUT = 60    # сек ждём матч
 GAME_TIMEOUT     = 120   # сек максимум на игру
+SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", True)
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -182,7 +191,10 @@ class SioClient:
             if self._ws:
                 self._ws.send(raw)
                 import logging as _l
-                _l.getLogger("game_player").debug(f"[SioClient] -> {raw[:120]}")
+                log = _l.getLogger("game_player")
+                log.debug(f"[SioClient] -> {raw[:120]}")
+                if SOCKET_FULL_LOG:
+                    log.info(f"[SioClient][full] -> {raw}")
         except Exception as e:
             import logging as _l
             _l.getLogger("game_player").warning(f"[SioClient] send error: {e}")
@@ -196,6 +208,8 @@ class SioClient:
         import logging as _l
         log = _l.getLogger("game_player")
         log.info(f"[SioClient] <- {msg[:200]}")
+        if SOCKET_FULL_LOG:
+            log.info(f"[SioClient][full] <- {msg}")
 
         if msg == "2":
             self._ws_send("3")
