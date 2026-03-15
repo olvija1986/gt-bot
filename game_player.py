@@ -58,6 +58,100 @@ HEADERS_HTTP = {
 }
 
 
+def _mode_stat_names(mode: str) -> tuple[str, str]:
+    """Возвращает ключи характеристик для формулы скорости."""
+    if mode == "swim":
+        return "swim", "agility"
+    return "strength", "agility"
+
+
+def _speed_factor(chars: dict, mode: str) -> float:
+    """
+    Множитель из game-клиента:
+    (mainStat/100 + agility/100) * 0.45
+    """
+    main_stat, second_stat = _mode_stat_names(mode)
+    return ((chars.get(main_stat, 0) / 100.0) + (chars.get(second_stat, 0) / 100.0)) * 0.45
+
+
+def _calc_mode_speed(base_speed: float, chars: dict, mode: str) -> float:
+    """Расчёт speed.initial / speed.max / speed.increasePerSec под режим."""
+    return base_speed + base_speed * _speed_factor(chars, mode)
+
+
+def _extract_speed_profile(info: dict, mode: str) -> dict | None:
+    """
+    Достаёт профиль скорости из pet.info по формулам фронта.
+    Возвращает значения в px/tick.
+    """
+    chars = info.get("chars", {}) or {}
+    speed = info.get("speed", {}) or {}
+    required = ("initial", "max", "increasePerSec")
+    if any(speed.get(k) is None for k in required):
+        return None
+
+    initial_tick = _calc_mode_speed(float(speed["initial"]), chars, mode)
+    max_tick = _calc_mode_speed(float(speed["max"]), chars, mode)
+    increase_sec = _calc_mode_speed(float(speed["increasePerSec"]), chars, mode)
+
+    # 1 tick = 10ms => 100 ticks/s
+    increase_tick = increase_sec / 100.0
+    return {
+        "initial": max(0.1, initial_tick),
+        "max": max(0.1, max_tick),
+        "increase_per_tick": max(0.0, increase_tick),
+    }
+
+
+def _ticks_to_cover_distance(distance: float, speed0: float, accel_tick: float, speed_max: float) -> float:
+    """
+    Сколько тиков нужно, чтобы пройти distance по X
+    при разгоне speed0 + accel_tick * t с ограничением speed_max.
+    """
+    if distance <= 0:
+        return 0.0
+
+    v0 = max(0.01, speed0)
+    vmax = max(v0, speed_max)
+    a = max(0.0, accel_tick)
+
+    # Без ускорения — обычная линейка
+    if a <= 1e-9:
+        return distance / v0
+
+    # Тики до выхода на vmax
+    t_to_max = max(0.0, (vmax - v0) / a)
+    # Путь на участке разгона (дискретно-непрерывная аппроксимация)
+    dist_accel = v0 * t_to_max + 0.5 * a * t_to_max * t_to_max
+
+    if distance <= dist_accel:
+        # Решаем 0.5*a*t^2 + v0*t - distance = 0
+        disc = v0 * v0 + 2.0 * a * distance
+        return (-v0 + disc ** 0.5) / a
+
+    return t_to_max + (distance - dist_accel) / vmax
+
+def _distance_in_ticks(ticks: float, speed0: float, accel_tick: float, speed_max: float) -> float:
+    """Какую дистанцию пройдёт пет за ticks тиков по той же модели разгона."""
+    if ticks <= 0:
+        return 0.0
+
+    v0 = max(0.01, speed0)
+    vmax = max(v0, speed_max)
+    a = max(0.0, accel_tick)
+
+    if a <= 1e-9:
+        return v0 * ticks
+
+    t_to_max = max(0.0, (vmax - v0) / a)
+    t_acc = min(ticks, t_to_max)
+    dist = v0 * t_acc + 0.5 * a * t_acc * t_acc
+    if ticks > t_to_max:
+        dist += (ticks - t_to_max) * vmax
+    return dist
+
+
+
 # ══════════════════════════════════════════════════════════
 #  Физика прыжка (порт physics.ts)
 # ══════════════════════════════════════════════════════════
@@ -382,6 +476,9 @@ class GameSession:
         # currentSpeed — обновляется из engine.sync и engine.jump событий
         self.current_speed_x  = 0.0   # px/tick (не px/ms!)
         self.current_speed_y  = 0.0
+        self.speed_initial_x  = 0.0
+        self.speed_max_x      = 0.0
+        self.speed_up_tick_x  = 0.0
         # Физические параметры пета — берём из engine.user.connected
         self.jump_power    = 20.0    # дефолт, перезапишется из pet.info
         self.dive_power    = 10.0    # для swim
@@ -500,27 +597,33 @@ class GameSession:
         else:
             ticks_up = ticks_to_reach_depth(self.dive_power, barrier_high)
 
-        ideal_dist = speed * (ticks_up + 2)
+        travel_ticks = ticks_up + 2
+        ideal_dist = _distance_in_ticks(
+            travel_ticks,
+            speed,
+            self.speed_up_tick_x,
+            self.speed_max_x if self.speed_max_x > 0 else speed,
+        )
 
-        # BUFFER: сколько px до барьера должен быть пет в момент прыжка
-        # Для надёжного перелёта нужно dist ≥ 40px при jump_x
-        # Initial: скорость откорректирована *1.18, буфер небольшой
-        # Calibrated: скорость реальная из подтверждённого прыжка
-        BUFFER = 90.0
+        # BUFFER: запас до барьера в момент прыжка.
+        # Чем точнее скорость, тем меньше можно буферить — это даёт "идеальнее" тайминг.
+        BUFFER = 72.0 if self.speed_up_tick_x > 0 else 90.0
 
         target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER
         target_x = max(target_x, from_x + speed)
 
-        # jumpedAt: используем якорь если есть (точнее)
+        # jumpedAt: считаем время до target_x по модели разгона
+        distance_to_target = max(0.0, target_x - from_x)
+        delta_ticks = _ticks_to_cover_distance(
+            distance_to_target,
+            speed,
+            self.speed_up_tick_x,
+            self.speed_max_x if self.speed_max_x > 0 else speed,
+        )
         if anchor_srv_time > 0 and from_x > 118:
-            delta_ticks = (target_x - from_x) / speed
             jump_server_time = anchor_srv_time + delta_ticks * 10.0
         else:
-            # Первый прыжок: формула занижает скорость на ~18%
-            # Корректируем: используем speed*1.18 для расчёта jumpedAt
-            corrected_speed = speed * 1.18
-            elapsed_ticks = (target_x - 118.0) / corrected_speed
-            jump_server_time = self.physics_start_at + elapsed_ticks * 10.0
+            jump_server_time = self.physics_start_at + delta_ticks * 10.0
 
         # Локальное время отправки
         now_local = time.time() * 1000
@@ -597,23 +700,32 @@ class GameSession:
             if "power" in info:
                 self.gravity = float(info["power"].get("gravity", self.gravity))
 
-            # Квадратичная формула скорости из реальных измерений:
-            # (10→1.648, 53→2.610, 77→4.150 px/tick)
-            # speed = 0.000624*agi^2 - 0.016927*agi + 1.754893
-            agility = info.get("chars", {}).get("agility", 53)
-            self.current_speed_x = (
-                0.000624 * agility**2
-                - 0.016927 * agility
-                + 1.754893
-            )
-            self.current_speed_x = max(0.5, self.current_speed_x)
+            chars = info.get("chars", {}) or {}
+            speed_profile = _extract_speed_profile(info, self.mode)
+            if speed_profile:
+                self.speed_initial_x = speed_profile["initial"]
+                self.speed_max_x = speed_profile["max"]
+                self.speed_up_tick_x = speed_profile["increase_per_tick"]
+                self.current_speed_x = self.speed_initial_x
+            else:
+                # Фолбэк: эмпирическая аппроксимация если сервер не прислал speed.*
+                agility = chars.get("agility", 53)
+                self.current_speed_x = (
+                    0.000624 * agility**2
+                    - 0.016927 * agility
+                    + 1.754893
+                )
+                self.current_speed_x = max(0.5, self.current_speed_x)
+                self.speed_initial_x = self.current_speed_x
+                self.speed_max_x = self.current_speed_x
+                self.speed_up_tick_x = 0.0
 
             logger.info(
                 f"[{self.game_id}] Наш пет: {info.get('name')} "
-                f"row={self.pet_row} agility={agility} "
-                f"speed={self.current_speed_x:.3f}px/tick "
-                f"(тик=10ms → {self.current_speed_x/10:.4f}px/ms) "
-                f"jp={self.jump_power:.1f} g={self.gravity:.2f}"
+                f"row={self.pet_row} str={chars.get('strength',0)} "
+                f"agi={chars.get('agility',0)} swim={chars.get('swim',0)} "
+                f"v0={self.speed_initial_x:.3f}px/tick vmax={self.speed_max_x:.3f} "
+                f"a={self.speed_up_tick_x:.5f}px/tick² jp={self.jump_power:.1f} g={self.gravity:.2f}"
             )
             # Применяем барьеры если они уже пришли до нашего connected
             if self._all_barriers_raw and self.pet_row and not self.barriers:
