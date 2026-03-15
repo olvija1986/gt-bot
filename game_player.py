@@ -574,6 +574,38 @@ class GameSession:
             return self.current_speed_x
         return (current_ground_x - 118.0) / elapsed
 
+    def _match_sent_jump(self, confirm_time: float):
+        """
+        Матчит server confirm с реально отправленным прыжком.
+
+        Важный момент: подтверждение для i-го прыжка может прийти уже после
+        отправки (i+1)-го. Если брать просто "ближайший по времени" элемент из
+        хвоста, иногда выбирается неверный target_x и дальше каскадно уезжают
+        координаты 2+ прыжков.
+
+        Поэтому сначала берём самый свежий прыжок, отправленный НЕ позже
+        confirm_time (+ небольшой допуск), и только если такого нет — fallback на
+        ближайший по |dt|.
+        """
+        if not self._sent_jumps:
+            return None
+
+        allow_future_ms = 120.0
+        candidates = [j for j in self._sent_jumps if j[0] <= confirm_time + allow_future_ms]
+        if candidates:
+            matched = max(candidates, key=lambda j: j[0])
+        else:
+            matched = min(self._sent_jumps, key=lambda j: abs(j[0] - confirm_time))
+
+        matched_at = matched[0]
+        # Удаляем использованный и более старые прыжки — чтобы не перематчивать
+        # их на следующих confirm (это и ломало 2-й/3-й прыжок).
+        self._sent_jumps = deque(
+            [j for j in self._sent_jumps if j[0] > matched_at],
+            maxlen=self._sent_jumps.maxlen,
+        )
+        return matched
+
     def _schedule_next_jump(self, from_x: float, speed: float,
                             anchor_srv_time: float = 0.0):
         """
@@ -1082,12 +1114,7 @@ class GameSession:
                 # Ищем какой из отправленных нами jumpedAt ближе всего к confirm.
                 # Это лечит ситуацию, когда confirm приходит с заметной задержкой
                 # и _prev_target_x уже относится к следующему прыжку.
-                matched_jump = None
-                if self._sent_jumps:
-                    matched_jump = min(
-                        self._sent_jumps,
-                        key=lambda item: abs(item[0] - confirm_time),
-                    )
+                matched_jump = self._match_sent_jump(confirm_time)
 
                 anchor = confirm_time
                 anchor_x = real_x
