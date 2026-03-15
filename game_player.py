@@ -471,6 +471,61 @@ def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity
     return x
 
 
+def _find_late_safe_jump_distance(
+    speed_x: float,
+    jump_power: float,
+    gravity: float,
+    barrier_high: float,
+    width_pet: float,
+    width_barrier: float,
+    safety_margin: float = 3.0,
+) -> float | None:
+    """
+    Возвращает минимальную дистанцию (в px) от X пета до X барьера,
+    при которой прыжок ещё безопасно перелетает барьер.
+
+    Меньшая дистанция => более поздний ("точный") прыжок.
+    Если безопасной дистанции нет, вернёт None.
+    """
+    vx = max(0.05, float(speed_x))
+    barrier_left = 0.0
+    barrier_right = float(width_barrier)
+    required_height = max(0.0, float(barrier_high)) + max(0.0, float(safety_margin))
+
+    def _is_safe(dx_to_barrier: float) -> bool:
+        x = -float(dx_to_barrier)
+        y = 0.0
+        sy = float(jump_power)
+
+        for _ in range(500):
+            sy = max(0.0, sy - 0.6)
+            y += sy
+            if y - gravity > 0:
+                y -= gravity
+            else:
+                y = max(0.0, y - gravity)
+
+            pet_left = x
+            pet_right = x + width_pet
+            overlap = pet_right > barrier_left and pet_left < barrier_right
+            if overlap and y < required_height:
+                return False
+
+            # Приземлились: считаем прыжок успешным, если весь пет уже за барьером.
+            if y <= 0:
+                return pet_left >= barrier_right
+
+            x += vx
+
+        return False
+
+    # Ищем самый поздний (минимальный dx) безопасный прыжок.
+    for dx in range(int(width_pet), 900):
+        if _is_safe(float(dx)):
+            return float(dx)
+    return None
+
+
 class GameSession:
     def __init__(self, game_id: str, lobby_url: str, mode: str, user_id: int, on_finish=None, pet_id=None):
         self.game_id   = game_id
@@ -641,39 +696,34 @@ class GameSession:
             self.speed_max_x if self.speed_max_x > 0 else speed,
         )
 
-        # BUFFER: запас до барьера в момент прыжка.
-        # Чуть увеличили для более стабильного перелёта переднего края барьера.
-        BUFFER = 82.0 if self.speed_up_tick_x > 0 else 98.0
+        # Для более "идеального" прыжка считаем самую позднюю безопасную дистанцию
+        # до барьера через прямую симуляцию (без запаса на пол-экрана).
+        safe_dx = _find_late_safe_jump_distance(
+            speed,
+            self.jump_power,
+            self.gravity,
+            barrier_high,
+            self.width_pet,
+            self.width_barrier,
+            safety_margin=3.0,
+        )
 
-        # Дополнительный сдвиг старта прыжка влево.
-        # После перехода на расчёт distance по физике разгона прыгали слишком "впритык"
-        # (визуально прямо на барьере). Делаем ранний триггер по той же схеме, как
-        # у встроенных игровых ботов — небольшой pre-jump offset до базового BUFFER.
-        PRE_JUMP_OFFSET = 22.0
-        if self.speed_up_tick_x > 0:
-            # При разгоне оставляем чуть больше запаса, чтобы не цеплять верх/край барьера.
-            PRE_JUMP_OFFSET += 10.0
-
-        # Медленные петы (обычно wood-лига) чаще «втыкаются» в барьер из‑за
-        # сетевой задержки и квантования serverTime. Для них чуть раньше
-        # двигаем точку старта прыжка и отправляем пакет с большим упреждением.
+        # Дополнительные запасы только на сеть/джиттер.
         slow_factor = max(0.0, 2.2 - float(speed))
-        PRE_JUMP_OFFSET += min(42.0, slow_factor * 44.0)
-
-        # Чем выше барьер, тем раньше начинаем прыжок.
-        # Это даёт дополнительный запас по высоте траектории в точке барьера.
-        PRE_JUMP_OFFSET += min(18.0, max(0.0, (float(barrier_high) - 50.0) * 0.28))
-
-        # Пользовательская тонкая настройка: ранний старт в пикселях.
-        PRE_JUMP_OFFSET += max(0.0, JUMP_EARLY_EXTRA_PX)
-        # На барьерах 2/3/4 оставляем немного больший запас (цепочка препятствий).
+        network_pad = 6.0 + min(16.0, slow_factor * 12.0)
+        network_pad += min(8.0, max(0.0, self._tx_latency_ms) / 30.0)
+        network_pad += max(0.0, JUMP_EARLY_EXTRA_PX * 0.6)
         if next_idx is not None and next_idx >= 1:
-            PRE_JUMP_OFFSET += min(28.0, JUMP_CHAIN_EXTRA_PX * float(next_idx))
-        # Авто-подстройка: если подтверждения прыжка приходят слишком поздно,
-        # постепенно увеличиваем ранний старт в on_jump.
-        PRE_JUMP_OFFSET += max(0.0, self._adaptive_prejump_px)
+            network_pad += min(10.0, JUMP_CHAIN_EXTRA_PX * 0.6)
+        network_pad += min(10.0, max(0.0, self._adaptive_prejump_px) * 0.5)
 
-        target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER - PRE_JUMP_OFFSET
+        # Фолбэк на старую эвристику, если симуляция не нашла безопасную зону.
+        if safe_dx is None:
+            target_dist = ideal_dist + self.width_pet + 72.0
+        else:
+            target_dist = safe_dx + network_pad
+
+        target_x = next_b["x"] - target_dist
         target_x = max(target_x, from_x + speed)
 
         # jumpedAt: считаем время до target_x по модели разгона
@@ -700,7 +750,8 @@ class GameSession:
 
         logger.info(
             f"[{self.game_id}] NEXT JUMP: barrier={next_b['x']} "
-                f"target_x={target_x:.0f} ideal={ideal_dist:.1f}+buf={BUFFER:.0f}+pre={PRE_JUMP_OFFSET:.0f} "
+                f"target_x={target_x:.0f} ideal={ideal_dist:.1f} safe_dx={safe_dx if safe_dx is not None else -1:.1f} "
+                f"pad={network_pad:.1f} "
                 f"speed={speed:.4f} fire_in={delay_s*1000:.0f}ms "
                 f"send_ahead={send_ahead_ms:.0f}ms"
             )
