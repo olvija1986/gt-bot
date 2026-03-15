@@ -48,14 +48,14 @@ SCREEN         = {"w": 1182, "h": 468}
 WAITROOM_TIMEOUT = 60    # сек ждём матч
 GAME_TIMEOUT     = 120   # сек максимум на игру
 # Отправляем jump немного заранее для компенсации сети/обработки на сервере.
-JUMP_SEND_AHEAD_MS = float(os.environ.get("JUMP_SEND_AHEAD_MS", "170"))
+JUMP_SEND_AHEAD_MS = float(os.environ.get("JUMP_SEND_AHEAD_MS", "230"))
 # Глобальный доп. сдвиг влево для более раннего старта прыжка.
 # Полезно если питомец всё ещё иногда "упирается" в край барьера.
-JUMP_EARLY_EXTRA_PX = float(os.environ.get("JUMP_EARLY_EXTRA_PX", "24"))
+JUMP_EARLY_EXTRA_PX = float(os.environ.get("JUMP_EARLY_EXTRA_PX", "44"))
 # Минимальный запас между носом пета и барьером в момент отправки прыжка.
-JUMP_MIN_FRONT_CLEARANCE_PX = float(os.environ.get("JUMP_MIN_FRONT_CLEARANCE_PX", "58"))
+JUMP_MIN_FRONT_CLEARANCE_PX = float(os.environ.get("JUMP_MIN_FRONT_CLEARANCE_PX", "76"))
 # Доп. сдвиг по барьерам №2+ (помогает на сериях препятствий 2/3/4).
-JUMP_CHAIN_EXTRA_PX = float(os.environ.get("JUMP_CHAIN_EXTRA_PX", "8"))
+JUMP_CHAIN_EXTRA_PX = float(os.environ.get("JUMP_CHAIN_EXTRA_PX", "14"))
 # Минимальная пауза между отправками jump/dive, чтобы исключить дребезг
 # при дублях engine.jump и при одновременном retry + плановом прыжке.
 JUMP_RETRY_COOLDOWN_MS = float(os.environ.get("JUMP_RETRY_COOLDOWN_MS", "220"))
@@ -65,6 +65,9 @@ JUMP_CONFIRM_DEDUP_MS = float(os.environ.get("JUMP_CONFIRM_DEDUP_MS", "120"))
 # Это помогает компенсировать сетевую/очередную задержку и начать дугу раньше.
 JUMP_RETRO_BASE_MS = float(os.environ.get("JUMP_RETRO_BASE_MS", "95"))
 JUMP_RETRO_MAX_MS = float(os.environ.get("JUMP_RETRO_MAX_MS", "240"))
+# Экстренный порог: если по sync нос пета уже близко к барьеру,
+# шлём jump сразу, не дожидаясь таймера планировщика.
+JUMP_EMERGENCY_TRIGGER_PX = float(os.environ.get("JUMP_EMERGENCY_TRIGGER_PX", "54"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -962,6 +965,42 @@ class GameSession:
                         f"[{self.game_id}] Карта: {len(self.barriers)} барьеров "
                         f"на row={self.pet_row}, первый x={self.barriers[0]['x'] if self.barriers else '—'}"
                     )
+
+            # Failsafe: если по sync до барьера осталось критически мало,
+            # шлём прыжок немедленно (часто спасает при джиттере/лаг-спайках).
+            if self.started and self.mode == "race" and self.barriers and self.pet_x is not None:
+                pet_front = float(self.pet_x) + self.width_pet
+                next_barrier = next((b for b in self.barriers if b["x"] > pet_front), None)
+                if next_barrier and self.pet_status != "jumping":
+                    distance_to_barrier = next_barrier["x"] - pet_front
+                    emergency_trigger = max(30.0, min(120.0, JUMP_EMERGENCY_TRIGGER_PX))
+                    jump_soon = (
+                        self._next_jump_fire_local_ms > 0
+                        and self._next_jump_fire_local_ms - (time.time() * 1000) <= JUMP_RETRY_COOLDOWN_MS
+                    )
+                    recently_sent = (
+                        self._last_fire_local_ms > 0
+                        and (time.time() * 1000) - self._last_fire_local_ms < JUMP_RETRY_COOLDOWN_MS
+                    )
+                    if distance_to_barrier <= emergency_trigger and not jump_soon and not recently_sent:
+                        now_local_ms = time.time() * 1000
+                        now_srv = now_local_ms + self.server_time_offset
+                        retro_ms = min(JUMP_RETRO_MAX_MS, JUMP_RETRO_BASE_MS + max(40.0, self._tx_latency_ms))
+                        jumped_at = int(max(now_srv - 1900.0, now_srv - retro_ms))
+                        payload = {
+                            "clickPosition": {"x": self.click_x, "y": self.click_y},
+                            "jumpedAt": jumped_at,
+                        }
+                        self._client.emit_with_null("engine.jump", payload)
+                        self._last_fire_local_ms = now_local_ms
+                        self._next_jump_fire_local_ms = 0.0
+                        self._last_jumped_barrier = next_barrier["x"]
+                        self._last_sent_jumped_at = jumped_at
+                        self.pet_status = "jumping"
+                        logger.info(
+                            f"[{self.game_id}] ⚠️ EMERGENCY JUMP barrier={next_barrier['x']} "
+                            f"dist={distance_to_barrier:.1f}px jumpedAt={jumped_at}"
+                        )
 
         def on_started(data: dict):
             self.last_update = data.get("lastUpdate", self.last_update)
