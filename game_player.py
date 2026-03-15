@@ -880,24 +880,37 @@ class GameSession:
 
             if real_x is not None:
                 self.pet_x = real_x
-                # speed.x из ответа = мгновенная горизонтальная скорость дуги
-                # Стабильна, точна, не требует вычислений
+                # В engine.jump координата часто приходит уже «в дуге» (y>0),
+                # поэтому real_x не равен позиции на земле в момент jumpedAt.
+                # Для планирования следующего прыжка используем target_x предыдущего
+                # отправленного прыжка (если есть), а не mid-air координату.
                 anchor = float(self._last_sent_jumped_at or
                                data.get("petLastUpdate") or
                                data.get("serverTime") or 0)
 
-                if arc_spx > 0.5:
-                    self.current_speed_x = arc_spx
-                    logger.info(
-                        f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} spx={arc_spx:.4f}"
-                    )
-                    self._schedule_next_jump(
-                        from_x=real_x, speed=arc_spx, anchor_srv_time=anchor
-                    )
-                else:
-                    self._schedule_next_jump(
-                        from_x=real_x, speed=self.current_speed_x, anchor_srv_time=anchor
-                    )
+                # Оцениваем реальную скорость бега (по земле), не подменяя её
+                # мгновенной дуговой speed.x из engine.jump.
+                running_spx = self._running_speed_from_jump(real_x, int(anchor))
+                if running_spx > 0.5:
+                    self.current_speed_x = running_spx
+
+                # anchor_x — позиция на земле в момент jumpedAt.
+                # Если есть target предыдущего прыжка, он заметно стабильнее real_x.
+                anchor_x = self._prev_target_x if self._prev_target_x > 0 else real_x
+
+                logger.info(
+                    f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
+                    f"arc_spx={arc_spx:.4f} run_spx={self.current_speed_x:.4f} anchor_x={anchor_x:.0f}"
+                )
+                self._schedule_next_jump(
+                    from_x=anchor_x,
+                    speed=self.current_speed_x,
+                    anchor_srv_time=anchor,
+                )
+
+                # Обновляем историю подтверждённых прыжков для расчёта speed на следующем.
+                self._prev_confirmed_x = real_x
+                self._prev_confirmed_at = anchor
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
