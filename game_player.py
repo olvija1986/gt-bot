@@ -519,7 +519,7 @@ class GameSession:
         if not barrier:
             return
 
-        dist = barrier["x"] - pet_front
+       dist = barrier["x"] - pet_x
         if dist <= 0:
             return
 
@@ -542,7 +542,8 @@ class GameSession:
         poll_lag_px = self.current_speed_x * lag_ticks
 
         if dist <= ideal_dist + poll_lag_px:
-            now_srv = int(time.time() * 1000 + self.server_time_offset-20)
+            now_srv = int(time.time() * 1000 + self.server_time_offset)
+            jumpedAt = now_srv - self._jump_latency_ms
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
                 "jumpedAt": now_srv,
