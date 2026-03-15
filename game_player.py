@@ -609,7 +609,16 @@ class GameSession:
         # Чем точнее скорость, тем меньше можно буферить — это даёт "идеальнее" тайминг.
         BUFFER = 72.0 if self.speed_up_tick_x > 0 else 90.0
 
-        target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER
+        # Дополнительный сдвиг старта прыжка влево.
+        # После перехода на расчёт distance по физике разгона прыгали слишком "впритык"
+        # (визуально прямо на барьере). Делаем ранний триггер по той же схеме, как
+        # у встроенных игровых ботов — небольшой pre-jump offset до базового BUFFER.
+        PRE_JUMP_OFFSET = 18.0
+        if self.speed_up_tick_x > 0:
+            # При разгоне оставляем чуть больше запаса, чтобы не цеплять верх/край барьера.
+            PRE_JUMP_OFFSET += 6.0
+
+        target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER - PRE_JUMP_OFFSET
         target_x = max(target_x, from_x + speed)
 
         # jumpedAt: считаем время до target_x по модели разгона
@@ -632,7 +641,7 @@ class GameSession:
 
         logger.info(
             f"[{self.game_id}] NEXT JUMP: barrier={next_b['x']} "
-            f"target_x={target_x:.0f} ideal={ideal_dist:.1f}+buf={BUFFER:.0f} "
+            f"target_x={target_x:.0f} ideal={ideal_dist:.1f}+buf={BUFFER:.0f}+pre={PRE_JUMP_OFFSET:.0f} "
             f"speed={speed:.4f} fire_in={delay_s*1000:.0f}ms"
         )
 
