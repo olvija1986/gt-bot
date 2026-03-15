@@ -382,37 +382,47 @@ class GameSession:
         # Калибруется после каждого подтверждённого прыжка.
         # Начальное значение 60px — из реальных логов (было ~68px при agi=10).
         # После первого прыжка обновится до реального значения.
-        self.lag_px        = 32.0   # из DevTools: реальная позиция опережает оценку на ~32px
-        self._lag_samples  = []  # для усреднения
-        self.result        = None
+        self.lag_px             = 0.0
+        self._lag_samples       = []
+        self.physics_start_at   = 0.0   # serverTime из engine.game.started
+        self.server_time_offset = 0.0   # local → server time offset
+        self._jump_timers       = []    # список Timer объектов
+        self.result             = None
         self._done         = threading.Event()
 
     def _ai_loop(self):
+        """
+        Резервный polling loop — срабатывает если scheduled jump не отработал
+        (например барьеры пришли ПОСЛЕ game.started).
+        Основная логика теперь в _schedule_jumps().
+        """
         last_action_time = 0
-        COOLDOWN_MS = 1500  # минимум между прыжками (мс)
+        COOLDOWN_MS = 1500
 
         while not self._done.is_set():
-            if self.started and self.barriers:
-                now_ms = time.time() * 1000
-                # Cooldown между прыжками чтобы не прыгать дважды
-                if now_ms - last_action_time < COOLDOWN_MS:
-                    time.sleep(0.08)
-                    continue
+            if self.started and self.barriers and not self._jump_timers:
+                # Таймеры ещё не запланированы (барьеры пришли после started)
+                self._schedule_jumps()
 
+            now_ms = time.time() * 1000
+            if (self.started and self.barriers
+                    and now_ms - last_action_time >= COOLDOWN_MS
+                    and not self._jump_timers):
+                # Fallback: нет таймеров, прыгаем по старой логике
                 if self.mode == "race" and self._should_act("race"):
                     payload = self._make_action_payload()
                     self._client.emit_with_null("engine.jump", payload)
-                    logger.info(f"[{self.game_id}] → JUMP sent")
+                    logger.info(f"[{self.game_id}] → FALLBACK JUMP")
                     self.pet_status = "jumping"
                     last_action_time = now_ms
                 elif self.mode == "swim" and self._should_act("swim"):
                     payload = self._make_action_payload()
                     self._client.emit_with_null("engine.dive", payload)
-                    logger.info(f"[{self.game_id}] → DIVE sent")
+                    logger.info(f"[{self.game_id}] → FALLBACK DIVE")
                     self.pet_status = "diving"
                     last_action_time = now_ms
 
-            time.sleep(0.08)
+            time.sleep(0.1)
 
     def _calc_ideal_jump_distance(self) -> float:
         """Порт RaceBot.calcIdealJumpDistance — точная формула из исходников."""
@@ -492,6 +502,74 @@ class GameSession:
             "clickPosition": {"x": self.click_x, "y": self.click_y},
             "jumpedAt":      int(time.time() * 1000),
         }
+
+    def _schedule_jumps(self):
+        """
+        Вычисляет точное серверное время для каждого прыжка и планирует его.
+        Формула: jumpedAt = physics_start + (target_x - 118) * 10 / speed
+        где target_x = barrier_x - ideal_dist - pet_width
+        """
+        if not self.barriers or self.current_speed_x <= 0:
+            logger.warning(f"[{self.game_id}] _schedule_jumps: нет барьеров или скорости")
+            return
+
+        barrier_high = 50
+        if self.mode == "race":
+            ticks = ticks_to_reach_height(self.jump_power, self.gravity, barrier_high)
+        else:
+            ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
+
+        ideal_dist = self.current_speed_x * (ticks + 2)
+        now_local_ms = time.time() * 1000
+
+        logger.info(
+            f"[{self.game_id}] Планирую {len(self.barriers)} прыжков: "
+            f"ideal_dist={ideal_dist:.1f}px ticks={ticks} jp={self.jump_power:.1f}"
+        )
+
+        for i, barrier in enumerate(self.barriers):
+            # Позиция где нужно быть при прыжке
+            target_x = barrier["x"] - ideal_dist - self.width_pet
+            if target_x <= 118:
+                target_x = 118 + self.current_speed_x  # минимум 1 тик после старта
+
+            # Серверное время когда пет будет в target_x
+            ticks_to_target = (target_x - 118) / self.current_speed_x
+            jump_server_time = self.physics_start_at + ticks_to_target * 10  # tick=10ms
+
+            # Когда нам нужно отправить (в локальном времени)
+            fire_local_ms = jump_server_time - self.server_time_offset
+            delay_ms = fire_local_ms - now_local_ms
+
+            logger.info(
+                f"[{self.game_id}] Барьер {i+1}: x={barrier['x']} "
+                f"target_x={target_x:.0f} fire_in={delay_ms:.0f}ms "
+                f"jump_server_time={jump_server_time:.0f}"
+            )
+
+            if delay_ms < 0:
+                logger.warning(f"[{self.game_id}] Барьер {i+1}: время прыжка уже прошло!")
+                continue
+
+            def make_jump_fn(b_idx, srv_time):
+                def fire():
+                    if self._done.is_set() or self.pet_status == "jumping":
+                        return
+                    # jumpedAt = точное серверное время когда пет должен прыгнуть
+                    payload = {
+                        "clickPosition": {"x": self.click_x, "y": self.click_y},
+                        "jumpedAt": int(srv_time),
+                    }
+                    event = "engine.jump" if self.mode == "race" else "engine.dive"
+                    self._client.emit_with_null(event, payload)
+                    self.pet_status = "jumping"
+                    logger.info(f"[{self.game_id}] ⏱ SCHEDULED JUMP #{b_idx+1} jumpedAt={int(srv_time)}")
+                return fire
+
+            t = threading.Timer(delay_ms / 1000.0, make_jump_fn(i, jump_server_time))
+            t.daemon = True
+            t.start()
+            self._jump_timers.append(t)
 
     def run(self, timeout: int = GAME_TIMEOUT):
         client = SioClient(self.lobby_url, TG_TOKEN)
@@ -638,10 +716,21 @@ class GameSession:
                     logger.info(f"[{self.game_id}] Барьеры получены но row ещё неизвестен, ждём connected")
 
         def on_started(data: dict):
-            self.last_update   = data.get("lastUpdate", self.last_update)
-            self.started       = True
-            self.game_started_at = time.time() * 1000
-            logger.info(f"[{self.game_id}] 🏁 Игра началась! speed={self.current_speed_x:.3f}px/tick")
+            self.last_update    = data.get("lastUpdate", self.last_update)
+            self.started        = True
+            server_time         = data.get("serverTime", 0)
+            local_now_ms        = time.time() * 1000
+            # Смещение: сколько прибавить к time.time()*1000 чтобы получить серверное время
+            self.server_time_offset = server_time - local_now_ms
+            self.physics_start_at   = server_time   # серверное время старта физики
+            self.game_started_at    = local_now_ms   # локальное, для оценки позиции
+            logger.info(
+                f"[{self.game_id}] 🏁 Игра! physics_start={server_time} "
+                f"srv_offset={self.server_time_offset:.0f}ms "
+                f"speed={self.current_speed_x:.3f}px/tick"
+            )
+            # Планируем все прыжки заранее
+            self._schedule_jumps()
 
         def on_ended(data: dict):
             for p in data.get("usersPrizes", []):
@@ -655,6 +744,10 @@ class GameSession:
                         f"опыт: {prize.get('experience',0)} | "
                         f"extra: {len(extra)}"
                     )
+            # Отменяем незапущенные таймеры
+            for t in self._jump_timers:
+                t.cancel()
+            self._jump_timers.clear()
             self._done.set()
             if self.on_finish:
                 self.on_finish(self.result)
