@@ -414,6 +414,19 @@ class GameSession:
         self.result             = None
         self._done         = threading.Event()
 
+    def _estimate_pet_x_now(self, now_srv: float) -> float:
+        """
+        Оценка текущей позиции пета на серверной временной шкале.
+
+        Берём последнюю подтверждённую позицию из sync/jump и докидываем
+        пройденную дистанцию по текущей горизонтальной скорости.
+        """
+        base_x = float(self.pet_x or 0.0)
+        if self.last_update <= 0 or self.current_speed_x <= 0:
+            return base_x
+        dt_ticks = max(0.0, (now_srv - self.last_update) / 10.0)
+        return base_x + dt_ticks * self.current_speed_x
+
     def _running_speed_from_jump(self, confirmed_x: float, jumped_at: int) -> float:
         """
         Вычисляет скорость бега по дельте target_x между соседними прыжками.
@@ -542,6 +555,28 @@ class GameSession:
                 return
             # Если время прыжка уже прошло — используем текущее серверное время
             now_srv = time.time() * 1000 + self.server_time_offset
+
+            # Защита от слишком раннего прыжка:
+            # если до барьера ещё далеко, не шлём jump, а немного ждём.
+            est_x = self._estimate_pet_x_now(now_srv)
+            est_front = est_x + self.width_pet
+            distance_to_barrier = bx - est_front
+            min_jump_dist = 45.0
+            max_jump_dist = 120.0
+
+            if distance_to_barrier > max_jump_dist and self.current_speed_x > 0:
+                extra_ticks = (distance_to_barrier - max_jump_dist) / self.current_speed_x
+                extra_delay_s = min(0.25, max(0.03, extra_ticks * 0.01))
+                logger.info(
+                    f"[{self.game_id}] EARLY jump guard: dist={distance_to_barrier:.1f}px "
+                    f"to barrier={bx}, postpone {extra_delay_s*1000:.0f}ms"
+                )
+                t2 = threading.Timer(extra_delay_s, fire)
+                t2.daemon = True
+                t2.start()
+                self._jump_timers.append(t2)
+                return
+
             actual_jumped_at = int(max(srv_time, now_srv))
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
@@ -556,7 +591,8 @@ class GameSession:
             self._prev_target_x = target_ref  # target_x этого прыжка
             logger.info(
                 f"[{self.game_id}] ⏱ JUMP jumpedAt={actual_jumped_at} "
-                f"barrier={bx} (planned={int(srv_time)})"
+                f"barrier={bx} dist={distance_to_barrier:.1f}px "
+                f"(planned={int(srv_time)}, min={min_jump_dist:.0f})"
             )
 
         t = threading.Timer(delay_s, fire)
