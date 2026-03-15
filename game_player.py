@@ -519,7 +519,7 @@ class GameSession:
         # Для надёжного перелёта нужно dist ≥ 40px при jump_x
         # Initial: скорость откорректирована *1.18, буфер небольшой
         # Calibrated: скорость реальная из подтверждённого прыжка
-        BUFFER = 90.0
+        BUFFER = 130.0
 
         target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER
         target_x = max(target_x, from_x + speed)
@@ -556,20 +556,33 @@ class GameSession:
             # Если время прыжка уже прошло — используем текущее серверное время
             now_srv = time.time() * 1000 + self.server_time_offset
 
-            # Защита от слишком раннего прыжка:
-            # если до барьера ещё далеко, не шлём jump, а немного ждём.
-            est_x = self._estimate_pet_x_now(now_srv)
+            # Перед отправкой прыжка пересчитываем дистанцию до барьера.
+            # Используем максимум из двух оценок позиции:
+            # 1) из последних sync/jump событий,
+            # 2) кинематическая оценка от точки планирования (устойчиво к lag sync).
+            est_x_sync = self._estimate_pet_x_now(now_srv)
+            speed_now = self.current_speed_x if self.current_speed_x > 0 else speed
+            anchor_for_pred = anchor_srv_time if anchor_srv_time > 0 else self.physics_start_at
+            if anchor_for_pred > 0 and speed_now > 0:
+                dt_ticks = max(0.0, (now_srv - anchor_for_pred) / 10.0)
+                est_x_pred = from_x + dt_ticks * speed_now
+            else:
+                est_x_pred = from_x
+
+            est_x = max(est_x_sync, est_x_pred)
             est_front = est_x + self.width_pet
             distance_to_barrier = bx - est_front
-            min_jump_dist = 45.0
-            max_jump_dist = 120.0
 
-            if distance_to_barrier > max_jump_dist and self.current_speed_x > 0:
-                extra_ticks = (distance_to_barrier - max_jump_dist) / self.current_speed_x
-                extra_delay_s = min(0.25, max(0.03, extra_ticks * 0.01))
+            desired_jump_dist = ideal_dist + BUFFER
+            tolerance = 15.0
+            min_jump_dist = 55.0
+
+            if distance_to_barrier > desired_jump_dist + tolerance and speed_now > 0:
+                extra_ticks = (distance_to_barrier - (desired_jump_dist + tolerance)) / speed_now
+                extra_delay_s = min(0.2, max(0.02, extra_ticks * 0.01))
                 logger.info(
                     f"[{self.game_id}] EARLY jump guard: dist={distance_to_barrier:.1f}px "
-                    f"to barrier={bx}, postpone {extra_delay_s*1000:.0f}ms"
+                    f"target={desired_jump_dist:.1f}px barrier={bx}, postpone {extra_delay_s*1000:.0f}ms"
                 )
                 t2 = threading.Timer(extra_delay_s, fire)
                 t2.daemon = True
@@ -592,7 +605,7 @@ class GameSession:
             logger.info(
                 f"[{self.game_id}] ⏱ JUMP jumpedAt={actual_jumped_at} "
                 f"barrier={bx} dist={distance_to_barrier:.1f}px "
-                f"(planned={int(srv_time)}, min={min_jump_dist:.0f})"
+                f"(planned={int(srv_time)}, min={min_jump_dist:.0f}, desired={desired_jump_dist:.1f})"
             )
 
         t = threading.Timer(delay_s, fire)
