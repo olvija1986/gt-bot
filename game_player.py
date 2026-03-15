@@ -59,7 +59,7 @@ SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", True)
 AI_POLL_INTERVAL_MS = 80
 # Дополнительное упреждение до идеальной точки прыжка.
 # Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
-JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "14"))
+JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "20"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
