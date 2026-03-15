@@ -511,18 +511,14 @@ class GameSession:
         target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER
         target_x = max(target_x, from_x + speed)
 
-        # jumpedAt: вычисляем через реальную скорость движения пета
-        # arc_spx (speed.x из engine.jump) ≈ 85-88% от скорости бега
-        # Корректируем *1.18 чтобы пет оказался точно в target_x в момент прыжка
-        SPEED_CORRECTION = 1.18
+        # jumpedAt: используем якорь если есть (точнее)
         if anchor_srv_time > 0 and from_x > 118:
-            # После первого прыжка — якорный метод с коррекцией
-            effective_speed = speed * SPEED_CORRECTION
-            delta_ticks = (target_x - from_x) / effective_speed
+            delta_ticks = (target_x - from_x) / speed
             jump_server_time = anchor_srv_time + delta_ticks * 10.0
         else:
-            # Первый прыжок — от physics_start с коррекцией
-            corrected_speed = speed * SPEED_CORRECTION
+            # Первый прыжок: формула занижает скорость на ~18%
+            # Корректируем: используем speed*1.18 для расчёта jumpedAt
+            corrected_speed = speed * 1.18
             elapsed_ticks = (target_x - 118.0) / corrected_speed
             jump_server_time = self.physics_start_at + elapsed_ticks * 10.0
 
