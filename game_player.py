@@ -54,6 +54,11 @@ JUMP_SEND_AHEAD_MS = float(os.environ.get("JUMP_SEND_AHEAD_MS", "120"))
 JUMP_EARLY_EXTRA_PX = float(os.environ.get("JUMP_EARLY_EXTRA_PX", "16"))
 # Доп. сдвиг по барьерам №2+ (помогает на сериях препятствий 2/3/4).
 JUMP_CHAIN_EXTRA_PX = float(os.environ.get("JUMP_CHAIN_EXTRA_PX", "8"))
+# Минимальная пауза между отправками jump/dive, чтобы исключить дребезг
+# при дублях engine.jump и при одновременном retry + плановом прыжке.
+JUMP_RETRY_COOLDOWN_MS = float(os.environ.get("JUMP_RETRY_COOLDOWN_MS", "220"))
+# Дедупликация повторных engine.jump с одинаковыми lastUpdate/x.
+JUMP_CONFIRM_DEDUP_MS = float(os.environ.get("JUMP_CONFIRM_DEDUP_MS", "120"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -518,6 +523,9 @@ class GameSession:
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
         self._last_fire_local_ms = 0.0   # локальное время отправки jump-пакета
         self._tx_latency_ms      = 0.0   # EWMA оценка send->server latency
+        self._next_jump_fire_local_ms = 0.0  # локальное время запланированного следующего прыжка
+        self._last_jump_event_key = None     # дедуп ключ последнего engine.jump
+        self._last_jump_event_local_ms = 0.0 # время получения последнего engine.jump
         self.result             = None
         self._done         = threading.Event()
 
@@ -683,6 +691,7 @@ class GameSession:
         send_ahead_ms += min(180.0, max(0.0, self._tx_latency_ms))
         fire_local = jump_server_time - self.server_time_offset - send_ahead_ms
         delay_s = max(0.0, (fire_local - now_local) / 1000.0)
+        self._next_jump_fire_local_ms = fire_local
 
         logger.info(
             f"[{self.game_id}] NEXT JUMP: barrier={next_b['x']} "
@@ -694,6 +703,16 @@ class GameSession:
         def fire(srv_time=jump_server_time, bx=next_b["x"], target_ref=target_x):
             if self._done.is_set():
                 return
+            now_local_ms = time.time() * 1000
+            if (
+                self._last_fire_local_ms > 0
+                and now_local_ms - self._last_fire_local_ms < JUMP_RETRY_COOLDOWN_MS
+            ):
+                logger.info(
+                    f"[{self.game_id}] skip noisy JUMP fire "
+                    f"Δ={now_local_ms - self._last_fire_local_ms:.0f}ms"
+                )
+                return
             # Если время прыжка уже прошло — используем текущее серверное время
             now_srv = time.time() * 1000 + self.server_time_offset
             actual_jumped_at = int(max(srv_time, now_srv))
@@ -703,7 +722,8 @@ class GameSession:
             }
             event = "engine.jump" if self.mode == "race" else "engine.dive"
             self._client.emit_with_null(event, payload)
-            self._last_fire_local_ms = time.time() * 1000
+            self._last_fire_local_ms = now_local_ms
+            self._next_jump_fire_local_ms = 0.0
             self.pet_status = "jumping"
             self._last_jumped_barrier = bx  # фиксируем только при реальной отправке
             # Запоминаем jumpedAt который отправили — для точного расчёта скорости
@@ -954,6 +974,22 @@ class GameSession:
             arc_spx = speed_data.get("x", 0)
             speed_y = speed_data.get("y", 1.0)
 
+            # Некоторые комнаты шлют дубли engine.jump с теми же lastUpdate/x.
+            # Их обработка создаёт каскад NEXT JUMP fire_in=0ms.
+            now_local_ms = time.time() * 1000
+            jump_key = (
+                int(data.get("lastUpdate") or data.get("petLastUpdate") or 0),
+                int(real_x) if real_x is not None else -1,
+            )
+            if (
+                self._last_jump_event_key == jump_key
+                and now_local_ms - self._last_jump_event_local_ms < JUMP_CONFIRM_DEDUP_MS
+            ):
+                self.last_update = data.get("lastUpdate", self.last_update)
+                return
+            self._last_jump_event_key = jump_key
+            self._last_jump_event_local_ms = now_local_ms
+
             if real_x is not None:
                 self.pet_x = real_x
                 # speed.x из ответа = мгновенная горизонтальная скорость дуги
@@ -1015,6 +1051,21 @@ class GameSession:
                     (b for b in self.barriers if b["x"] > real_x), None
                 )
                 if current_barrier and pet_front < current_barrier["x"]:
+                    jump_soon = (
+                        self._next_jump_fire_local_ms > 0
+                        and self._next_jump_fire_local_ms - now_local_ms <= JUMP_RETRY_COOLDOWN_MS
+                    )
+                    recently_sent = (
+                        self._last_fire_local_ms > 0
+                        and now_local_ms - self._last_fire_local_ms < JUMP_RETRY_COOLDOWN_MS
+                    )
+                    if jump_soon or recently_sent:
+                        logger.info(
+                            f"[{self.game_id}] skip noisy RETRY barrier={current_barrier['x']} "
+                            f"jump_soon={jump_soon} recently_sent={recently_sent}"
+                        )
+                        self.last_update = data.get("lastUpdate", self.last_update)
+                        return
                     logger.info(
                         f"[{self.game_id}] Приземлился до барьера {current_barrier['x']} "
                         f"(x={real_x:.0f}) — повторный прыжок!"
@@ -1027,6 +1078,7 @@ class GameSession:
                     }
                     evt = "engine.jump" if self.mode == "race" else "engine.dive"
                     self._client.emit_with_null(evt, payload)
+                    self._last_fire_local_ms = now_local_ms
                     self._last_jumped_barrier = current_barrier["x"]
                     self.pet_status = "jumping"
                     logger.info(f"[{self.game_id}] ⚡ RETRY jumpedAt={now_srv} barrier={current_barrier['x']}")
