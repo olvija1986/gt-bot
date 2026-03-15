@@ -456,10 +456,12 @@ class GameSession:
         else:
             ideal_dist = self._calc_ideal_dive_distance(next_b.get("high", 50))
 
-        # Из реального трафика живых игроков: прыгают за ~40 тиков до барьера
-        # (измерено: dist=92px при speed=2.61px/tick → 35 тиков; dist=160px → 61 тик)
-        # Среднее ~40 тиков — берём чуть больше для надёжности
-        trigger_dist = self.current_speed_x * 45  # 45 тиков = 450ms
+        # Нужно учесть что наша оценка позиции отстаёт от реальной ~68px
+        # Поэтому прыгаем при dist = real_trigger + lag_correction
+        # real_trigger ≈ 50px (из DevTools реальных игроков)
+        # lag_correction ≈ 70px (систематическое отставание позиции)
+        # итого: 120px, или ~65 тиков при speed=1.841
+        trigger_dist = self.current_speed_x * 65  # 65 тиков ≈ 650ms
 
         logger.info(
             f"[{self.game_id}] CHECK pet_x={self.pet_x:.0f} dist={dist:.0f} "
@@ -676,12 +678,22 @@ class GameSession:
                 self.last_update = data.get("lastUpdate", self.last_update)
 
         def on_jump(data: dict):
-            """engine.jump — пет в прыжке."""
+            """engine.jump — сервер подтвердил прыжок."""
             if data.get("userId") == self.user_id:
                 self.pet_status = "jumping"
                 coords = data.get("coordinates", {})
-                self.pet_x = coords.get("x", self.pet_x)
-                self.pet_y = coords.get("y", self.pet_y)
+                real_x = coords.get("x")
+                if real_x is not None:
+                    old_est = self.pet_x
+                    # Калибруем game_started_at по реальной x с сервера
+                    if self.current_speed_x > 0:
+                        ticks_real = (real_x - 118) / self.current_speed_x
+                        self.game_started_at = time.time() * 1000 - ticks_real * 10
+                    self.pet_x = real_x
+                    logger.info(
+                        f"[{self.game_id}] Калибровка: est={old_est:.0f} → real={real_x:.0f} "
+                        f"(лаг {real_x - old_est:.0f}px), пересчитан game_started_at"
+                    )
                 speed = data.get("speed", {})
                 if speed.get("x") is not None:
                     self.current_speed_x = speed["x"]
