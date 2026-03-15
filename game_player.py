@@ -503,14 +503,26 @@ class GameSession:
             "jumpedAt":      int(time.time() * 1000),
         }
 
-    def _schedule_jumps(self):
+    def _schedule_jumps(self, speed: float = None, from_barrier_idx: int = 0):
         """
-        Вычисляет точное серверное время для каждого прыжка и планирует его.
-        Формула: jumpedAt = physics_start + (target_x - 118) * 10 / speed
-        где target_x = barrier_x - ideal_dist - pet_width
+        Планирует прыжки через threading.Timer.
+
+        Формула (из реального трафика):
+          target_x = barrier_x - ideal_dist - pet_width
+          ideal_dist = speed * (ticks_to_clear_barrier + 2)
+          jumpedAt = physics_start_at + (target_x - 118) / speed * 10
+
+        speed можно передать после первого прыжка (реальная скорость с сервера).
+        from_barrier_idx — пропускаем уже обработанные барьеры.
         """
-        if not self.barriers or self.current_speed_x <= 0:
-            logger.warning(f"[{self.game_id}] _schedule_jumps: нет барьеров или скорости")
+        # Отменяем старые незапущенные таймеры
+        for t in self._jump_timers:
+            t.cancel()
+        self._jump_timers.clear()
+
+        spx = speed if speed and speed > 0 else self.current_speed_x
+        if not self.barriers or spx <= 0 or not self.physics_start_at:
+            logger.warning(f"[{self.game_id}] _schedule_jumps: нет данных (barriers={len(self.barriers)} spx={spx} start={self.physics_start_at})")
             return
 
         barrier_high = 50
@@ -519,43 +531,45 @@ class GameSession:
         else:
             ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
 
-        ideal_dist = self.current_speed_x * (ticks + 2)
+        ideal_dist = spx * (ticks + 2)
         now_local_ms = time.time() * 1000
 
         logger.info(
-            f"[{self.game_id}] Планирую {len(self.barriers)} прыжков: "
-            f"ideal_dist={ideal_dist:.1f}px ticks={ticks} jp={self.jump_power:.1f}"
+            f"[{self.game_id}] Планирую прыжки: speed={spx:.4f}px/tick "
+            f"ideal_dist={ideal_dist:.1f}px ticks_to_clear={ticks} jp={self.jump_power:.1f}"
         )
 
-        for i, barrier in enumerate(self.barriers):
-            # Позиция где нужно быть при прыжке
+        scheduled = 0
+        for i, barrier in enumerate(self.barriers[from_barrier_idx:], start=from_barrier_idx):
+            # Позиция пета В МОМЕНТ прыжка (чтобы перелететь барьер)
+            # Пет должен начать прыжок за ideal_dist до ПЕРЕДНЕЙ ГРАНИ барьера
             target_x = barrier["x"] - ideal_dist - self.width_pet
-            if target_x <= 118:
-                target_x = 118 + self.current_speed_x  # минимум 1 тик после старта
+            target_x = max(target_x, 119.0)  # не раньше старта
 
-            # Серверное время когда пет будет в target_x
-            ticks_to_target = (target_x - 118) / self.current_speed_x
-            jump_server_time = self.physics_start_at + ticks_to_target * 10  # tick=10ms
+            # Серверное время прыжка
+            ticks_to_target = (target_x - 118.0) / spx
+            jump_server_time = self.physics_start_at + ticks_to_target * 10.0
 
-            # Когда нам нужно отправить (в локальном времени)
+            # Локальное время отправки
             fire_local_ms = jump_server_time - self.server_time_offset
             delay_ms = fire_local_ms - now_local_ms
 
             logger.info(
                 f"[{self.game_id}] Барьер {i+1}: x={barrier['x']} "
-                f"target_x={target_x:.0f} fire_in={delay_ms:.0f}ms "
-                f"jump_server_time={jump_server_time:.0f}"
+                f"target_x={target_x:.0f} "
+                f"jump_at={jump_server_time:.0f} fire_in={delay_ms:.0f}ms"
             )
 
-            if delay_ms < 0:
-                logger.warning(f"[{self.game_id}] Барьер {i+1}: время прыжка уже прошло!")
+            if delay_ms < -200:
+                logger.warning(f"[{self.game_id}] Барьер {i+1}: опоздали, пропускаем")
                 continue
 
-            def make_jump_fn(b_idx, srv_time):
+            delay_s = max(0.0, delay_ms / 1000.0)
+
+            def make_fn(b_idx, srv_time, barrier_x):
                 def fire():
-                    if self._done.is_set() or self.pet_status == "jumping":
+                    if self._done.is_set():
                         return
-                    # jumpedAt = точное серверное время когда пет должен прыгнуть
                     payload = {
                         "clickPosition": {"x": self.click_x, "y": self.click_y},
                         "jumpedAt": int(srv_time),
@@ -563,13 +577,19 @@ class GameSession:
                     event = "engine.jump" if self.mode == "race" else "engine.dive"
                     self._client.emit_with_null(event, payload)
                     self.pet_status = "jumping"
-                    logger.info(f"[{self.game_id}] ⏱ SCHEDULED JUMP #{b_idx+1} jumpedAt={int(srv_time)}")
+                    logger.info(
+                        f"[{self.game_id}] ⏱ JUMP #{b_idx+1} jumpedAt={int(srv_time)} "
+                        f"barrier_x={barrier_x}"
+                    )
                 return fire
 
-            t = threading.Timer(delay_ms / 1000.0, make_jump_fn(i, jump_server_time))
+            t = threading.Timer(delay_s, make_fn(i, jump_server_time, barrier["x"]))
             t.daemon = True
             t.start()
             self._jump_timers.append(t)
+            scheduled += 1
+
+        logger.info(f"[{self.game_id}] Запланировано {scheduled} прыжков")
 
     def run(self, timeout: int = GAME_TIMEOUT):
         client = SioClient(self.lobby_url, TG_TOKEN)
@@ -809,12 +829,28 @@ class GameSession:
 
                 logger.info(
                     f"[{self.game_id}] JUMP confirmed: real={real_x:.0f} "
-                    f"est={our_est:.0f} lag={lag:.0f}px avg_lag={self.lag_px:.0f}px"
+                    f"est={our_est:.0f} lag={lag:.0f}px"
                 )
 
             speed = data.get("speed", {})
-            if speed.get("x") is not None:
-                self.current_speed_x = speed["x"]
+            real_spx = speed.get("x") if speed else None
+            if real_spx and real_spx > 0:
+                old_spx = self.current_speed_x
+                self.current_speed_x = real_spx
+                # Если реальная скорость отличается > 5% — пересчитываем расписание
+                if abs(real_spx - old_spx) / max(old_spx, 0.001) > 0.05:
+                    logger.info(
+                        f"[{self.game_id}] Скорость обновлена: {old_spx:.4f} → {real_spx:.4f}, "
+                        f"пересчитываю расписание"
+                    )
+                    # Определяем следующий непройденный барьер
+                    pet_front = (real_x or self.pet_x) + self.width_pet
+                    next_idx = next(
+                        (i for i, b in enumerate(self.barriers) if b["x"] > pet_front),
+                        len(self.barriers)
+                    )
+                    self._schedule_jumps(speed=real_spx, from_barrier_idx=next_idx)
+
             self.last_update = data.get("lastUpdate", self.last_update)
 
             # Автосброс статуса через 1.2с
