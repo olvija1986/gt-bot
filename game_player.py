@@ -48,12 +48,12 @@ SCREEN         = {"w": 1182, "h": 468}
 WAITROOM_TIMEOUT = 60    # сек ждём матч
 GAME_TIMEOUT     = 120   # сек максимум на игру
 # Отправляем jump немного заранее для компенсации сети/обработки на сервере.
-JUMP_SEND_AHEAD_MS = float(os.environ.get("JUMP_SEND_AHEAD_MS", "120"))
+JUMP_SEND_AHEAD_MS = float(os.environ.get("JUMP_SEND_AHEAD_MS", "170"))
 # Глобальный доп. сдвиг влево для более раннего старта прыжка.
 # Полезно если питомец всё ещё иногда "упирается" в край барьера.
-JUMP_EARLY_EXTRA_PX = float(os.environ.get("JUMP_EARLY_EXTRA_PX", "16"))
+JUMP_EARLY_EXTRA_PX = float(os.environ.get("JUMP_EARLY_EXTRA_PX", "24"))
 # Минимальный запас между носом пета и барьером в момент отправки прыжка.
-JUMP_MIN_FRONT_CLEARANCE_PX = float(os.environ.get("JUMP_MIN_FRONT_CLEARANCE_PX", "38"))
+JUMP_MIN_FRONT_CLEARANCE_PX = float(os.environ.get("JUMP_MIN_FRONT_CLEARANCE_PX", "58"))
 # Доп. сдвиг по барьерам №2+ (помогает на сериях препятствий 2/3/4).
 JUMP_CHAIN_EXTRA_PX = float(os.environ.get("JUMP_CHAIN_EXTRA_PX", "8"))
 # Минимальная пауза между отправками jump/dive, чтобы исключить дребезг
@@ -707,12 +707,12 @@ class GameSession:
             barrier_high,
             self.width_pet,
             self.width_barrier,
-            safety_margin=3.0,
+            safety_margin=8.0,
         )
 
         # Дополнительные запасы только на сеть/джиттер.
         slow_factor = max(0.0, 2.2 - float(speed))
-        network_pad = 6.0 + min(16.0, slow_factor * 12.0)
+        network_pad = 12.0 + min(20.0, slow_factor * 14.0)
         network_pad += min(8.0, max(0.0, self._tx_latency_ms) / 30.0)
         network_pad += max(0.0, JUMP_EARLY_EXTRA_PX * 0.6)
         if next_idx is not None and next_idx >= 1:
