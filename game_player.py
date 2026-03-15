@@ -454,7 +454,7 @@ class GameSession:
         # Для надёжного перелёта нужно dist ≥ 40px при jump_x
         # Initial: скорость откорректирована *1.18, буфер небольшой
         # Calibrated: скорость реальная из подтверждённого прыжка
-        BUFFER = 70.0
+        BUFFER = 40.0
 
         target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER
         target_x = max(target_x, from_x + speed)
