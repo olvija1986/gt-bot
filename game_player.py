@@ -382,7 +382,7 @@ class GameSession:
         # Калибруется после каждого подтверждённого прыжка.
         # Начальное значение 60px — из реальных логов (было ~68px при agi=10).
         # После первого прыжка обновится до реального значения.
-        self.lag_px        = 60.0
+        self.lag_px        = 32.0   # из DevTools: реальная позиция опережает оценку на ~32px
         self._lag_samples  = []  # для усреднения
         self.result        = None
         self._done         = threading.Event()
@@ -458,8 +458,12 @@ class GameSession:
         if dist <= 0:
             return False
 
-        # Физически точный trigger из исходников RaceBot:
-        # ideal_dist = speed * (ticks_to_clear_barrier + 2)
+        # Физически точный trigger:
+        # 1. ideal_dist = тиков чтобы взлететь выше барьера * скорость
+        # 2. lag_px = на сколько реальная позиция опережает нашу оценку
+        # 3. safety = запас 25px чтобы точно перелететь
+        # Итого: когда наша оценка показывает dist = ideal + lag + safety,
+        # реальная dist на сервере = ideal + safety ≈ 33-45px — оптимально
         barrier_high = next_b.get("high", 50)
         if mode == "race":
             ticks = ticks_to_reach_height(self.jump_power, self.gravity, barrier_high)
@@ -467,15 +471,12 @@ class GameSession:
             ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
 
         ideal_dist = self.current_speed_x * (ticks + 2)
-
-        # Компенсация лага: наша позиция всегда отстаёт от серверной.
-        # lag_px накапливается из калибровок в on_jump.
-        # Без калибровки используем консервативный дефолт = 2 * ideal_dist
-        total_trigger = ideal_dist + self.lag_px
+        safety = 25.0
+        total_trigger = ideal_dist + self.lag_px + safety
 
         logger.info(
             f"[{self.game_id}] CHECK x={self.pet_x:.0f} dist={dist:.0f} "
-            f"ideal={ideal_dist:.1f} lag={self.lag_px:.0f} trigger={total_trigger:.1f} "
+            f"trigger={total_trigger:.1f} (ideal={ideal_dist:.1f}+lag={self.lag_px:.0f}+safe=25) "
             f"jp={self.jump_power:.1f} ticks={ticks} spx={self.current_speed_x:.3f}"
         )
 
@@ -695,17 +696,18 @@ class GameSession:
             coords = data.get("coordinates", {})
             real_x = coords.get("x")
             if real_x is not None and self.game_started_at and self.current_speed_x > 0:
-                # Вычисляем наш текущий estimate в момент получения ответа
                 elapsed_ms = (time.time() * 1000) - self.game_started_at
                 our_est = 118.0 + self.current_speed_x * (elapsed_ms / 10.0)
-                # Лаг = разница между реальной позицией и нашей оценкой
-                # Реальная позиция немного позади (сервер обрабатывает с задержкой)
-                lag = our_est - real_x
+
+                # lag = real_x - our_est:
+                # > 0: пет ВПЕРЕДИ нашей оценки → мы прыгаем слишком поздно
+                #      нужно увеличить trigger чтобы прыгать раньше
+                # < 0: пет позади → прыгаем слишком рано (редко)
+                lag = real_x - our_est
                 self._lag_samples.append(lag)
-                # Скользящее среднее последних 3 прыжков
-                if len(self._lag_samples) > 3:
+                if len(self._lag_samples) > 5:
                     self._lag_samples.pop(0)
-                self.lag_px = max(0, sum(self._lag_samples) / len(self._lag_samples))
+                self.lag_px = sum(self._lag_samples) / len(self._lag_samples)
 
                 # Пересчитываем game_started_at по реальной позиции
                 ticks_real = (real_x - 118) / self.current_speed_x
@@ -713,8 +715,8 @@ class GameSession:
                 self.pet_x = real_x
 
                 logger.info(
-                    f"[{self.game_id}] JUMP confirmed: real_x={real_x:.0f} "
-                    f"our_est={our_est:.0f} lag={lag:.0f}px avg_lag={self.lag_px:.0f}px"
+                    f"[{self.game_id}] JUMP confirmed: real={real_x:.0f} "
+                    f"est={our_est:.0f} lag={lag:.0f}px avg_lag={self.lag_px:.0f}px"
                 )
 
             speed = data.get("speed", {})
