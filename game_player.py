@@ -365,8 +365,8 @@ def _estimate_running_speed_px_tick(chars: dict) -> tuple[float, str, int]:
     speed_stat = strength if strength > 0 else agility
 
     # Квадратичная аппроксимация скорости (px/tick) на диапазоне 0..100.
-    # Повышаем базовую скорость на 5% для лучшего совпадения с серверной физикой
-    speed = (0.000624 * speed_stat**2 - 0.016927 * speed_stat + 1.754893) * 1.05
+    # НЕ используем фиксированную коррекцию - она слишком агрессивна для медленных петов
+    speed = 0.000624 * speed_stat**2 - 0.016927 * speed_stat + 1.754893
     return max(0.5, speed), speed_source, speed_stat
 
 
@@ -375,10 +375,12 @@ def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity
     
     Улучшенная версия: учитываем, что arc_spx (горизонтальная скорость в воздухе)
     примерно на 15-20% ниже скорости бега из-за физики прыжка.
+    Для медленных петов используем более консервативный коэффициент (0.80 вместо 0.85).
     """
     y, sy = 0.0, jump_power
     # Корректируем скорость в воздухе — она ниже скорости бега
-    arc_speed = speed_x * 0.85
+    # Для медленных петов консервативнее
+    arc_speed = speed_x * (0.80 if speed_x < 2.0 else 0.85)
     x = float(start_x)
     for _ in range(500):
         sy -= 0.6
@@ -568,19 +570,23 @@ class GameSession:
 
         # SAFE_GAP: целевая дистанция (в px) до барьера в момент отправки прыжка.
         # Должна быть «перед барьером», но с запасом на сетевую/серверную задержку.
-        # Держим её адаптивной от текущей скорости, чтобы не упираться в барьер на быстрых петах.
-        # Небольшой сдвиг в более ранний прыжок: лучше «перепрыгнуть с запасом»,
-        # чем упереться в барьер на нестабильной задержке.
-        # После первого прыжка сервер нередко ускоряет горизонтальный ход пета,
-        # поэтому для следующих барьеров нужен более ранний триггер.
-        # Первый прыжок чаще всего «чувствительный»: позиция ещё не подхвачена
-        # реальными jump/sync-данными, поэтому делаем его чуть позже.
+        # Первый прыжок особо критичен — пет только начинает движение,
+        # позиция ещё не подтверждена сервером, поэтому берём больший запас.
         is_first_jump = anchor_srv_time <= 0 or from_x <= 120.0
-        # Унифицировали параметры для большей стабильности
-        reaction_ticks = 14.0   # ~140ms (усреднили 12-16)
-        safety_margin_px = 62.0  # ~60px (немного меньше для лучшей точности)
-        min_gap_px = 180.0      # минимальный зазор перед прыжком
-        max_gap_px = 240.0      # максимальный зазор перед прыжком
+        
+        if is_first_jump:
+            # Первый прыжок: более консервативно, чтобы не приземлиться ДО барьера
+            reaction_ticks = 16.0   # ~160ms (больше времени)
+            safety_margin_px = 75.0  # больший запас
+            min_gap_px = 220.0      # намного больше минимума
+            max_gap_px = 280.0
+        else:
+            # Остальные прыжки: можем быть более агрессивными
+            reaction_ticks = 12.0   # ~120ms
+            safety_margin_px = 50.0
+            min_gap_px = 170.0
+            max_gap_px = 230.0
+        
         safe_gap = ideal_dist + speed * reaction_ticks + safety_margin_px
         safe_gap = max(min_gap_px, min(max_gap_px, safe_gap))
 
@@ -589,8 +595,11 @@ class GameSession:
 
         # jumpedAt: вычисляем через реальную скорость движения пета
         # arc_spx (speed.x из engine.jump) ≈ 85% от скорости бега
-        # Корректируем меньше — агрессивная коррекция привела к частым ранним прыжкам
-        SPEED_CORRECTION = 1.10 if is_first_jump else 1.12
+        # Коррекция НИЖЕ для первого прыжка (пет только начинает двигаться)
+        if is_first_jump:
+            SPEED_CORRECTION = 1.05  # ← очень консервативно
+        else:
+            SPEED_CORRECTION = 1.10  # умеренная коррекция для остальных
         
         # Применяем калибровку лага если она доступна
         lag_correction = 1.0
@@ -668,6 +677,21 @@ class GameSession:
                 return
 
             # Актуальная целевая дистанция до барьера с учётом текущей скорости.
+            # Используем те же параметры что и при планировании
+            if self.pet_status == "running" or not hasattr(self, '_is_first_jump_for_fire'):
+                # Определяем если это всё ещё "первый" прыжок
+                is_first = anchor_srv_time <= 0 or from_x <= 120.0
+                if is_first:
+                    reaction_ticks = 16.0
+                    safety_margin_px = 75.0
+                    min_gap_px = 220.0
+                    max_gap_px = 280.0
+                else:
+                    reaction_ticks = 12.0
+                    safety_margin_px = 50.0
+                    min_gap_px = 170.0
+                    max_gap_px = 230.0
+            
             desired_jump_dist = ideal_dist + speed_now * reaction_ticks + safety_margin_px
             desired_jump_dist = max(min_gap_px, min(max_gap_px, desired_jump_dist))
 
@@ -688,11 +712,10 @@ class GameSession:
                 )
 
             # Проверяем рано ли мы (далеко от барьера)
-            # Увеличили множитель на 0.005 для меньшей агрессивности переносов
             if distance_to_barrier > desired_jump_dist + tolerance and speed_now > 0:
                 extra_ticks = (distance_to_barrier - (desired_jump_dist + tolerance)) / speed_now
-                # Минимальная задержка 15ms для экономии CPU, максимальная 100ms
-                extra_delay_s = min(0.100, max(0.015, extra_ticks * 0.008))
+                # Минимальная задержка 20ms для медленных петов, максимальная 120ms
+                extra_delay_s = min(0.120, max(0.020, extra_ticks * 0.008))
                 logger.info(
                     f"[{self.game_id}] EARLY jump guard: dist={distance_to_barrier:.1f}px "
                     f"target={desired_jump_dist:.1f}px barrier={bx}, postpone {extra_delay_s*1000:.0f}ms"
