@@ -773,6 +773,10 @@ class GameSession:
                     old_spx = self.current_speed_x
                     ratio = running_spx / max(old_spx, 0.001)
 
+                    # Якорь для следующего прыжка — наш отправленный jumpedAt
+                    # (точнее чем petLastUpdate который включает сетевую задержку ~150ms)
+                    anchor = float(self._last_sent_jumped_at) if self._last_sent_jumped_at > 0 else float(jumped_at)
+
                     if 0.3 <= ratio <= 5.0:
                         self.current_speed_x = running_spx
                         logger.info(
@@ -782,7 +786,7 @@ class GameSession:
                         )
                         self._schedule_next_jump(
                             from_x=real_x, speed=running_spx,
-                            anchor_srv_time=float(jumped_at)
+                            anchor_srv_time=anchor
                         )
                     else:
                         logger.warning(
@@ -791,7 +795,7 @@ class GameSession:
                         )
                         self._schedule_next_jump(
                             from_x=real_x, speed=old_spx,
-                            anchor_srv_time=float(jumped_at)
+                            anchor_srv_time=anchor
                         )
                 else:
                     self._schedule_next_jump(from_x=real_x, speed=self.current_speed_x)
