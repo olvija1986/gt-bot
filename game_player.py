@@ -56,10 +56,10 @@ SCREEN         = {"w": 1182, "h": 468}
 WAITROOM_TIMEOUT = 60    # сек ждём матч
 GAME_TIMEOUT     = 120   # сек максимум на игру
 SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", True)
-AI_POLL_INTERVAL_MS = 40
+AI_POLL_INTERVAL_MS = 30
 # Дополнительное упреждение до идеальной точки прыжка.
 # Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
-JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "20"))
+JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "16"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -542,7 +542,7 @@ class GameSession:
         poll_lag_px = self.current_speed_x * lag_ticks
 
         if dist <= ideal_dist + poll_lag_px:
-            now_srv = int(time.time() * 1000 + self.server_time_offset)
+            now_srv = int(time.time() * 1000 + self.server_time_offset-20)
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
                 "jumpedAt": now_srv,
