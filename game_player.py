@@ -518,7 +518,7 @@ class GameSession:
         if not barrier:
             return
 
-       dist = barrier["x"] - self.pet_x
+        dist = barrier["x"] - self.pet_x
         if dist <= 0:
             return
 
@@ -551,7 +551,7 @@ class GameSession:
             self._client.emit_with_null(event, payload)
             self.pet_status = "jumping"
             self._last_jumped_barrier = barrier["x"]
-            self._last_sent_jumped_at = now_srv
+            self._last_sent_jumped_at = jumpedAt
             logger.info(
                 f"[{self.game_id}] ⏱ JUMP barrier={barrier['x']} "
                 f"dist={dist:.1f} ideal={ideal_dist:.1f} lag={poll_lag_px:.1f} "
