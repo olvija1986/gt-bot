@@ -567,14 +567,6 @@ class GameSession:
                 )
                 logger.info(f"[{self.game_id}] Барьеры применены после connected: "
                             f"{len(self.barriers)} на row={self.pet_row}")
-            # Применяем барьеры если они уже пришли до нашего connected
-            if self._all_barriers_raw and self.pet_row and not self.barriers:
-                self.barriers = sorted(
-                    [b for b in self._all_barriers_raw if b.get("row") == self.pet_row],
-                    key=lambda b: b["x"]
-                )
-                logger.info(f"[{self.game_id}] Барьеры применены после connected: "
-                            f"{len(self.barriers)} на row={self.pet_row}")
 
         _sync_count = [0]
 
