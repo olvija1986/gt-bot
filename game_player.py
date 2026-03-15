@@ -798,6 +798,32 @@ class GameSession:
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
+            # Retry только если пет ПРИЗЕМЛИЛСЯ (speed.y ≈ 0) до барьера
+            speed_data = data.get("speed", {})
+            speed_y = speed_data.get("y", 1.0) if speed_data else 1.0
+            if abs(speed_y) < 0.5 and real_x is not None and self.barriers:
+                pet_front = real_x + self.width_pet
+                current_barrier = next(
+                    (b for b in self.barriers if b["x"] > real_x),
+                    None
+                )
+                if current_barrier and pet_front < current_barrier["x"]:
+                    logger.info(
+                        f"[{self.game_id}] Приземлился до барьера {current_barrier['x']} "
+                        f"(x={real_x:.0f}) — повторный прыжок!"
+                    )
+                    self._last_jumped_barrier = current_barrier["x"] - 1
+                    now_srv = int(time.time() * 1000 + self.server_time_offset)
+                    payload = {
+                        "clickPosition": {"x": self.click_x, "y": self.click_y},
+                        "jumpedAt": now_srv,
+                    }
+                    evt = "engine.jump" if self.mode == "race" else "engine.dive"
+                    self._client.emit_with_null(evt, payload)
+                    self._last_jumped_barrier = current_barrier["x"]
+                    self.pet_status = "jumping"
+                    logger.info(f"[{self.game_id}] ⚡ RETRY jumpedAt={now_srv} barrier={current_barrier['x']}")
+
             # Автосброс статуса через 1.2с
             def reset_after_jump():
                 time.sleep(1.2)
