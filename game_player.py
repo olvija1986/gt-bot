@@ -59,7 +59,7 @@ SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", True)
 AI_POLL_INTERVAL_MS = 30
 # Дополнительное упреждение до идеальной точки прыжка.
 # Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
-JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "14"))
+JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "12"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -795,8 +795,8 @@ class GameSession:
                 # фильтр от мусора
                 if 0 < sample < 600:
                     self._jump_latency_ms = (
-                        self._jump_latency_ms * 0.7 +
-                        sample * 0.3
+                        self._jump_latency_ms * 0.4 +
+                        sample * 0.6
                     )
         
             if real_x is not None:
