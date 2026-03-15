@@ -715,14 +715,19 @@ class GameSession:
             
 
 
-            # Барьеры — только в первом синке
-            barriers_raw = (
-                data.get("extra", {})
-                    .get("mapInfo", {})
-                    .get("barriers")
-            )
+            # Барьеры и gameStartedAt из extra — приходят в первом синке
+            extra = data.get("extra", {})
+            map_info = extra.get("mapInfo", {})
+            barriers_raw = map_info.get("barriers")
+
+            # server_time_offset — вычисляем из каждого синка для точности
+            server_time_sync = data.get("serverTime", 0)
+            if server_time_sync:
+                local_now_ms = time.time() * 1000
+                self.server_time_offset = server_time_sync - local_now_ms
+
             if barriers_raw is not None:
-                self._all_barriers_raw = barriers_raw   # всегда сохраняем
+                self._all_barriers_raw = barriers_raw
                 if self.pet_row is not None and not self.barriers:
                     self.barriers = sorted(
                         [b for b in barriers_raw if b.get("row") == self.pet_row],
@@ -732,24 +737,23 @@ class GameSession:
                         f"[{self.game_id}] Карта: {len(self.barriers)} барьеров "
                         f"на row={self.pet_row}, первый x={self.barriers[0]['x'] if self.barriers else '—'}"
                     )
-                elif self.pet_row is None:
-                    logger.info(f"[{self.game_id}] Барьеры получены но row ещё неизвестен, ждём connected")
 
         def on_started(data: dict):
-            self.last_update    = data.get("lastUpdate", self.last_update)
-            self.started        = True
-            server_time         = data.get("serverTime", 0)
-            local_now_ms        = time.time() * 1000
-            # Смещение: сколько прибавить к time.time()*1000 чтобы получить серверное время
+            self.last_update = data.get("lastUpdate", self.last_update)
+            self.started     = True
+            server_time      = data.get("serverTime", 0)
+            local_now_ms     = time.time() * 1000
             self.server_time_offset = server_time - local_now_ms
-            self.physics_start_at   = server_time   # серверное время старта физики
-            self.game_started_at    = local_now_ms   # локальное, для оценки позиции
+            self.game_started_at    = local_now_ms
+
+            # physics_start_at = serverTime из engine.game.started
+            # Проверено из DevTools: jumpedAt - physics_start = elapsed тиков * 10ms
+            self.physics_start_at = server_time
+
             logger.info(
                 f"[{self.game_id}] 🏁 Игра! physics_start={server_time} "
-                f"srv_offset={self.server_time_offset:.0f}ms "
                 f"speed={self.current_speed_x:.3f}px/tick"
             )
-            # Планируем все прыжки заранее
             self._schedule_jumps()
 
         def on_ended(data: dict):
@@ -808,48 +812,34 @@ class GameSession:
             self.pet_status = "jumping"
             coords = data.get("coordinates", {})
             real_x = coords.get("x")
-            if real_x is not None and self.game_started_at and self.current_speed_x > 0:
-                elapsed_ms = (time.time() * 1000) - self.game_started_at
-                our_est = 118.0 + self.current_speed_x * (elapsed_ms / 10.0)
-
-                # lag = real_x - our_est:
-                # > 0: пет ВПЕРЕДИ нашей оценки → мы прыгаем слишком поздно
-                #      нужно увеличить trigger чтобы прыгать раньше
-                # < 0: пет позади → прыгаем слишком рано (редко)
-                lag = real_x - our_est
-                self._lag_samples.append(lag)
-                if len(self._lag_samples) > 5:
-                    self._lag_samples.pop(0)
-                self.lag_px = sum(self._lag_samples) / len(self._lag_samples)
-
-                # Пересчитываем game_started_at по реальной позиции
-                ticks_real = (real_x - 118) / self.current_speed_x
-                self.game_started_at = time.time() * 1000 - ticks_real * 10
+            if real_x is not None:
                 self.pet_x = real_x
-
-                logger.info(
-                    f"[{self.game_id}] JUMP confirmed: real={real_x:.0f} "
-                    f"est={our_est:.0f} lag={lag:.0f}px"
-                )
+                logger.info(f"[{self.game_id}] JUMP confirmed: real_x={real_x:.0f}")
 
             speed = data.get("speed", {})
             real_spx = speed.get("x") if speed else None
             if real_spx and real_spx > 0:
                 old_spx = self.current_speed_x
-                self.current_speed_x = real_spx
-                # Если реальная скорость отличается > 5% — пересчитываем расписание
-                if abs(real_spx - old_spx) / max(old_spx, 0.001) > 0.05:
-                    logger.info(
-                        f"[{self.game_id}] Скорость обновлена: {old_spx:.4f} → {real_spx:.4f}, "
-                        f"пересчитываю расписание"
+                # Обновляем скорость только если разница разумная (не более 3x)
+                # Слишком большие скачки = данные из чужого прыжка попали сюда
+                ratio = real_spx / max(old_spx, 0.001)
+                if 0.5 <= ratio <= 3.0:
+                    self.current_speed_x = real_spx
+                    if abs(real_spx - old_spx) / max(old_spx, 0.001) > 0.05:
+                        logger.info(
+                            f"[{self.game_id}] Скорость: {old_spx:.4f} → {real_spx:.4f}, "
+                            f"пересчитываю расписание"
+                        )
+                        pet_front = (real_x or self.pet_x) + self.width_pet
+                        next_idx = next(
+                            (i for i, b in enumerate(self.barriers) if b["x"] > pet_front),
+                            len(self.barriers)
+                        )
+                        self._schedule_jumps(speed=real_spx, from_barrier_idx=next_idx)
+                else:
+                    logger.warning(
+                        f"[{self.game_id}] Скорость {real_spx:.4f} подозрительна (ratio={ratio:.2f}), игнорирую"
                     )
-                    # Определяем следующий непройденный барьер
-                    pet_front = (real_x or self.pet_x) + self.width_pet
-                    next_idx = next(
-                        (i for i, b in enumerate(self.barriers) if b["x"] > pet_front),
-                        len(self.barriers)
-                    )
-                    self._schedule_jumps(speed=real_spx, from_barrier_idx=next_idx)
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
