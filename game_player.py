@@ -546,10 +546,10 @@ class GameSession:
         # Держим её адаптивной от текущей скорости, чтобы не упираться в барьер на быстрых петах.
         # Небольшой сдвиг в более ранний прыжок: лучше «перепрыгнуть с запасом»,
         # чем упереться в барьер на нестабильной задержке.
-        reaction_ticks = 12.0  # ~120ms суммарной задержки input+server (с запасом на джиттер)
-        safety_margin_px = 46.0
-        min_gap_px = 145.0
-        max_gap_px = 195.0
+        reaction_ticks = 14.0  # ~140ms суммарной задержки input+server (с запасом на джиттер)
+        safety_margin_px = 58.0
+        min_gap_px = 170.0
+        max_gap_px = 220.0
         safe_gap = ideal_dist + speed * reaction_ticks + safety_margin_px
         safe_gap = max(min_gap_px, min(max_gap_px, safe_gap))
 
@@ -631,10 +631,10 @@ class GameSession:
             desired_jump_dist = max(min_gap_px, min(max_gap_px, desired_jump_dist))
 
             # Коридор принятия решения: чуть «раньше» цели, но без излишнего раннего прыжка.
-            tolerance = 3.0
+            tolerance = 2.0
             # Если уже слишком близко к барьеру — шлём немедленно.
             # Порог поднят, чтобы уменьшить случаи «упирания» перед прыжком.
-            min_jump_dist = 108.0
+            min_jump_dist = 132.0
 
             # Защита от «позднего» прыжка: если почти у барьера — шлём сразу
             # и не переносим таймер (иначе упираемся в барьер до применения input).
