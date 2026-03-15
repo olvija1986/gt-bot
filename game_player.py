@@ -346,6 +346,25 @@ def _agility_to_speed_per_ms(agility: int) -> float:
     return ys[-1]
 
 
+def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity: float = 1.5) -> float:
+    """Симулирует физику прыжка и возвращает x где пет приземлится."""
+    y, sy = 0.0, jump_power
+    x = float(start_x)
+    for _ in range(500):
+        sy -= 0.6
+        if sy < 0:
+            sy = 0.0
+        y += sy
+        if y - gravity > 0:
+            y -= gravity
+        else:
+            y = max(0.0, y - gravity)
+            if y <= 0:
+                return x
+        x += speed_x
+    return x
+
+
 class GameSession:
     def __init__(self, game_id: str, lobby_url: str, mode: str, user_id: int, on_finish=None, pet_id=None):
         self.game_id   = game_id
@@ -432,13 +451,29 @@ class GameSession:
             return
 
         pet_front = from_x + self.width_pet
+
+        # Симулируем прыжок чтобы понять куда пет приземлится
+        # Используем текущую горизонтальную скорость и jumpPower
+        # (from_x — позиция в начале дуги, speed — скорость бега)
+        landing_x = _simulate_landing(from_x, speed, self.jump_power, self.gravity)
+
+        # Ищем первый барьер ПОСЛЕ места приземления
+        search_from = max(pet_front, landing_x)
+        logger.info(
+            f"[{self.game_id}] landing≈{landing_x:.0f} "
+            f"(from_x={from_x:.0f} spx={speed:.2f} jp={self.jump_power:.1f})"
+        )
+
         next_b = next(
             (b for b in self.barriers
-             if b["x"] > pet_front and b["x"] > self._last_jumped_barrier),
+             if b["x"] > search_from and b["x"] > self._last_jumped_barrier),
             None
         )
         if not next_b:
-            logger.info(f"[{self.game_id}] Все барьеры пройдены (from_x={from_x:.0f})")
+            logger.info(
+                f"[{self.game_id}] Все барьеры пройдены "
+                f"(from_x={from_x:.0f} landing≈{landing_x:.0f})"
+            )
             return
         # НЕ устанавливаем _last_jumped_barrier здесь — только когда реально прыгнем
 
@@ -762,32 +797,6 @@ class GameSession:
                     self._schedule_next_jump(from_x=real_x, speed=self.current_speed_x)
 
             self.last_update = data.get("lastUpdate", self.last_update)
-
-            # Проверяем: пет не перепрыгнул барьер?
-            # Если confirmed_x + pet_width < barrier_x — приземлился до барьера
-            if real_x is not None and self.barriers:
-                pet_front = real_x + self.width_pet
-                current_barrier = next(
-                    (b for b in self.barriers if b["x"] > self._last_jumped_barrier - 1),
-                    None
-                )
-                if current_barrier and pet_front < current_barrier["x"]:
-                    logger.info(
-                        f"[{self.game_id}] Пет не перепрыгнул барьер {current_barrier['x']} "
-                        f"(pet_front={pet_front:.0f}) — прыгаем снова немедленно!"
-                    )
-                    # Сбрасываем _last_jumped_barrier чтобы разрешить прыжок на тот же барьер
-                    self._last_jumped_barrier = current_barrier["x"] - 1
-                    now_srv = time.time() * 1000 + self.server_time_offset
-                    payload = {
-                        "clickPosition": {"x": self.click_x, "y": self.click_y},
-                        "jumpedAt": int(now_srv),
-                    }
-                    event = "engine.jump" if self.mode == "race" else "engine.dive"
-                    self._client.emit_with_null(event, payload)
-                    self._last_jumped_barrier = current_barrier["x"]
-                    self.pet_status = "jumping"
-                    logger.info(f"[{self.game_id}] ⚡ RETRY JUMP jumpedAt={int(now_srv)} barrier={current_barrier['x']}")
 
             # Автосброс статуса через 1.2с
             def reset_after_jump():
