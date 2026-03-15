@@ -347,7 +347,7 @@ def _agility_to_speed_per_ms(agility: int) -> float:
 
 
 class GameSession:
-    def __init__(self, game_id: str, lobby_url: str, mode: str, user_id: int, on_finish=None):
+    def __init__(self, game_id: str, lobby_url: str, mode: str, user_id: int, on_finish=None, pet_id=None):
         self.game_id   = game_id
         self.lobby_url = lobby_url
         self.mode      = mode
@@ -355,7 +355,7 @@ class GameSession:
         self.on_finish = on_finish
 
         # Стейт пета
-        self.pet_id        = None
+        self.pet_id        = pet_id  # передаётся из AutoPlayer, уточняется из engine.user.connected
         self.pet_row       = None
         self.pet_x         = 118.0   # стартовая позиция
         self.pet_y         = 0.0
@@ -382,29 +382,30 @@ class GameSession:
         self._done         = threading.Event()
 
     def _ai_loop(self):
+        last_action_time = 0
+        COOLDOWN_MS = 1500  # минимум между прыжками (мс)
+
         while not self._done.is_set():
-            if self.started:
-                if not self.barriers:
-                    pass  # ждём карту
-                elif self.mode == "race" and self._should_act("race"):
+            if self.started and self.barriers:
+                now_ms = time.time() * 1000
+                # Cooldown между прыжками чтобы не прыгать дважды
+                if now_ms - last_action_time < COOLDOWN_MS:
+                    time.sleep(0.08)
+                    continue
+
+                if self.mode == "race" and self._should_act("race"):
                     payload = self._make_action_payload()
                     self._client.emit_with_null("engine.jump", payload)
-                    logger.info(f"[{self.game_id}] → JUMP sent: {payload}")
-                    setattr(self, '_first_jump_done', True)
+                    logger.info(f"[{self.game_id}] → JUMP sent")
                     self.pet_status = "jumping"
-                    # Ждём пока прыжок завершится (~1.5с), потом снова running
-                    time.sleep(1.5)
-                    if self.pet_status == "jumping":
-                        self.pet_status = "running"
+                    last_action_time = now_ms
                 elif self.mode == "swim" and self._should_act("swim"):
                     payload = self._make_action_payload()
                     self._client.emit_with_null("engine.dive", payload)
-                    logger.info(f"[{self.game_id}] → DIVE sent: {payload}")
-                    setattr(self, '_first_jump_done', True)
+                    logger.info(f"[{self.game_id}] → DIVE sent")
                     self.pet_status = "diving"
-                    time.sleep(1.5)
-                    if self.pet_status == "diving":
-                        self.pet_status = "running"
+                    last_action_time = now_ms
+
             time.sleep(0.08)
 
     def _calc_ideal_jump_distance(self) -> float:
@@ -440,6 +441,7 @@ class GameSession:
         # Чистим пройденные барьеры
         self.barriers = [b for b in self.barriers if b["x"] + self.width_barrier > pet_front]
         if not self.barriers:
+            logger.debug(f"[{self.game_id}] Все барьеры пройдены")
             return False
 
         next_b = self.barriers[0]
@@ -461,7 +463,10 @@ class GameSession:
         # real_trigger ≈ 50px (из DevTools реальных игроков)
         # lag_correction ≈ 70px (систематическое отставание позиции)
         # итого: 120px, или ~65 тиков при speed=1.841
-        trigger_dist = self.current_speed_x * 65  # 65 тиков ≈ 650ms
+        # Лаг нашей позиции относительно сервера ~60-70px
+        # Хотим прыгать когда реальный dist ≈ 80px
+        # Значит наш trigger = 80 + 65 = 145px ≈ 88 тиков при speed=1.648
+        trigger_dist = self.current_speed_x * 90  # 90 тиков ≈ 900ms
 
         logger.info(
             f"[{self.game_id}] CHECK pet_x={self.pet_x:.0f} dist={dist:.0f} "
@@ -630,8 +635,7 @@ class GameSession:
             self.last_update   = data.get("lastUpdate", self.last_update)
             self.started       = True
             self.game_started_at = time.time() * 1000
-            # Вычисляем speed_per_ms из chars пета если знаем
-            logger.info(f"[{self.game_id}] 🏁 Игра началась! speed_per_ms={self.speed_per_ms:.3f}")
+            logger.info(f"[{self.game_id}] 🏁 Игра началась! speed={self.current_speed_x:.3f}px/tick")
 
         def on_ended(data: dict):
             for p in data.get("usersPrizes", []):
@@ -685,14 +689,13 @@ class GameSession:
                 real_x = coords.get("x")
                 if real_x is not None:
                     old_est = self.pet_x
-                    # Калибруем game_started_at по реальной x с сервера
                     if self.current_speed_x > 0:
                         ticks_real = (real_x - 118) / self.current_speed_x
                         self.game_started_at = time.time() * 1000 - ticks_real * 10
                     self.pet_x = real_x
                     logger.info(
                         f"[{self.game_id}] Калибровка: est={old_est:.0f} → real={real_x:.0f} "
-                        f"(лаг {real_x - old_est:.0f}px), пересчитан game_started_at"
+                        f"(лаг {real_x - old_est:.0f}px)"
                     )
                 speed = data.get("speed", {})
                 if speed.get("x") is not None:
@@ -700,6 +703,12 @@ class GameSession:
                 if speed.get("y") is not None:
                     self.current_speed_y = speed["y"]
                 self.last_update = data.get("lastUpdate", self.last_update)
+                # Автосброс статуса через 1.2с (длительность прыжка)
+                def reset_after_jump():
+                    time.sleep(1.2)
+                    if self.pet_status == "jumping":
+                        self.pet_status = "running"
+                threading.Thread(target=reset_after_jump, daemon=True).start()
 
         client.on("_open",                  on_open)
         client.on("engine.user.connected",  on_user_connected)
@@ -908,6 +917,7 @@ class AutoPlayer:
                 mode      = self.mode,
                 user_id   = self.user_id,
                 on_finish = on_finish,
+                pet_id    = self.pet_id,
             )
             session.run(timeout=GAME_TIMEOUT)
 
