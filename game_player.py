@@ -406,6 +406,7 @@ class GameSession:
         self.physics_start_at   = 0.0   # serverTime из engine.game.started
         self.server_time_offset = 0.0   # local → server time offset
         self._jump_timers       = []    # список Timer объектов
+        self._jump_plan_seq     = 0     # поколение плана прыжка (для отбрасывания устаревших fire)
         self._last_jumped_barrier = 0.0  # x барьера для которого уже запланирован/выполнен прыжок
         self._last_sent_jumped_at = 0.0   # jumpedAt который мы отправили последним
         self._prev_confirmed_x   = 0.0   # x предыдущего подтверждённого прыжка
@@ -473,6 +474,8 @@ class GameSession:
         for t in self._jump_timers:
             t.cancel()
         self._jump_timers.clear()
+        self._jump_plan_seq += 1
+        plan_seq = self._jump_plan_seq
 
         if not self.barriers or speed <= 0 or not self.physics_start_at:
             return
@@ -552,6 +555,15 @@ class GameSession:
         def fire(srv_time=jump_server_time, bx=next_b["x"], target_ref=target_x):
             if self._done.is_set():
                 return
+
+            # Этот fire может прилететь из старого таймера (гонка между cancel и callback).
+            # В таком случае просто игнорируем его, чтобы не прыгать по старому барьеру.
+            if plan_seq != self._jump_plan_seq:
+                logger.info(
+                    f"[{self.game_id}] stale jump plan ignored: barrier={bx} plan={plan_seq} current={self._jump_plan_seq}"
+                )
+                return
+
             # Если время прыжка уже прошло — используем текущее серверное время
             now_srv = time.time() * 1000 + self.server_time_offset
 
@@ -571,6 +583,18 @@ class GameSession:
             est_x = max(est_x_sync, est_x_pred)
             est_front = est_x + self.width_pet
             distance_to_barrier = bx - est_front
+
+            # Барьер уже позади/впритык по оценке — этот план устарел, перепланируем с текущей позиции.
+            if distance_to_barrier <= 0:
+                logger.info(
+                    f"[{self.game_id}] skip stale barrier={bx}: est_front={est_front:.1f}, replan"
+                )
+                self._schedule_next_jump(
+                    from_x=est_x,
+                    speed=speed_now,
+                    anchor_srv_time=now_srv,
+                )
+                return
 
             # Компенсируем задержку между решением и фактическим применением прыжка сервером.
             # На загруженных лобби доходит до ~250ms, поэтому берём более консервативный запас.
