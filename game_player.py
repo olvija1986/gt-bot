@@ -544,9 +544,9 @@ class GameSession:
         # SAFE_GAP: целевая дистанция (в px) до барьера в момент отправки прыжка.
         # Должна быть «перед барьером», но с запасом на сетевую/серверную задержку.
         # Держим её адаптивной от текущей скорости, чтобы не упираться в барьер на быстрых петах.
-        reaction_ticks = 8.8   # ~88ms суммарной задержки input+server
-        safety_margin_px = 30.0
-        min_gap_px = 108.0
+        reaction_ticks = 10.5  # ~105ms суммарной задержки input+server (с запасом на джиттер)
+        safety_margin_px = 38.0
+        min_gap_px = 132.0
         max_gap_px = 175.0
         safe_gap = ideal_dist + speed * reaction_ticks + safety_margin_px
         safe_gap = max(min_gap_px, min(max_gap_px, safe_gap))
@@ -557,7 +557,7 @@ class GameSession:
         # jumpedAt: вычисляем через реальную скорость движения пета
         # arc_spx (speed.x из engine.jump) ≈ 85-88% от скорости бега
         # Корректируем *1.18 чтобы пет оказался точно в target_x в момент прыжка
-        SPEED_CORRECTION = 1.18
+        SPEED_CORRECTION = 1.28
         if anchor_srv_time > 0 and from_x > 118:
             # После первого прыжка — якорный метод с коррекцией
             effective_speed = speed * SPEED_CORRECTION
@@ -629,8 +629,8 @@ class GameSession:
             desired_jump_dist = max(min_gap_px, min(max_gap_px, desired_jump_dist))
 
             # Коридор принятия решения: чуть «раньше» цели, но без излишнего раннего прыжка.
-            tolerance = 4.0
-            min_jump_dist = 58.0
+            tolerance = 3.0
+            min_jump_dist = 88.0
 
             # Защита от «позднего» прыжка: если почти у барьера — шлём сразу
             # и не переносим таймер (иначе упираемся в барьер до применения input).
