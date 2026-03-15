@@ -594,7 +594,7 @@ def set_bot_commands():
         {"command": "essence",    "description": "Применить эссенции"},
     ]
     try:
-        resp = requests.post(url, json={"commands": commands})
+        resp = requests.post(url, json={"commands": commands}, timeout=10)
         log(f"Команды меню обновлены: {resp.json()}")
     except Exception as e:
         log(f"Ошибка обновления команд меню: {e}")
@@ -825,7 +825,8 @@ log("Бот запускается…")
 
 try:
     wh = requests.get(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}"
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}",
+        timeout=10
     )
     log(f"Webhook set: {wh.text}")
 except Exception as e:
