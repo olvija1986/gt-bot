@@ -387,6 +387,7 @@ class GameSession:
         self.physics_start_at   = 0.0   # serverTime из engine.game.started
         self.server_time_offset = 0.0   # local → server time offset
         self._jump_timers       = []    # список Timer объектов
+        self._last_jumped_barrier = 0.0  # x барьера для которого уже запланирован/выполнен прыжок
         self.result             = None
         self._done         = threading.Event()
 
@@ -408,12 +409,19 @@ class GameSession:
         if not self.barriers or speed <= 0 or not self.physics_start_at:
             return
 
-        # Находим следующий непройденный барьер
+        # Находим следующий барьер ПОСЛЕ последнего прыжка
+        # Берём барьер строго дальше чем тот, на который уже прыгали
         pet_front = from_x + self.width_pet
-        next_b = next((b for b in self.barriers if b["x"] > pet_front), None)
+        next_b = next(
+            (b for b in self.barriers
+             if b["x"] > pet_front and b["x"] > self._last_jumped_barrier),
+            None
+        )
         if not next_b:
-            logger.info(f"[{self.game_id}] Все барьеры пройдены")
+            logger.info(f"[{self.game_id}] Все барьеры пройдены (from_x={from_x:.0f})")
             return
+        # Запоминаем этот барьер чтобы не прыгнуть на него повторно
+        self._last_jumped_barrier = next_b["x"]
 
         barrier_high = next_b.get("high", 50)
         if self.mode == "race":
@@ -450,14 +458,20 @@ class GameSession:
         def fire(srv_time=jump_server_time, bx=next_b["x"]):
             if self._done.is_set():
                 return
+            # Если время прыжка уже прошло — используем текущее серверное время
+            now_srv = time.time() * 1000 + self.server_time_offset
+            actual_jumped_at = int(max(srv_time, now_srv))
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
-                "jumpedAt": int(srv_time),
+                "jumpedAt": actual_jumped_at,
             }
             event = "engine.jump" if self.mode == "race" else "engine.dive"
             self._client.emit_with_null(event, payload)
             self.pet_status = "jumping"
-            logger.info(f"[{self.game_id}] ⏱ JUMP jumpedAt={int(srv_time)} barrier={bx}")
+            logger.info(
+                f"[{self.game_id}] ⏱ JUMP jumpedAt={actual_jumped_at} "
+                f"barrier={bx} (planned={int(srv_time)})"
+            )
 
         t = threading.Timer(delay_s, fire)
         t.daemon = True
