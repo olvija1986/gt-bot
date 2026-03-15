@@ -450,12 +450,11 @@ class GameSession:
 
         ideal_dist = speed * (ticks_up + 2)
 
-        # BUFFER: pet нужно прыгнуть на 60+px до барьера чтобы перелететь
-        # (confirmed_x ≈ jump_x + 30px движения в дуге, dist нужно ≥ 30px при jump_x)
-        # Initial: +120px (ошибка формулы скорости ~18%)
-        # Calibrated: +60px (скорость точная, но ускорение между прыжками)
-        is_calibrated = from_x > 200.0
-        BUFFER = 60.0 if is_calibrated else 120.0
+        # BUFFER: сколько px до барьера должен быть пет в момент прыжка
+        # Для надёжного перелёта нужно dist ≥ 40px при jump_x
+        # Initial: скорость откорректирована *1.18, буфер небольшой
+        # Calibrated: скорость реальная из подтверждённого прыжка
+        BUFFER = 40.0
 
         target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER
         target_x = max(target_x, from_x + speed)
@@ -465,7 +464,10 @@ class GameSession:
             delta_ticks = (target_x - from_x) / speed
             jump_server_time = anchor_srv_time + delta_ticks * 10.0
         else:
-            elapsed_ticks = (target_x - 118.0) / speed
+            # Первый прыжок: формула занижает скорость на ~18%
+            # Корректируем: используем speed*1.18 для расчёта jumpedAt
+            corrected_speed = speed * 1.18
+            elapsed_ticks = (target_x - 118.0) / corrected_speed
             jump_server_time = self.physics_start_at + elapsed_ticks * 10.0
 
         # Локальное время отправки
