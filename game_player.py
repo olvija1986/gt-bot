@@ -56,6 +56,10 @@ SCREEN         = {"w": 1182, "h": 468}
 WAITROOM_TIMEOUT = 60    # сек ждём матч
 GAME_TIMEOUT     = 120   # сек максимум на игру
 SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", True)
+AI_POLL_INTERVAL_MS = 80
+# Дополнительное упреждение до идеальной точки прыжка.
+# Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
+JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "14"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -422,6 +426,7 @@ class GameSession:
         self._jump_timers       = []    # список Timer объектов
         self._last_jumped_barrier = 0.0  # x барьера для которого уже запланирован/выполнен прыжок
         self._last_sent_jumped_at = 0.0   # jumpedAt который мы отправили последним
+        self._jump_latency_ms     = 150.0 # EWMA задержки send→server подтверждения
         self._prev_confirmed_x   = 0.0   # x предыдущего подтверждённого прыжка
         self._prev_confirmed_at  = 0.0   # jumpedAt предыдущего подтверждённого прыжка
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
@@ -497,7 +502,7 @@ class GameSession:
             if self.started and self.barriers and self.current_speed_x > 0:
                 if self.pet_status not in ("jumping", "diving"):
                     self._tick_bot()
-            time.sleep(0.08)
+            time.sleep(AI_POLL_INTERVAL_MS / 1000.0)
 
     def _tick_bot(self):
         """Порт raceBot.tickBot — вызывается каждые 80ms."""
@@ -527,9 +532,14 @@ class GameSession:
             ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
         ideal_dist = self.current_speed_x * (ticks + 2)
 
-        # Запас на polling lag (80ms) + сетевую задержку (~150ms) + погрешность позиции
-        # При speed=2.0: 230ms * 2.0/10ms_per_tick = 46px движения до реального прыжка
-        poll_lag_px = self.current_speed_x * 23  # 230ms / 10ms
+        # Запас на polling lag + реальную задержку до подтверждения + доп. упреждение.
+        # Это делает прыжок раньше и убирает «залипание» у барьера при джиттере.
+        lag_ticks = (
+            AI_POLL_INTERVAL_MS / 10.0
+            + self._jump_latency_ms / 10.0
+            + JUMP_LEAD_TICKS
+        )
+        poll_lag_px = self.current_speed_x * lag_ticks
 
         if dist <= ideal_dist + poll_lag_px:
             now_srv = int(time.time() * 1000 + self.server_time_offset)
@@ -544,7 +554,8 @@ class GameSession:
             self._last_sent_jumped_at = now_srv
             logger.info(
                 f"[{self.game_id}] ⏱ JUMP barrier={barrier['x']} "
-                f"dist={dist:.1f} ideal={ideal_dist:.1f} spx={self.current_speed_x:.3f}"
+                f"dist={dist:.1f} ideal={ideal_dist:.1f} lag={poll_lag_px:.1f} "
+                f"spx={self.current_speed_x:.3f}"
             )
 
     def _make_action_payload(self) -> dict:
@@ -774,6 +785,13 @@ class GameSession:
             speed_data = data.get("speed", {}) or {}
             arc_spx = speed_data.get("x", 0)
 
+            # Оценка фактической задержки между jumpedAt и serverTime.
+            jumped_at = self._last_sent_jumped_at
+            server_time = data.get("serverTime")
+            if jumped_at and server_time:
+                sample = max(0.0, min(600.0, float(server_time) - float(jumped_at)))
+                self._jump_latency_ms = self._jump_latency_ms * 0.7 + sample * 0.3
+
             if real_x is not None:
                 self.pet_x = real_x
                 self._anchor_x = real_x
@@ -787,7 +805,8 @@ class GameSession:
                     ticks = (real_x - 118.0) / self.current_speed_x
                     self.game_started_at = time.time() * 1000 - ticks * 10
                 logger.info(
-                    f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} spx={self.current_speed_x:.4f}"
+                    f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
+                    f"spx={self.current_speed_x:.4f} lag_ms≈{self._jump_latency_ms:.0f}"
                 )
 
             self.last_update = data.get("lastUpdate", self.last_update)
