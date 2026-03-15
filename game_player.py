@@ -413,28 +413,16 @@ class GameSession:
 
     def _running_speed_from_jump(self, confirmed_x: float, jumped_at: int) -> float:
         """
-        Вычисляет реальную скорость БЕГА пета.
-
-        Сервер вычисляет позицию как: petX = 118 + speed * (jumpedAt - physicsStart) / 10
-        Поэтому нужно использовать наш jumpedAt (который мы отправили),
-        а НЕ petLastUpdate (это время когда сервер ответил, включает сетевую задержку).
-
-        running_speed = (confirmed_x - 118) / elapsed_ticks
-        где elapsed_ticks = (our_jumpedAt - physics_start) / 10
+        Вычисляет среднюю скорость бега от старта до подтверждённого прыжка.
+        confirmed_x и jumped_at (petLastUpdate) — консистентная пара от сервера.
+        speed = (confirmed_x - 118) / ((jumped_at - physics_start) / 10)
         """
         if not self.physics_start_at or self.physics_start_at <= 0:
             return self.current_speed_x
-        # Используем наш jumpedAt если он есть, иначе переданный (petLastUpdate)
-        use_jumped_at = self._last_sent_jumped_at if self._last_sent_jumped_at > 0 else jumped_at
-        elapsed_ticks = (use_jumped_at - self.physics_start_at) / 10.0
+        elapsed_ticks = (jumped_at - self.physics_start_at) / 10.0
         if elapsed_ticks <= 0:
             return self.current_speed_x
-        speed = (confirmed_x - 118.0) / elapsed_ticks
-        logger.debug(
-            f"run_speed: x={confirmed_x:.0f} jumpedAt={use_jumped_at} "
-            f"ticks={elapsed_ticks:.0f} speed={speed:.4f}"
-        )
-        return speed
+        return (confirmed_x - 118.0) / elapsed_ticks
 
     def _schedule_next_jump(self, from_x: float, speed: float,
                             anchor_srv_time: float = 0.0):
@@ -452,17 +440,14 @@ class GameSession:
 
         pet_front = from_x + self.width_pet
 
-        # Симулируем прыжок чтобы понять куда пет приземлится
-        # Используем текущую горизонтальную скорость и jumpPower
-        # (from_x — позиция в начале дуги, speed — скорость бега)
-        landing_x = _simulate_landing(from_x, speed, self.jump_power, self.gravity)
-
-        # Ищем первый барьер ПОСЛЕ места приземления
-        search_from = max(pet_front, landing_x)
-        logger.info(
-            f"[{self.game_id}] landing≈{landing_x:.0f} "
-            f"(from_x={from_x:.0f} spx={speed:.2f} jp={self.jump_power:.1f})"
-        )
+        # Для быстрых петов симулируем куда долетит (чтобы не прыгать на уже пройденный барьер)
+        # Для медленных (speed < 3) просто ищем ближайший барьер
+        if speed >= 3.0 and from_x > 118:
+            landing_x = _simulate_landing(from_x, speed, self.jump_power, self.gravity)
+            search_from = max(pet_front, landing_x)
+            logger.info(f"[{self.game_id}] landing≈{landing_x:.0f} search_from={search_from:.0f}")
+        else:
+            search_from = pet_front
 
         next_b = next(
             (b for b in self.barriers
@@ -470,10 +455,7 @@ class GameSession:
             None
         )
         if not next_b:
-            logger.info(
-                f"[{self.game_id}] Все барьеры пройдены "
-                f"(from_x={from_x:.0f} landing≈{landing_x:.0f})"
-            )
+            logger.info(f"[{self.game_id}] Все барьеры пройдены (from_x={from_x:.0f})")
             return
         # НЕ устанавливаем _last_jumped_barrier здесь — только когда реально прыгнем
 
@@ -772,9 +754,7 @@ class GameSession:
                     running_spx = self._running_speed_from_jump(real_x, jumped_at)
                     old_spx = self.current_speed_x
                     ratio = running_spx / max(old_spx, 0.001)
-
-                    # Якорь для следующего прыжка — наш отправленный jumpedAt
-                    # (точнее чем petLastUpdate который включает сетевую задержку ~150ms)
+                    # Якорь: наш отправленный jumpedAt точнее чем petLastUpdate (~150ms позже)
                     anchor = float(self._last_sent_jumped_at) if self._last_sent_jumped_at > 0 else float(jumped_at)
 
                     if 0.3 <= ratio <= 5.0:
