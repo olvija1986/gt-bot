@@ -47,27 +47,6 @@ WAITROOM_WS    = "wss://waitroom.nl.gatto.pw/socket.io/?EIO=4&transport=websocke
 SCREEN         = {"w": 1182, "h": 468}
 WAITROOM_TIMEOUT = 60    # сек ждём матч
 GAME_TIMEOUT     = 120   # сек максимум на игру
-# Отправляем jump немного заранее для компенсации сети/обработки на сервере.
-JUMP_SEND_AHEAD_MS = float(os.environ.get("JUMP_SEND_AHEAD_MS", "230"))
-# Глобальный доп. сдвиг влево для более раннего старта прыжка.
-# Полезно если питомец всё ещё иногда "упирается" в край барьера.
-JUMP_EARLY_EXTRA_PX = float(os.environ.get("JUMP_EARLY_EXTRA_PX", "44"))
-# Минимальный запас между носом пета и барьером в момент отправки прыжка.
-JUMP_MIN_FRONT_CLEARANCE_PX = float(os.environ.get("JUMP_MIN_FRONT_CLEARANCE_PX", "76"))
-# Доп. сдвиг по барьерам №2+ (помогает на сериях препятствий 2/3/4).
-JUMP_CHAIN_EXTRA_PX = float(os.environ.get("JUMP_CHAIN_EXTRA_PX", "14"))
-# Минимальная пауза между отправками jump/dive, чтобы исключить дребезг
-# при дублях engine.jump и при одновременном retry + плановом прыжке.
-JUMP_RETRY_COOLDOWN_MS = float(os.environ.get("JUMP_RETRY_COOLDOWN_MS", "220"))
-# Дедупликация повторных engine.jump с одинаковыми lastUpdate/x.
-JUMP_CONFIRM_DEDUP_MS = float(os.environ.get("JUMP_CONFIRM_DEDUP_MS", "120"))
-# Сервер позволяет прислать jumpedAt немного в прошлом (rewind до 2с).
-# Это помогает компенсировать сетевую/очередную задержку и начать дугу раньше.
-JUMP_RETRO_BASE_MS = float(os.environ.get("JUMP_RETRO_BASE_MS", "95"))
-JUMP_RETRO_MAX_MS = float(os.environ.get("JUMP_RETRO_MAX_MS", "240"))
-# Экстренный порог: если по sync нос пета уже близко к барьеру,
-# шлём jump сразу, не дожидаясь таймера планировщика.
-JUMP_EMERGENCY_TRIGGER_PX = float(os.environ.get("JUMP_EMERGENCY_TRIGGER_PX", "54"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -77,100 +56,6 @@ HEADERS_HTTP = {
     "referer": "https://gatto.pw/",
     "user-agent": "Mozilla/5.0",
 }
-
-
-def _mode_stat_names(mode: str) -> tuple[str, str]:
-    """Возвращает ключи характеристик для формулы скорости."""
-    if mode == "swim":
-        return "swim", "agility"
-    return "strength", "agility"
-
-
-def _speed_factor(chars: dict, mode: str) -> float:
-    """
-    Множитель из game-клиента:
-    (mainStat/100 + agility/100) * 0.45
-    """
-    main_stat, second_stat = _mode_stat_names(mode)
-    return ((chars.get(main_stat, 0) / 100.0) + (chars.get(second_stat, 0) / 100.0)) * 0.45
-
-
-def _calc_mode_speed(base_speed: float, chars: dict, mode: str) -> float:
-    """Расчёт speed.initial / speed.max / speed.increasePerSec под режим."""
-    return base_speed + base_speed * _speed_factor(chars, mode)
-
-
-def _extract_speed_profile(info: dict, mode: str) -> dict | None:
-    """
-    Достаёт профиль скорости из pet.info по формулам фронта.
-    Возвращает значения в px/tick.
-    """
-    chars = info.get("chars", {}) or {}
-    speed = info.get("speed", {}) or {}
-    required = ("initial", "max", "increasePerSec")
-    if any(speed.get(k) is None for k in required):
-        return None
-
-    initial_tick = _calc_mode_speed(float(speed["initial"]), chars, mode)
-    max_tick = _calc_mode_speed(float(speed["max"]), chars, mode)
-    increase_sec = _calc_mode_speed(float(speed["increasePerSec"]), chars, mode)
-
-    # 1 tick = 10ms => 100 ticks/s
-    increase_tick = increase_sec / 100.0
-    return {
-        "initial": max(0.1, initial_tick),
-        "max": max(0.1, max_tick),
-        "increase_per_tick": max(0.0, increase_tick),
-    }
-
-
-def _ticks_to_cover_distance(distance: float, speed0: float, accel_tick: float, speed_max: float) -> float:
-    """
-    Сколько тиков нужно, чтобы пройти distance по X
-    при разгоне speed0 + accel_tick * t с ограничением speed_max.
-    """
-    if distance <= 0:
-        return 0.0
-
-    v0 = max(0.01, speed0)
-    vmax = max(v0, speed_max)
-    a = max(0.0, accel_tick)
-
-    # Без ускорения — обычная линейка
-    if a <= 1e-9:
-        return distance / v0
-
-    # Тики до выхода на vmax
-    t_to_max = max(0.0, (vmax - v0) / a)
-    # Путь на участке разгона (дискретно-непрерывная аппроксимация)
-    dist_accel = v0 * t_to_max + 0.5 * a * t_to_max * t_to_max
-
-    if distance <= dist_accel:
-        # Решаем 0.5*a*t^2 + v0*t - distance = 0
-        disc = v0 * v0 + 2.0 * a * distance
-        return (-v0 + disc ** 0.5) / a
-
-    return t_to_max + (distance - dist_accel) / vmax
-
-def _distance_in_ticks(ticks: float, speed0: float, accel_tick: float, speed_max: float) -> float:
-    """Какую дистанцию пройдёт пет за ticks тиков по той же модели разгона."""
-    if ticks <= 0:
-        return 0.0
-
-    v0 = max(0.01, speed0)
-    vmax = max(v0, speed_max)
-    a = max(0.0, accel_tick)
-
-    if a <= 1e-9:
-        return v0 * ticks
-
-    t_to_max = max(0.0, (vmax - v0) / a)
-    t_acc = min(ticks, t_to_max)
-    dist = v0 * t_acc + 0.5 * a * t_acc * t_acc
-    if ticks > t_to_max:
-        dist += (ticks - t_to_max) * vmax
-    return dist
-
 
 
 # ══════════════════════════════════════════════════════════
@@ -480,61 +365,6 @@ def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity
     return x
 
 
-def _find_late_safe_jump_distance(
-    speed_x: float,
-    jump_power: float,
-    gravity: float,
-    barrier_high: float,
-    width_pet: float,
-    width_barrier: float,
-    safety_margin: float = 3.0,
-) -> float | None:
-    """
-    Возвращает минимальную дистанцию (в px) от X пета до X барьера,
-    при которой прыжок ещё безопасно перелетает барьер.
-
-    Меньшая дистанция => более поздний ("точный") прыжок.
-    Если безопасной дистанции нет, вернёт None.
-    """
-    vx = max(0.05, float(speed_x))
-    barrier_left = 0.0
-    barrier_right = float(width_barrier)
-    required_height = max(0.0, float(barrier_high)) + max(0.0, float(safety_margin))
-
-    def _is_safe(dx_to_barrier: float) -> bool:
-        x = -float(dx_to_barrier)
-        y = 0.0
-        sy = float(jump_power)
-
-        for _ in range(500):
-            sy = max(0.0, sy - 0.6)
-            y += sy
-            if y - gravity > 0:
-                y -= gravity
-            else:
-                y = max(0.0, y - gravity)
-
-            pet_left = x
-            pet_right = x + width_pet
-            overlap = pet_right > barrier_left and pet_left < barrier_right
-            if overlap and y < required_height:
-                return False
-
-            # Приземлились: считаем прыжок успешным, если весь пет уже за барьером.
-            if y <= 0:
-                return pet_left >= barrier_right
-
-            x += vx
-
-        return False
-
-    # Ищем самый поздний (минимальный dx) безопасный прыжок.
-    for dx in range(int(width_pet), 900):
-        if _is_safe(float(dx)):
-            return float(dx)
-    return None
-
-
 class GameSession:
     def __init__(self, game_id: str, lobby_url: str, mode: str, user_id: int, on_finish=None, pet_id=None):
         self.game_id   = game_id
@@ -552,9 +382,6 @@ class GameSession:
         # currentSpeed — обновляется из engine.sync и engine.jump событий
         self.current_speed_x  = 0.0   # px/tick (не px/ms!)
         self.current_speed_y  = 0.0
-        self.speed_initial_x  = 0.0
-        self.speed_max_x      = 0.0
-        self.speed_up_tick_x  = 0.0
         # Физические параметры пета — берём из engine.user.connected
         self.jump_power    = 20.0    # дефолт, перезапишется из pet.info
         self.dive_power    = 10.0    # для swim
@@ -581,15 +408,9 @@ class GameSession:
         self._jump_timers       = []    # список Timer объектов
         self._last_jumped_barrier = 0.0  # x барьера для которого уже запланирован/выполнен прыжок
         self._last_sent_jumped_at = 0.0   # jumpedAt который мы отправили последним
-        self._adaptive_prejump_px = 0.0   # авто-подстройка раннего старта прыжка
         self._prev_confirmed_x   = 0.0   # x предыдущего подтверждённого прыжка
         self._prev_confirmed_at  = 0.0   # jumpedAt предыдущего подтверждённого прыжка
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
-        self._last_fire_local_ms = 0.0   # локальное время отправки jump-пакета
-        self._tx_latency_ms      = 0.0   # EWMA оценка send->server latency
-        self._next_jump_fire_local_ms = 0.0  # локальное время запланированного следующего прыжка
-        self._last_jump_event_key = None     # дедуп ключ последнего engine.jump
-        self._last_jump_event_local_ms = 0.0 # время получения последнего engine.jump
         self.result             = None
         self._done         = threading.Event()
 
@@ -629,188 +450,64 @@ class GameSession:
             return self.current_speed_x
         return (confirmed_x - 118.0) / elapsed
 
-    def _schedule_next_jump(self, from_x: float, speed: float,
-                            anchor_srv_time: float = 0.0):
+    def _ai_loop(self):
         """
-        Планирует следующий прыжок.
-        anchor_srv_time: серверное время подтверждённого прыжка из которого known from_x.
-        Используем его как точку отсчёта — точнее чем physics_start.
+        Polling loop по образцу raceBot.ts (исходники сервера).
+        Каждые 80ms проверяет дистанцию до барьера и прыгает если нужно.
+        intelligence=1.0 → triggerDist = idealDist (идеальная реакция).
         """
-        for t in self._jump_timers:
-            t.cancel()
-        self._jump_timers.clear()
+        while not self._done.is_set():
+            if self.started and self.barriers and self.current_speed_x > 0:
+                if self.pet_status not in ("jumping", "diving"):
+                    self._tick_bot()
+            time.sleep(0.08)
 
-        if not self.barriers or speed <= 0 or not self.physics_start_at:
-            return
+    def _tick_bot(self):
+        """Порт raceBot.tickBot — вызывается каждые 80ms."""
+        # Обновляем оценку позиции (тик = 10ms)
+        if self.game_started_at:
+            elapsed_ms = time.time() * 1000 - self.game_started_at
+            self.pet_x = 118.0 + self.current_speed_x * (elapsed_ms / 10.0)
 
-        pet_front = from_x + self.width_pet
+        pet_front = self.pet_x + self.width_pet
 
-        # Для быстрых петов симулируем куда долетит (чтобы не прыгать на уже пройденный барьер)
-        # Для медленных (speed < 3) просто ищем ближайший барьер
-        # Симулируем приземление чтобы понять какие барьеры пет уже перелетит
-        landing_x = _simulate_landing(from_x, speed, self.jump_power, self.gravity)
-        logger.info(f"[{self.game_id}] from_x={from_x:.0f} landing≈{landing_x:.0f} spx={speed:.3f}")
-
-        # Ищем следующий барьер устойчиво к «отскокам» от препятствий:
-        # если после предыдущего прыжка мы всё ещё заметно ДО того же барьера,
-        # не перескакиваем его в планировании, а повторяем именно его.
-        # Повторно целимся в тот же барьер только если до него не дотягивают
-        # и текущая позиция, и прогноз приземления. Иначе на подтверждении
-        # прыжка (когда x ещё "в дуге") можно ошибочно зациклиться на 1-м барьере.
-        landing_front = landing_x + self.width_pet
-        retry_last_barrier = (
-            self._last_jumped_barrier > 0
-            and pet_front + 12.0 < self._last_jumped_barrier
-            and landing_front + 6.0 < self._last_jumped_barrier
+        # findNextBarrier: первый барьер чья правая грань ещё впереди пета
+        barrier = next(
+            (b for b in self.barriers if b["x"] + self.width_barrier > pet_front),
+            None
         )
-
-        next_idx = None
-        next_b = None
-        if retry_last_barrier:
-            for i, b in enumerate(self.barriers):
-                if b["x"] >= self._last_jumped_barrier - 1.0:
-                    next_idx = i
-                    next_b = b
-                    break
-            logger.info(
-                f"[{self.game_id}] retry target barrier={self._last_jumped_barrier:.0f} "
-                f"(pet_front={pet_front:.0f}, landing≈{landing_x:.0f})"
-            )
-        else:
-            # Обычный режим: берём ближайший барьер впереди текущего фронта пета.
-            # Не опираемся только на landing_x: в матчах с лагом он иногда
-            # переоценивает дальность и приводит к пропуску нужного барьера.
-            search_from = max(pet_front, self._last_jumped_barrier + 1.0)
-            for i, b in enumerate(self.barriers):
-                if b["x"] > search_from:
-                    next_idx = i
-                    next_b = b
-                    break
-        if not next_b:
-            logger.info(f"[{self.game_id}] Все барьеры пройдены (from_x={from_x:.0f})")
+        if not barrier:
             return
-        # НЕ устанавливаем _last_jumped_barrier здесь — только когда реально прыгнем
 
-        barrier_high = next_b.get("high", 50)
+        dist = barrier["x"] - pet_front
+        if dist <= 0:
+            return
+
+        # calcIdealJumpDistance: порт из raceBot.ts
+        # idealDist = speed * (ticksToReachHeight + 2)
+        barrier_high = barrier.get("high", 50)
         if self.mode == "race":
-            ticks_up = ticks_to_reach_height(self.jump_power, self.gravity, barrier_high)
+            ticks = ticks_to_reach_height(self.jump_power, self.gravity, barrier_high)
         else:
-            ticks_up = ticks_to_reach_depth(self.dive_power, barrier_high)
+            ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
+        ideal_dist = self.current_speed_x * (ticks + 2)
 
-        travel_ticks = ticks_up + 2
-        ideal_dist = _distance_in_ticks(
-            travel_ticks,
-            speed,
-            self.speed_up_tick_x,
-            self.speed_max_x if self.speed_max_x > 0 else speed,
-        )
-
-        # Для более "идеального" прыжка считаем самую позднюю безопасную дистанцию
-        # до барьера через прямую симуляцию (без запаса на пол-экрана).
-        safe_dx = _find_late_safe_jump_distance(
-            speed,
-            self.jump_power,
-            self.gravity,
-            barrier_high,
-            self.width_pet,
-            self.width_barrier,
-            safety_margin=8.0,
-        )
-
-        # Дополнительные запасы только на сеть/джиттер.
-        slow_factor = max(0.0, 2.2 - float(speed))
-        network_pad = 12.0 + min(20.0, slow_factor * 14.0)
-        network_pad += min(8.0, max(0.0, self._tx_latency_ms) / 30.0)
-        network_pad += max(0.0, JUMP_EARLY_EXTRA_PX * 0.6)
-        if next_idx is not None and next_idx >= 1:
-            network_pad += min(10.0, JUMP_CHAIN_EXTRA_PX * 0.6)
-        network_pad += min(10.0, max(0.0, self._adaptive_prejump_px) * 0.5)
-
-        # Фолбэк на старую эвристику, если симуляция не нашла безопасную зону.
-        if safe_dx is None:
-            target_dist = ideal_dist + self.width_pet + 72.0
-        else:
-            target_dist = safe_dx + network_pad
-
-        # Не прыгаем впритык: фиксируем минимальный запас до барьера по координате.
-        min_target_dist = self.width_pet + max(0.0, JUMP_MIN_FRONT_CLEARANCE_PX)
-        target_dist = max(target_dist, min_target_dist)
-
-        target_x = next_b["x"] - target_dist
-        target_x = max(target_x, from_x + speed)
-
-        # jumpedAt: считаем время до target_x по модели разгона
-        distance_to_target = max(0.0, target_x - from_x)
-        delta_ticks = _ticks_to_cover_distance(
-            distance_to_target,
-            speed,
-            self.speed_up_tick_x,
-            self.speed_max_x if self.speed_max_x > 0 else speed,
-        )
-        if anchor_srv_time > 0 and from_x > 118:
-            jump_server_time = anchor_srv_time + delta_ticks * 10.0
-        else:
-            jump_server_time = self.physics_start_at + delta_ticks * 10.0
-
-        # Локальное время отправки
-        now_local = time.time() * 1000
-        send_ahead_ms = JUMP_SEND_AHEAD_MS + min(120.0, slow_factor * 150.0)
-        # Добавляем сетевую поправку по реальным подтверждениям сервера.
-        send_ahead_ms += min(180.0, max(0.0, self._tx_latency_ms))
-        fire_local = jump_server_time - self.server_time_offset - send_ahead_ms
-        delay_s = max(0.0, (fire_local - now_local) / 1000.0)
-        self._next_jump_fire_local_ms = fire_local
-
-        logger.info(
-            f"[{self.game_id}] NEXT JUMP: barrier={next_b['x']} "
-                f"target_x={target_x:.0f} ideal={ideal_dist:.1f} safe_dx={safe_dx if safe_dx is not None else -1:.1f} "
-                f"pad={network_pad:.1f} "
-                f"speed={speed:.4f} fire_in={delay_s*1000:.0f}ms "
-                f"send_ahead={send_ahead_ms:.0f}ms"
-            )
-
-        def fire(srv_time=jump_server_time, bx=next_b["x"], target_ref=target_x):
-            if self._done.is_set():
-                return
-            now_local_ms = time.time() * 1000
-            if (
-                self._last_fire_local_ms > 0
-                and now_local_ms - self._last_fire_local_ms < JUMP_RETRY_COOLDOWN_MS
-            ):
-                logger.info(
-                    f"[{self.game_id}] skip noisy JUMP fire "
-                    f"Δ={now_local_ms - self._last_fire_local_ms:.0f}ms"
-                )
-                return
-            # jumpedAt можно дать немного в прошлом: сервер откатит состояние
-            # и применит jump в тот момент (по аналогии с клиентом игры).
-            now_srv = time.time() * 1000 + self.server_time_offset
-            retro_ms = JUMP_RETRO_BASE_MS + min(90.0, max(0.0, self._tx_latency_ms) * 0.8)
-            retro_ms = min(JUMP_RETRO_MAX_MS, retro_ms)
-            planned_jumped_at = min(float(srv_time), now_srv)
-            actual_jumped_at = int(max(now_srv - 1900.0, planned_jumped_at - retro_ms))
+        # intelligence=1.0 → triggerDist = idealDist (без jitter)
+        if dist <= ideal_dist:
+            now_srv = int(time.time() * 1000 + self.server_time_offset)
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
-                "jumpedAt": actual_jumped_at,
+                "jumpedAt": now_srv,
             }
             event = "engine.jump" if self.mode == "race" else "engine.dive"
             self._client.emit_with_null(event, payload)
-            self._last_fire_local_ms = now_local_ms
-            self._next_jump_fire_local_ms = 0.0
             self.pet_status = "jumping"
-            self._last_jumped_barrier = bx  # фиксируем только при реальной отправке
-            # Запоминаем jumpedAt который отправили — для точного расчёта скорости
-            self._last_sent_jumped_at = actual_jumped_at
-            self._prev_target_x = target_ref  # target_x этого прыжка
+            self._last_jumped_barrier = barrier["x"]
+            self._last_sent_jumped_at = now_srv
             logger.info(
-                f"[{self.game_id}] ⏱ JUMP jumpedAt={actual_jumped_at} "
-                f"barrier={bx} (planned={int(srv_time)} retro={retro_ms:.0f}ms)"
+                f"[{self.game_id}] ⏱ JUMP barrier={barrier['x']} "
+                f"dist={dist:.1f} ideal={ideal_dist:.1f} spx={self.current_speed_x:.3f}"
             )
-
-        t = threading.Timer(delay_s, fire)
-        t.daemon = True
-        t.start()
-        self._jump_timers.append(t)
 
     def _make_action_payload(self) -> dict:
         return {
@@ -849,32 +546,23 @@ class GameSession:
             if "power" in info:
                 self.gravity = float(info["power"].get("gravity", self.gravity))
 
-            chars = info.get("chars", {}) or {}
-            speed_profile = _extract_speed_profile(info, self.mode)
-            if speed_profile:
-                self.speed_initial_x = speed_profile["initial"]
-                self.speed_max_x = speed_profile["max"]
-                self.speed_up_tick_x = speed_profile["increase_per_tick"]
-                self.current_speed_x = self.speed_initial_x
-            else:
-                # Фолбэк: эмпирическая аппроксимация если сервер не прислал speed.*
-                agility = chars.get("agility", 53)
-                self.current_speed_x = (
-                    0.000624 * agility**2
-                    - 0.016927 * agility
-                    + 1.754893
-                )
-                self.current_speed_x = max(0.5, self.current_speed_x)
-                self.speed_initial_x = self.current_speed_x
-                self.speed_max_x = self.current_speed_x
-                self.speed_up_tick_x = 0.0
+            # Квадратичная формула скорости из реальных измерений:
+            # (10→1.648, 53→2.610, 77→4.150 px/tick)
+            # speed = 0.000624*agi^2 - 0.016927*agi + 1.754893
+            agility = info.get("chars", {}).get("agility", 53)
+            self.current_speed_x = (
+                0.000624 * agility**2
+                - 0.016927 * agility
+                + 1.754893
+            )
+            self.current_speed_x = max(0.5, self.current_speed_x)
 
             logger.info(
                 f"[{self.game_id}] Наш пет: {info.get('name')} "
-                f"row={self.pet_row} str={chars.get('strength',0)} "
-                f"agi={chars.get('agility',0)} swim={chars.get('swim',0)} "
-                f"v0={self.speed_initial_x:.3f}px/tick vmax={self.speed_max_x:.3f} "
-                f"a={self.speed_up_tick_x:.5f}px/tick² jp={self.jump_power:.1f} g={self.gravity:.2f}"
+                f"row={self.pet_row} agility={agility} "
+                f"speed={self.current_speed_x:.3f}px/tick "
+                f"(тик=10ms → {self.current_speed_x/10:.4f}px/ms) "
+                f"jp={self.jump_power:.1f} g={self.gravity:.2f}"
             )
             # Применяем барьеры если они уже пришли до нашего connected
             if self._all_barriers_raw and self.pet_row and not self.barriers:
@@ -966,42 +654,6 @@ class GameSession:
                         f"на row={self.pet_row}, первый x={self.barriers[0]['x'] if self.barriers else '—'}"
                     )
 
-            # Failsafe: если по sync до барьера осталось критически мало,
-            # шлём прыжок немедленно (часто спасает при джиттере/лаг-спайках).
-            if self.started and self.mode == "race" and self.barriers and self.pet_x is not None:
-                pet_front = float(self.pet_x) + self.width_pet
-                next_barrier = next((b for b in self.barriers if b["x"] > pet_front), None)
-                if next_barrier and self.pet_status != "jumping":
-                    distance_to_barrier = next_barrier["x"] - pet_front
-                    emergency_trigger = max(30.0, min(120.0, JUMP_EMERGENCY_TRIGGER_PX))
-                    jump_soon = (
-                        self._next_jump_fire_local_ms > 0
-                        and self._next_jump_fire_local_ms - (time.time() * 1000) <= JUMP_RETRY_COOLDOWN_MS
-                    )
-                    recently_sent = (
-                        self._last_fire_local_ms > 0
-                        and (time.time() * 1000) - self._last_fire_local_ms < JUMP_RETRY_COOLDOWN_MS
-                    )
-                    if distance_to_barrier <= emergency_trigger and not jump_soon and not recently_sent:
-                        now_local_ms = time.time() * 1000
-                        now_srv = now_local_ms + self.server_time_offset
-                        retro_ms = min(JUMP_RETRO_MAX_MS, JUMP_RETRO_BASE_MS + max(40.0, self._tx_latency_ms))
-                        jumped_at = int(max(now_srv - 1900.0, now_srv - retro_ms))
-                        payload = {
-                            "clickPosition": {"x": self.click_x, "y": self.click_y},
-                            "jumpedAt": jumped_at,
-                        }
-                        self._client.emit_with_null("engine.jump", payload)
-                        self._last_fire_local_ms = now_local_ms
-                        self._next_jump_fire_local_ms = 0.0
-                        self._last_jumped_barrier = next_barrier["x"]
-                        self._last_sent_jumped_at = jumped_at
-                        self.pet_status = "jumping"
-                        logger.info(
-                            f"[{self.game_id}] ⚠️ EMERGENCY JUMP barrier={next_barrier['x']} "
-                            f"dist={distance_to_barrier:.1f}px jumpedAt={jumped_at}"
-                        )
-
         def on_started(data: dict):
             self.last_update = data.get("lastUpdate", self.last_update)
             self.started     = True
@@ -1018,10 +670,7 @@ class GameSession:
                 f"[{self.game_id}] 🏁 Игра! physics_start={server_time} "
                 f"speed={self.current_speed_x:.4f}px/tick"
             )
-            # Планируем первый прыжок от актуальной позиции из sync.
-            # Жёсткая 118 иногда даёт поздний тайминг в начале заезда.
-            start_x = float(self.pet_x) if self.pet_x is not None else 118.0
-            self._schedule_next_jump(from_x=start_x, speed=self.current_speed_x)
+            # AI loop запускается в run() — он сам найдёт барьеры
 
         def on_ended(data: dict):
             for p in data.get("usersPrizes", []):
@@ -1072,7 +721,7 @@ class GameSession:
                 self.last_update = data.get("lastUpdate", self.last_update)
 
         def on_jump(data: dict):
-            """engine.jump — сервер подтвердил прыжок."""
+            """engine.jump — сервер подтвердил прыжок, обновляем состояние."""
             if data.get("userId") != self.user_id:
                 return
 
@@ -1081,118 +730,23 @@ class GameSession:
             real_x = coords.get("x")
             speed_data = data.get("speed", {}) or {}
             arc_spx = speed_data.get("x", 0)
-            speed_y = speed_data.get("y", 1.0)
-
-            # Некоторые комнаты шлют дубли engine.jump с теми же lastUpdate/x.
-            # Их обработка создаёт каскад NEXT JUMP fire_in=0ms.
-            now_local_ms = time.time() * 1000
-            jump_key = (
-                int(data.get("lastUpdate") or data.get("petLastUpdate") or 0),
-                int(real_x) if real_x is not None else -1,
-            )
-            if (
-                self._last_jump_event_key == jump_key
-                and now_local_ms - self._last_jump_event_local_ms < JUMP_CONFIRM_DEDUP_MS
-            ):
-                self.last_update = data.get("lastUpdate", self.last_update)
-                return
-            self._last_jump_event_key = jump_key
-            self._last_jump_event_local_ms = now_local_ms
 
             if real_x is not None:
                 self.pet_x = real_x
-                # speed.x из ответа = мгновенная горизонтальная скорость дуги
-                # Стабильна, точна, не требует вычислений
-                anchor = float(self._last_sent_jumped_at or
-                               data.get("petLastUpdate") or
-                               data.get("serverTime") or 0)
-
+                # Обновляем скорость из ответа сервера
                 if arc_spx > 0.5:
                     self.current_speed_x = arc_spx
-
-                    # Адаптивная коррекция pre-jump:
-                    # если подтверждённый x уже почти на барьере (или после него),
-                    # сдвигаем последующие прыжки левее; если запас слишком большой —
-                    # понемногу откатываем добавку.
-                    if self._last_jumped_barrier > 0:
-                        clearance = self._last_jumped_barrier - (real_x + self.width_pet)
-                        target_clearance = 34.0
-                        if clearance < target_clearance:
-                            self._adaptive_prejump_px = min(
-                                110.0,
-                                self._adaptive_prejump_px + (target_clearance - clearance) * 0.60,
-                            )
-                        elif clearance > 80.0:
-                            self._adaptive_prejump_px = max(
-                                0.0,
-                                self._adaptive_prejump_px
-                                - min(12.0, (clearance - 80.0) * 0.22),
-                            )
-
-                    # Оцениваем задержку отправка->сервер и сглаживаем её.
-                    if self._last_fire_local_ms > 0:
-                        ack_local_ms = time.time() * 1000
-                        sample = max(0.0, ack_local_ms - self._last_fire_local_ms)
-                        if self._tx_latency_ms <= 0:
-                            self._tx_latency_ms = sample
-                        else:
-                            self._tx_latency_ms = self._tx_latency_ms * 0.75 + sample * 0.25
-
-                    logger.info(
-                        f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} spx={arc_spx:.4f} "
-                        f"adapt_pre={self._adaptive_prejump_px:.1f}px "
-                        f"txLag≈{self._tx_latency_ms:.0f}ms"
-                    )
-                    self._schedule_next_jump(
-                        from_x=real_x, speed=arc_spx, anchor_srv_time=anchor
-                    )
-                else:
-                    self._schedule_next_jump(
-                        from_x=real_x, speed=self.current_speed_x, anchor_srv_time=anchor
-                    )
+                # Калибруем game_started_at по реальной позиции
+                if self.current_speed_x > 0:
+                    ticks = (real_x - 118.0) / self.current_speed_x
+                    self.game_started_at = time.time() * 1000 - ticks * 10
+                logger.info(
+                    f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} spx={self.current_speed_x:.4f}"
+                )
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
-            # Retry только если пет ПРИЗЕМЛИЛСЯ (speed.y ≈ 0) до барьера
-            if abs(speed_y) < 0.5 and real_x is not None and self.barriers:
-                pet_front = real_x + self.width_pet
-                current_barrier = next(
-                    (b for b in self.barriers if b["x"] > real_x), None
-                )
-                if current_barrier and pet_front < current_barrier["x"]:
-                    jump_soon = (
-                        self._next_jump_fire_local_ms > 0
-                        and self._next_jump_fire_local_ms - now_local_ms <= JUMP_RETRY_COOLDOWN_MS
-                    )
-                    recently_sent = (
-                        self._last_fire_local_ms > 0
-                        and now_local_ms - self._last_fire_local_ms < JUMP_RETRY_COOLDOWN_MS
-                    )
-                    if jump_soon or recently_sent:
-                        logger.info(
-                            f"[{self.game_id}] skip noisy RETRY barrier={current_barrier['x']} "
-                            f"jump_soon={jump_soon} recently_sent={recently_sent}"
-                        )
-                        self.last_update = data.get("lastUpdate", self.last_update)
-                        return
-                    logger.info(
-                        f"[{self.game_id}] Приземлился до барьера {current_barrier['x']} "
-                        f"(x={real_x:.0f}) — повторный прыжок!"
-                    )
-                    self._last_jumped_barrier = current_barrier["x"] - 1
-                    now_srv = int(time.time() * 1000 + self.server_time_offset)
-                    payload = {
-                        "clickPosition": {"x": self.click_x, "y": self.click_y},
-                        "jumpedAt": now_srv,
-                    }
-                    evt = "engine.jump" if self.mode == "race" else "engine.dive"
-                    self._client.emit_with_null(evt, payload)
-                    self._last_fire_local_ms = now_local_ms
-                    self._last_jumped_barrier = current_barrier["x"]
-                    self.pet_status = "jumping"
-                    logger.info(f"[{self.game_id}] ⚡ RETRY jumpedAt={now_srv} barrier={current_barrier['x']}")
-
-            # Автосброс статуса через 1.2с
+            # Автосброс статуса — ai_loop сам обнаружит когда можно прыгать снова
             def reset_after_jump():
                 time.sleep(1.2)
                 if self.pet_status == "jumping":
@@ -1207,6 +761,9 @@ class GameSession:
         client.on("engine.dive",            on_dive)
         client.on("engine.emerge",          on_emerge)
         client.on("engine.jump",            on_jump)
+
+        # Запускаем polling loop (порт raceBot.ts)
+        threading.Thread(target=self._ai_loop, daemon=True).start()
 
         ws_thread = client.connect()
 
