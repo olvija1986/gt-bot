@@ -823,19 +823,28 @@ def webhook():
 # ================= Start =================
 log("Бот запускается…")
 
-try:
-    wh = requests.get(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}",
-        timeout=10
-    )
-    log(f"Webhook set: {wh.text}")
-except Exception as e:
-    log(f"Ошибка установки webhook: {e}")
+def startup():
+    """Вся инициализация в фоне — gunicorn не ждёт."""
+    # Ждём сеть (Railway cold start — сеть поднимается через 5-30 секунд)
+    for attempt in range(20):
+        try:
+            wh = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}",
+                timeout=10
+            )
+            log(f"Webhook set: {wh.text}")
+            break
+        except Exception as e:
+            log(f"Попытка {attempt+1}/20 webhook: {e}")
+            time.sleep(5)
+    else:
+        log("Webhook не удалось установить после 20 попыток, продолжаем без него")
 
-set_bot_commands()
+    set_bot_commands()
+    start_initial_cycle()
+    scheduler_thread()   # блокирует — должен быть последним
 
-Thread(target=start_initial_cycle, daemon=True).start()
-Thread(target=scheduler_thread, daemon=True).start()
+Thread(target=startup, daemon=False).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
