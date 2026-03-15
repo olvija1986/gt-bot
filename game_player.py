@@ -514,7 +514,14 @@ class GameSession:
         # Ищем следующий барьер:
         # - если пет приземлится ПОСЛЕ _last_jumped_barrier → он его уже перелетел, ищем дальше
         # - если пет приземлится ДО _last_jumped_barrier → он ещё не перелетел, нужен этот барьер
-        if landing_x > self._last_jumped_barrier:
+        # Если предыдущий прыжок не дал фактического пролёта барьера,
+        # нельзя «перескакивать» его в планировщике только потому,
+        # что теоретический landing_x оказался правее.
+        # Пока морда пета реально до last_jumped_barrier — перецеливаемся
+        # в этот же барьер и не сдвигаем расписание дальше.
+        if self._last_jumped_barrier > 0 and pet_front + 5.0 < self._last_jumped_barrier:
+            search_from = pet_front
+        elif landing_x > self._last_jumped_barrier:
             # Барьер _last_jumped_barrier уже будет пройден — ищем после приземления
             search_from = max(pet_front, landing_x)
         else:
@@ -548,10 +555,13 @@ class GameSession:
         # чем упереться в барьер на нестабильной задержке.
         # После первого прыжка сервер нередко ускоряет горизонтальный ход пета,
         # поэтому для следующих барьеров нужен более ранний триггер.
-        reaction_ticks = 16.0  # ~160ms input+server+джиттер
-        safety_margin_px = 72.0
-        min_gap_px = 195.0
-        max_gap_px = 255.0
+        # Первый прыжок чаще всего «чувствительный»: позиция ещё не подхвачена
+        # реальными jump/sync-данными, поэтому делаем его чуть позже.
+        is_first_jump = anchor_srv_time <= 0 or from_x <= 120.0
+        reaction_ticks = 12.0 if is_first_jump else 16.0   # ~120/160ms
+        safety_margin_px = 52.0 if is_first_jump else 72.0
+        min_gap_px = 168.0 if is_first_jump else 195.0
+        max_gap_px = 228.0 if is_first_jump else 255.0
         safe_gap = ideal_dist + speed * reaction_ticks + safety_margin_px
         safe_gap = max(min_gap_px, min(max_gap_px, safe_gap))
 
@@ -561,7 +571,7 @@ class GameSession:
         # jumpedAt: вычисляем через реальную скорость движения пета
         # arc_spx (speed.x из engine.jump) ≈ 85-88% от скорости бега
         # Корректируем *1.18 чтобы пет оказался точно в target_x в момент прыжка
-        SPEED_CORRECTION = 1.28
+        SPEED_CORRECTION = 1.18 if is_first_jump else 1.28
         if anchor_srv_time > 0 and from_x > 118:
             # После первого прыжка — якорный метод с коррекцией
             effective_speed = speed * SPEED_CORRECTION
