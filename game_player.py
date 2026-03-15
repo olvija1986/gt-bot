@@ -510,6 +510,7 @@ class GameSession:
         self._jump_timers       = []    # список Timer объектов
         self._last_jumped_barrier = 0.0  # x барьера для которого уже запланирован/выполнен прыжок
         self._last_sent_jumped_at = 0.0   # jumpedAt который мы отправили последним
+        self._adaptive_prejump_px = 0.0   # авто-подстройка раннего старта прыжка
         self._prev_confirmed_x   = 0.0   # x предыдущего подтверждённого прыжка
         self._prev_confirmed_at  = 0.0   # jumpedAt предыдущего подтверждённого прыжка
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
@@ -635,6 +636,9 @@ class GameSession:
 
         # Пользовательская тонкая настройка: ранний старт в пикселях.
         PRE_JUMP_OFFSET += max(0.0, JUMP_EARLY_EXTRA_PX)
+        # Авто-подстройка: если подтверждения прыжка приходят слишком поздно,
+        # постепенно увеличиваем ранний старт в on_jump.
+        PRE_JUMP_OFFSET += max(0.0, self._adaptive_prejump_px)
 
         target_x = next_b["x"] - ideal_dist - self.width_pet - BUFFER - PRE_JUMP_OFFSET
         target_x = max(target_x, from_x + speed)
@@ -937,8 +941,28 @@ class GameSession:
 
                 if arc_spx > 0.5:
                     self.current_speed_x = arc_spx
+
+                    # Адаптивная коррекция pre-jump:
+                    # если подтверждённый x уже почти на барьере (или после него),
+                    # сдвигаем последующие прыжки левее; если запас слишком большой —
+                    # понемногу откатываем добавку.
+                    if self._last_jumped_barrier > 0:
+                        clearance = self._last_jumped_barrier - (real_x + self.width_pet)
+                        if clearance < 8.0:
+                            self._adaptive_prejump_px = min(
+                                110.0,
+                                self._adaptive_prejump_px + (8.0 - clearance) * 0.55,
+                            )
+                        elif clearance > 72.0:
+                            self._adaptive_prejump_px = max(
+                                0.0,
+                                self._adaptive_prejump_px
+                                - min(10.0, (clearance - 72.0) * 0.2),
+                            )
+
                     logger.info(
-                        f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} spx={arc_spx:.4f}"
+                        f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} spx={arc_spx:.4f} "
+                        f"adapt_pre={self._adaptive_prejump_px:.1f}px"
                     )
                     self._schedule_next_jump(
                         from_x=real_x, speed=arc_spx, anchor_srv_time=anchor
