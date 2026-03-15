@@ -521,9 +521,9 @@ class GameSession:
         # SAFE_GAP: целевая дистанция (в px) до барьера в момент отправки прыжка.
         # Должна быть «перед барьером», но с запасом на сетевую/серверную задержку.
         # Держим её адаптивной от текущей скорости, чтобы не упираться в барьер на быстрых петах.
-        reaction_ticks = 8.0   # ~80ms суммарной задержки input+server
-        safety_margin_px = 28.0
-        min_gap_px = 95.0
+        reaction_ticks = 8.8   # ~88ms суммарной задержки input+server
+        safety_margin_px = 30.0
+        min_gap_px = 108.0
         max_gap_px = 175.0
         safe_gap = ideal_dist + speed * reaction_ticks + safety_margin_px
         safe_gap = max(min_gap_px, min(max_gap_px, safe_gap))
