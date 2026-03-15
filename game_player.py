@@ -365,13 +365,20 @@ def _estimate_running_speed_px_tick(chars: dict) -> tuple[float, str, int]:
     speed_stat = strength if strength > 0 else agility
 
     # Квадратичная аппроксимация скорости (px/tick) на диапазоне 0..100.
-    speed = 0.000624 * speed_stat**2 - 0.016927 * speed_stat + 1.754893
+    # Повышаем базовую скорость на 5% для лучшего совпадения с серверной физикой
+    speed = (0.000624 * speed_stat**2 - 0.016927 * speed_stat + 1.754893) * 1.05
     return max(0.5, speed), speed_source, speed_stat
 
 
 def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity: float = 1.5) -> float:
-    """Симулирует физику прыжка и возвращает x где пет приземлится."""
+    """Симулирует физику прыжка и возвращает x где пет приземлится.
+    
+    Улучшенная версия: учитываем, что arc_spx (горизонтальная скорость в воздухе)
+    примерно на 15-20% ниже скорости бега из-за физики прыжка.
+    """
     y, sy = 0.0, jump_power
+    # Корректируем скорость в воздухе — она ниже скорости бега
+    arc_speed = speed_x * 0.85
     x = float(start_x)
     for _ in range(500):
         sy -= 0.6
@@ -384,7 +391,7 @@ def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity
             y = max(0.0, y - gravity)
             if y <= 0:
                 return x
-        x += speed_x
+        x += arc_speed
     return x
 
 
@@ -569,10 +576,11 @@ class GameSession:
         # Первый прыжок чаще всего «чувствительный»: позиция ещё не подхвачена
         # реальными jump/sync-данными, поэтому делаем его чуть позже.
         is_first_jump = anchor_srv_time <= 0 or from_x <= 120.0
-        reaction_ticks = 12.0 if is_first_jump else 16.0   # ~120/160ms
-        safety_margin_px = 52.0 if is_first_jump else 72.0
-        min_gap_px = 168.0 if is_first_jump else 195.0
-        max_gap_px = 228.0 if is_first_jump else 255.0
+        # Унифицировали параметры для большей стабильности
+        reaction_ticks = 14.0   # ~140ms (усреднили 12-16)
+        safety_margin_px = 62.0  # ~60px (немного меньше для лучшей точности)
+        min_gap_px = 180.0      # минимальный зазор перед прыжком
+        max_gap_px = 240.0      # максимальный зазор перед прыжком
         safe_gap = ideal_dist + speed * reaction_ticks + safety_margin_px
         safe_gap = max(min_gap_px, min(max_gap_px, safe_gap))
 
@@ -580,9 +588,19 @@ class GameSession:
         target_x = max(target_x, from_x + speed)
 
         # jumpedAt: вычисляем через реальную скорость движения пета
-        # arc_spx (speed.x из engine.jump) ≈ 85-88% от скорости бега
-        # Корректируем *1.18 чтобы пет оказался точно в target_x в момент прыжка
-        SPEED_CORRECTION = 1.18 if is_first_jump else 1.28
+        # arc_spx (speed.x из engine.jump) ≈ 85% от скорости бега
+        # Корректируем меньше — агрессивная коррекция привела к частым ранним прыжкам
+        SPEED_CORRECTION = 1.10 if is_first_jump else 1.12
+        
+        # Применяем калибровку лага если она доступна
+        lag_correction = 1.0
+        if self.lag_px > 0:
+            # Если мы обычно отстаём на lag_px, то нужно начинать прыжок чуть раньше
+            lag_correction = 1.0 + (self.lag_px / max(speed, 1.0)) * 0.05
+            lag_correction = min(1.15, lag_correction)  # не более 15% коррекции лага
+        
+        SPEED_CORRECTION *= lag_correction
+        
         if anchor_srv_time > 0 and from_x > 118:
             # После первого прыжка — якорный метод с коррекцией
             effective_speed = speed * SPEED_CORRECTION
@@ -653,8 +671,10 @@ class GameSession:
             desired_jump_dist = ideal_dist + speed_now * reaction_ticks + safety_margin_px
             desired_jump_dist = max(min_gap_px, min(max_gap_px, desired_jump_dist))
 
-            # Коридор принятия решения: чуть «раньше» цели, но без излишнего раннего прыжка.
-            tolerance = 3.0
+            # Коридор принятия решения: небольшой допуск на колебания позиции.
+            # Слишком маленький допуск приводит к частым переносам таймера (wobbling).
+            tolerance = 8.0  # увеличили с 3.0 для меньшей чувствительности
+            
             # Если уже слишком близко к барьеру — шлём немедленно.
             # Порог поднят, чтобы уменьшить случаи «упирания» перед прыжком.
             min_jump_dist = 155.0
@@ -667,10 +687,12 @@ class GameSession:
                     f"barrier={bx}, fire immediately"
                 )
 
+            # Проверяем рано ли мы (далеко от барьера)
+            # Увеличили множитель на 0.005 для меньшей агрессивности переносов
             if distance_to_barrier > desired_jump_dist + tolerance and speed_now > 0:
                 extra_ticks = (distance_to_barrier - (desired_jump_dist + tolerance)) / speed_now
-                # Маленькие шаги перепроверки не дают перескочить окно прыжка.
-                extra_delay_s = min(0.08, max(0.012, extra_ticks * 0.01))
+                # Минимальная задержка 15ms для экономии CPU, максимальная 100ms
+                extra_delay_s = min(0.100, max(0.015, extra_ticks * 0.008))
                 logger.info(
                     f"[{self.game_id}] EARLY jump guard: dist={distance_to_barrier:.1f}px "
                     f"target={desired_jump_dist:.1f}px barrier={bx}, postpone {extra_delay_s*1000:.0f}ms"
@@ -994,6 +1016,31 @@ class GameSession:
                 running_spx = self._running_speed_from_jump(real_x, int(anchor), ground_x=anchor_x)
                 if running_spx > 0.5:
                     self.current_speed_x = running_spx
+                
+                # Калибровка лага: сравниваем ожидаемую позицию с реальной
+                # Это помогает улучшить точность прыжков на нестабильных сетях
+                if matched_jump is not None and self.physics_start_at > 0:
+                    sent_at, sent_target_x, _ = matched_jump
+                    # Сколько тиков прошло с отправки и до подтверждения
+                    time_delta = int(anchor) - int(sent_at)
+                    if time_delta >= 0:
+                        # Насколько реальная позиция отличается от ожидаемой
+                        position_error = real_x - sent_target_x
+                        # Сохраняем последние N отсчётов для усреднения
+                        if not hasattr(self, '_lag_samples'):
+                            self._lag_samples = []
+                        self._lag_samples.append(position_error)
+                        # Держим последние 5 отсчётов
+                        if len(self._lag_samples) > 5:
+                            self._lag_samples.pop(0)
+                        # Вычисляем усреднённый lag
+                        avg_lag = sum(self._lag_samples) / len(self._lag_samples)
+                        self.lag_px = max(0.0, avg_lag)  # lag не может быть отрицательным
+                        if len(self._lag_samples) > 2:  # начинаем применять после 3-го прыжка
+                            logger.info(
+                                f"[{self.game_id}] lag calibration: error={position_error:.1f}px "
+                                f"avg_lag={avg_lag:.1f}px samples={len(self._lag_samples)}"
+                            )
 
                 logger.info(
                     f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
