@@ -323,6 +323,29 @@ class WaitroomSession:
 # ══════════════════════════════════════════════════════════
 #  ШАГ 2: GameSession — играем
 # ══════════════════════════════════════════════════════════
+# Таблица скоростей: (agility, px/ms) — измерено из реального трафика
+_SPEED_TABLE = [
+    (10,  0.165),
+    (53,  0.261),
+    (77,  0.415),
+    (100, 0.540),  # экстраполяция
+]
+
+def _agility_to_speed_per_ms(agility: int) -> float:
+    """Интерполирует скорость px/ms по agility из таблицы реальных измерений."""
+    xs = [x for x, _ in _SPEED_TABLE]
+    ys = [y for _, y in _SPEED_TABLE]
+    if agility <= xs[0]:
+        return ys[0]
+    if agility >= xs[-1]:
+        return ys[-1]
+    for i in range(len(xs) - 1):
+        if xs[i] <= agility <= xs[i+1]:
+            t = (agility - xs[i]) / (xs[i+1] - xs[i])
+            return ys[i] + t * (ys[i+1] - ys[i])
+    return ys[-1]
+
+
 class GameSession:
     def __init__(self, game_id: str, lobby_url: str, mode: str, user_id: int, on_finish=None):
         self.game_id   = game_id
@@ -334,29 +357,27 @@ class GameSession:
         # Стейт пета
         self.pet_id        = None
         self.pet_row       = None
-        self.pet_x         = 0.0
+        self.pet_x         = 118.0   # стартовая позиция
         self.pet_y         = 0.0
         self.pet_status    = "running"
-        self.speed_x       = 1.6   # реальная скорость из логов (~1.6)
-        # Координата клика — из реального трафика (центр игрового поля)
-        self.click_x       = 673.9921875
-        self.click_y       = 346.53125
-        self.speed_y       = 0.0
-        self.jump_power    = 12.0
+        # currentSpeed — обновляется из engine.sync и engine.jump событий
+        self.current_speed_x  = 0.0   # px/tick (не px/ms!)
+        self.current_speed_y  = 0.0
+        # Физические параметры пета — берём из engine.user.connected
+        self.jump_power    = 20.0    # дефолт, перезапишется из pet.info
+        self.dive_power    = 10.0    # для swim
         self.gravity       = 1.5
         self.width_pet     = 40
-        self.width_barrier = 30
+        self.width_barrier = 30      # raceBarrier / poolBarrier
+        # Клик координата из реального трафика
+        self.click_x       = 673.9921875
+        self.click_y       = 346.53125
 
         self.barriers          = []
         self._all_barriers_raw = []
         self.last_update   = 0
         self.started       = False
-        self.game_started_at = None  # timestamp (ms) когда игра началась
-        # Средняя скорость px/ms из реального трафика:
-        # бот с agility=77 проходит ~600px за ~1сек = 0.6px/ms
-        # бот с agility=86 проходит ~600px за ~0.8сек = 0.75px/ms  
-        # наш пет agility~53 → примерно 0.45px/ms
-        self.speed_per_ms  = 3.026 / 16  # дефолт для agility=53
+        self.game_started_at = None
         self.result        = None
         self._done         = threading.Event()
 
@@ -386,46 +407,67 @@ class GameSession:
                         self.pet_status = "running"
             time.sleep(0.08)
 
+    def _calc_ideal_jump_distance(self) -> float:
+        """Порт RaceBot.calcIdealJumpDistance — точная формула из исходников."""
+        barrier_high = 50
+        ticks = ticks_to_reach_height(self.jump_power, self.gravity, barrier_high)
+        return self.current_speed_x * (ticks + 2)
+
+    def _calc_ideal_dive_distance(self, barrier_high: float = 50) -> float:
+        """Порт SwimBot.calcIdealDiveDistance."""
+        ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
+        return self.current_speed_x * (ticks + 2)
+
     def _should_act(self, mode: str) -> bool:
-        # Не действуем если уже в действии
+        """Порт RaceBot.tickBot / SwimBot.tickBot логики."""
         if mode == "race" and self.pet_status == "jumping":
             return False
-        if mode == "swim" and self.pet_status in ("diving", "underwater"):
+        if mode == "swim" and self.pet_status in ("diving",):
             return False
-        if not self.barriers or not self.game_started_at:
-            return False
-
-        # pet_x не обновляется из синков — считаем позицию по времени
-        elapsed_ms = (time.time() * 1000) - self.game_started_at
-        # Реальная скорость ботов ~4-7 px/tick, тик ~16ms → ~4px/ms на старте
-        # Используем среднее из реального трафика
-        estimated_x = 118 + elapsed_ms * self.speed_per_ms
-        pet_front = estimated_x + self.width_pet
-
-        next_b = next(
-            (b for b in self.barriers if b["x"] + self.width_barrier > pet_front),
-            None
-        )
-        if not next_b:
+        if not self.barriers:
             return False
 
+        # Позиция пета — считаем по времени если нет обновлений из синка
+        if self.game_started_at:
+            elapsed_ms = (time.time() * 1000) - self.game_started_at
+            # Используем current_speed_x (px/tick) * тиков прошло
+            # 1 тик ≈ 16ms
+            ticks_elapsed = elapsed_ms / 16.0
+            self.pet_x = 118.0 + self.current_speed_x * ticks_elapsed
+
+        pet_front = self.pet_x + self.width_pet
+
+        # Чистим пройденные барьеры
+        self.barriers = [b for b in self.barriers if b["x"] + self.width_barrier > pet_front]
+        if not self.barriers:
+            return False
+
+        next_b = self.barriers[0]
         dist = next_b["x"] - pet_front
-        if dist < 0:
-            # Уже прошли барьер — убираем его из списка
-            self.barriers = [b for b in self.barriers if b["x"] + self.width_barrier > pet_front]
+
+        if dist <= 0:
             return False
 
-        # trigger = speed_px_per_tick * 20 тиков запаса
-        # Из реального трафика: Foxy(agi=53) прыгал при dist=52-80px
-        # speed_px_per_tick = agility * 0.032 + 1.33
-        speed_px_per_tick = self.speed_per_ms * 16
-        trigger = speed_px_per_tick * 20   # ~320ms запас до барьера
+        # Точная формула из RaceBot/SwimBot исходников:
+        # idealDist = currentSpeed.x * (ticks + 2)
+        # intelligence = 1.0 (идеальная реакция)
+        if mode == "race":
+            ideal_dist = self._calc_ideal_jump_distance()
+        else:
+            ideal_dist = self._calc_ideal_dive_distance(next_b.get("high", 50))
 
-        logger.info(f"[{self.game_id}] CHECK est_x={estimated_x:.0f} dist={dist:.0f} "
-                    f"trigger={trigger} barrier_x={next_b['x']} elapsed={elapsed_ms:.0f}ms "
-                    f"status={self.pet_status}")
+        # Из реального трафика живых игроков: прыгают за ~40 тиков до барьера
+        # (измерено: dist=92px при speed=2.61px/tick → 35 тиков; dist=160px → 61 тик)
+        # Среднее ~40 тиков — берём чуть больше для надёжности
+        trigger_dist = self.current_speed_x * 45  # 45 тиков = 450ms
 
-        return dist <= trigger
+        logger.info(
+            f"[{self.game_id}] CHECK pet_x={self.pet_x:.0f} dist={dist:.0f} "
+            f"trigger={trigger_dist:.1f} barrier_x={next_b['x']} "
+            f"spx={self.current_speed_x:.3f} status={self.pet_status}"
+        )
+
+        return dist <= trigger_dist
 
     def _make_action_payload(self) -> dict:
         """
@@ -460,18 +502,32 @@ class GameSession:
             info = pet_wrap.get("info", {})
             self.pet_id  = str(info.get("_id", ""))
             self.pet_row = pet_wrap.get("row")
-            # Формула из реального трафика:
-            # speed_px_per_tick = agility * 0.032 + 1.33
-            # tick = 16ms → speed_px_per_ms = speed_px_per_tick / 16
-            # Проверено: agi=10→1.650, agi=53→3.026, agi=77≈3.8 px/tick
+
+            # jumpPower и gravity из pet.info (если сервер их отдаёт)
+            if "jumpPower" in info:
+                self.jump_power = float(info["jumpPower"])
+            if "divePower" in info:
+                self.dive_power = float(info["divePower"])
+            if "power" in info:
+                self.gravity = float(info["power"].get("gravity", self.gravity))
+
+            # Квадратичная формула скорости из реальных измерений:
+            # (10→1.648, 53→2.610, 77→4.150 px/tick)
+            # speed = 0.000624*agi^2 - 0.016927*agi + 1.754893
             agility = info.get("chars", {}).get("agility", 53)
-            speed_px_per_tick = agility * 0.032 + 1.33
-            self.speed_per_ms = speed_px_per_tick / 16
+            self.current_speed_x = (
+                0.000624 * agility**2
+                - 0.016927 * agility
+                + 1.754893
+            )
+            self.current_speed_x = max(0.5, self.current_speed_x)
+
             logger.info(
                 f"[{self.game_id}] Наш пет: {info.get('name')} "
                 f"row={self.pet_row} agility={agility} "
-                f"speed={speed_px_per_tick:.3f}px/tick "
-                f"speed_per_ms={self.speed_per_ms:.4f}"
+                f"speed={self.current_speed_x:.3f}px/tick "
+                f"(тик=10ms → {self.current_speed_x/10:.4f}px/ms) "
+                f"jp={self.jump_power:.1f} g={self.gravity:.2f}"
             )
             # Применяем барьеры если они уже пришли до нашего connected
             if self._all_barriers_raw and self.pet_row and not self.barriers:
@@ -522,17 +578,19 @@ class GameSession:
                 if pet_wrap.get("row"):
                     self.pet_row = pet_wrap["row"]
 
-                # speed может быть внутри pet или на верхнем уровне
+                # currentSpeed из синка — это px/tick
                 speed = u.get("speed") or pet_wrap.get("speed") or {}
                 if speed.get("x") is not None:
-                    self.speed_x = speed["x"]
+                    self.current_speed_x = speed["x"]
                 if speed.get("y") is not None:
-                    self.speed_y = speed["y"]
+                    self.current_speed_y = speed["y"]
 
-                # jumpPower и gravity из pet.info
+                # jumpPower, gravity из pet.info в синке
                 info = pet_wrap.get("info", {})
                 if info.get("jumpPower"):
-                    self.jump_power = info["jumpPower"]
+                    self.jump_power = float(info["jumpPower"])
+                if info.get("power", {}).get("gravity"):
+                    self.gravity = float(info["power"]["gravity"])
 
                 status = u.get("status") or pet_wrap.get("status")
                 if status:
@@ -597,8 +655,10 @@ class GameSession:
                 self.pet_x = coords.get("x", self.pet_x)
                 self.pet_y = coords.get("y", self.pet_y)
                 speed = data.get("speed", {})
-                self.speed_x = speed.get("x", self.speed_x)
-                self.speed_y = speed.get("y", self.speed_y)
+                if speed.get("x") is not None:
+                    self.current_speed_x = speed["x"]
+                if speed.get("y") is not None:
+                    self.current_speed_y = speed["y"]
                 self.last_update = data.get("lastUpdate", self.last_update)
 
         def on_emerge(data: dict):
@@ -609,8 +669,10 @@ class GameSession:
                 self.pet_x = coords.get("x", self.pet_x)
                 self.pet_y = coords.get("y", self.pet_y)
                 speed = data.get("speed", {})
-                self.speed_x = speed.get("x", self.speed_x)
-                self.speed_y = speed.get("y", self.speed_y)
+                if speed.get("x") is not None:
+                    self.current_speed_x = speed["x"]
+                if speed.get("y") is not None:
+                    self.current_speed_y = speed["y"]
                 self.last_update = data.get("lastUpdate", self.last_update)
 
         def on_jump(data: dict):
@@ -621,8 +683,10 @@ class GameSession:
                 self.pet_x = coords.get("x", self.pet_x)
                 self.pet_y = coords.get("y", self.pet_y)
                 speed = data.get("speed", {})
-                self.speed_x = speed.get("x", self.speed_x)
-                self.speed_y = speed.get("y", self.speed_y)
+                if speed.get("x") is not None:
+                    self.current_speed_x = speed["x"]
+                if speed.get("y") is not None:
+                    self.current_speed_y = speed["y"]
                 self.last_update = data.get("lastUpdate", self.last_update)
 
         client.on("_open",                  on_open)
