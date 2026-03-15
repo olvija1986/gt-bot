@@ -681,7 +681,10 @@ class GameSession:
                 self._jump_timers.append(t2)
                 return
 
-            actual_jumped_at = int(max(srv_time, now_srv))
+            # jumpedAt должен отражать момент фактической отправки input.
+            # Если отправить jumpedAt из будущего (плановое srv_time), сервер
+            # может применить действие позже ожидаемого окна и пет упрётся в барьер.
+            actual_jumped_at = int(now_srv)
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
                 "jumpedAt": actual_jumped_at,
