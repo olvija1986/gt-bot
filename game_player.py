@@ -60,6 +60,9 @@ AI_POLL_INTERVAL_MS = 30
 # Дополнительное упреждение до идеальной точки прыжка.
 # Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
 JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "12"))
+# Насколько можно «откатывать» jumpedAt в прошлое (мс).
+# Большой откат вызывает рывки и эффект «прыжка из прошлого».
+JUMP_BACKDATE_MS = float(os.environ.get("JUMP_BACKDATE_MS", "15"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -518,6 +521,11 @@ class GameSession:
         if not barrier:
             return
 
+        # Уже прыгали под этот барьер — ждём следующий.
+        # Иначе при лаге можно спамить прыжками в один и тот же obstacle.
+        if barrier["x"] <= self._last_jumped_barrier + self.width_barrier:
+            return
+
         dist = barrier["x"] - self.pet_x
         if dist <= 0:
             return
@@ -542,7 +550,10 @@ class GameSession:
 
         if dist <= ideal_dist + poll_lag_px:
             now_srv = int(time.time() * 1000 + self.server_time_offset)
-            jumpedAt = now_srv - self._jump_latency_ms
+            # Важно: не отправляем сильно «в прошлое».
+            # Раньше тут использовался полный latency, из‑за чего пет часто
+            # прыгал рывком и «залипал» у барьера.
+            jumpedAt = now_srv - min(self._jump_latency_ms * 0.2, JUMP_BACKDATE_MS)
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
                 "jumpedAt": int(jumpedAt),
@@ -819,7 +830,9 @@ class GameSession:
         
             # автоматический возврат в running
             def reset_after_jump():
-                time.sleep(1.2)
+                # Фолбэк если не пришёл sync/status: не держим jumping слишком долго,
+                # иначе бот пропускает следующие барьеры.
+                time.sleep(0.45)
                 if self.pet_status == "jumping":
                     self.pet_status = "running"
         
