@@ -82,6 +82,50 @@ def send_telegram(text):
     tg_send_long(text)
 
 
+def build_jump_tips(agility: int = 53, barrier_high: int = 50) -> str:
+    """
+    Возвращает подсказку по таймингу прыжка для race-барьеров.
+
+    ВАЖНО: считаем скорость тем же уравнением, что и в GameSession
+    (см. on_user_connected), чтобы подсказка совпадала с реальной гонкой,
+    включая петов с agility > 100.
+    """
+    from game_player import ticks_to_reach_height
+
+    agility = max(1, min(300, int(agility)))
+    barrier_high = max(10, min(120, int(barrier_high)))
+
+    # Та же формула, что в game_player.py (on_user_connected):
+    # speed(px/tick) = 0.000624*agi^2 - 0.016927*agi + 1.754893
+    speed_px_tick = (
+        0.000624 * agility**2
+        - 0.016927 * agility
+        + 1.754893
+    )
+    speed_px_tick = max(0.5, speed_px_tick)
+    speed_px_ms = speed_px_tick / 10
+
+    ticks = ticks_to_reach_height(jump_power=14.0, gravity=1.5, target_height=barrier_high)
+
+    ideal_dist = speed_px_tick * (ticks + 2)
+    safe_early = ideal_dist + speed_px_tick * 4
+    too_early = max(0.0, ideal_dist - speed_px_tick * 8)
+
+    return (
+        "🧠 Как прыгать без касаний барьера:\n"
+        "1) Держи запас и прыгай чуть раньше идеальной точки (на ~2–4 тика).\n"
+        "2) Не спамь прыжок в один барьер — это часто даёт запинание.\n"
+        "3) Чем выше agility, тем раньше нужно жать прыжок.\n\n"
+        f"Твой пример (agility={agility}, высота барьера={barrier_high}):\n"
+        f"• Скорость ≈ {speed_px_tick:.2f} px/тик ({speed_px_ms:.3f} px/мс)\n"
+        f"• Тиков до высоты: {ticks}\n"
+        f"• Идеальная дистанция прыжка: ~{ideal_dist:.1f} px\n"
+        f"• Безопасно нажимать в диапазоне: {too_early:.1f}–{safe_early:.1f} px до барьера\n\n"
+        "Формат команды: /jumpcalc <agility> <height>\n"
+        "Пример: /jumpcalc 122 60"
+    )
+
+
 # ================= AutoPlayer состояние =================
 _auto_player = None
 _forced_pet_id = None
@@ -592,6 +636,7 @@ def set_bot_commands():
         {"command": "clearpet",   "description": "Сбросить пета (авто)"},
         {"command": "box",        "description": "Открыть боксы"},
         {"command": "essence",    "description": "Применить эссенции"},
+        {"command": "jumpcalc",   "description": "Подсказка по прыжкам /jumpcalc 77 60"},
     ]
     try:
         resp = requests.post(url, json={"commands": commands}, timeout=10)
@@ -816,6 +861,27 @@ def webhook():
     elif text.startswith("/box"):
         Thread(target=open_boxes, daemon=True).start()
         send_telegram("📦 Открываю боксы…")
+
+    elif text.startswith("/jumpcalc"):
+        parts = text.strip().split()
+        agility = 53
+        height = 50
+        if len(parts) >= 2:
+            try:
+                agility = int(parts[1])
+            except ValueError:
+                send_telegram("⚠️ Неверный agility. Пример: /jumpcalc 77 60")
+                return "ok"
+        if len(parts) >= 3:
+            try:
+                height = int(parts[2])
+            except ValueError:
+                send_telegram("⚠️ Неверная высота барьера. Пример: /jumpcalc 77 60")
+                return "ok"
+        send_telegram(build_jump_tips(agility=agility, barrier_high=height))
+
+    elif "прыж" in text.lower() and "барьер" in text.lower():
+        send_telegram(build_jump_tips())
 
     return "ok"
 
