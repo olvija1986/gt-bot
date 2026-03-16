@@ -63,6 +63,8 @@ JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "12"))
 # Насколько можно «откатывать» jumpedAt в прошлое (мс).
 # Большой откат вызывает рывки и эффект «прыжка из прошлого».
 JUMP_BACKDATE_MS = float(os.environ.get("JUMP_BACKDATE_MS", "15"))
+JUMP_CONFIRM_TIMEOUT_MS = float(os.environ.get("JUMP_CONFIRM_TIMEOUT_MS", "180"))
+JUMP_MAX_RETRIES = int(os.environ.get("JUMP_MAX_RETRIES", "1"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -430,6 +432,9 @@ class GameSession:
         self._last_jumped_barrier = 0.0  # x барьера для которого уже запланирован/выполнен прыжок
         self._last_sent_jumped_at = 0.0   # jumpedAt который мы отправили последним
         self._jump_latency_ms     = 150.0 # EWMA задержки send→server подтверждения
+        self._jump_jitter_ms      = 0.0   # EWMA джиттера offset serverTime
+        self._prev_server_offset  = None
+        self._pending_jump        = None  # {barrier_x, sent_at_srv, attempts}
         self._prev_confirmed_x   = 0.0   # x предыдущего подтверждённого прыжка
         self._prev_confirmed_at  = 0.0   # jumpedAt предыдущего подтверждённого прыжка
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
@@ -521,10 +526,21 @@ class GameSession:
         if not barrier:
             return
 
-        # Уже прыгали под этот барьер — ждём следующий.
+        # Уже прыгали/прыгаем под этот барьер — ждём следующий.
         # Иначе при лаге можно спамить прыжками в один и тот же obstacle.
         if barrier["x"] <= self._last_jumped_barrier + self.width_barrier:
             return
+
+        # Если есть jump в полёте по этому же барьеру, даём серверу время
+        # подтвердить, затем при необходимости делаем 1 аккуратный ретрай.
+        if self._pending_jump and abs(self._pending_jump["barrier_x"] - barrier["x"]) <= self.width_barrier:
+            now_srv = self._now_server_ms()
+            age_ms = now_srv - self._pending_jump["sent_at_srv"]
+            if age_ms < JUMP_CONFIRM_TIMEOUT_MS:
+                return
+            if self._pending_jump["attempts"] > JUMP_MAX_RETRIES:
+                self._pending_jump = None
+                return
 
         dist = barrier["x"] - self.pet_x
         if dist <= 0:
@@ -544,6 +560,7 @@ class GameSession:
         lag_ticks = (
             AI_POLL_INTERVAL_MS / 10.0
             + self._jump_latency_ms / 10.0
+            + self._jump_jitter_ms / 10.0
             + JUMP_LEAD_TICKS
         )
         poll_lag_px = self.current_speed_x * lag_ticks
@@ -561,12 +578,21 @@ class GameSession:
             event = "engine.jump" if self.mode == "race" else "engine.dive"
             self._client.emit_with_null(event, payload)
             self.pet_status = "jumping"
-            self._last_jumped_barrier = barrier["x"]
             self._last_sent_jumped_at = jumpedAt
+            if self._pending_jump and abs(self._pending_jump["barrier_x"] - barrier["x"]) <= self.width_barrier:
+                self._pending_jump["attempts"] += 1
+                self._pending_jump["sent_at_srv"] = now_srv
+            else:
+                self._pending_jump = {
+                    "barrier_x": barrier["x"],
+                    "sent_at_srv": now_srv,
+                    "attempts": 1,
+                }
             logger.info(
                 f"[{self.game_id}] ⏱ JUMP barrier={barrier['x']} "
                 f"dist={dist:.1f} ideal={ideal_dist:.1f} lag={poll_lag_px:.1f} "
-                f"spx={self.current_speed_x:.3f}"
+                f"spx={self.current_speed_x:.3f} "
+                f"attempt={self._pending_jump['attempts']}"
             )
 
     def _make_action_payload(self) -> dict:
@@ -701,7 +727,12 @@ class GameSession:
             server_time_sync = data.get("serverTime", 0)
             if server_time_sync:
                 local_now_ms = time.time() * 1000
-                self.server_time_offset = server_time_sync - local_now_ms
+                new_offset = server_time_sync - local_now_ms
+                if self._prev_server_offset is not None:
+                    delta = abs(new_offset - self._prev_server_offset)
+                    self._jump_jitter_ms = self._jump_jitter_ms * 0.7 + delta * 0.3
+                self._prev_server_offset = new_offset
+                self.server_time_offset = new_offset
                 if found:
                     self._anchor_server_time = server_time_sync
 
@@ -789,10 +820,16 @@ class GameSession:
             """engine.jump — сервер подтвердил прыжок, обновляем состояние."""
             if data.get("userId") != self.user_id:
                 return
-        
+
             self.pet_status = "jumping"
+            pending = self._pending_jump
+            self._pending_jump = None
             coords = data.get("coordinates", {})
             real_x = coords.get("x")
+            if pending:
+                self._last_jumped_barrier = max(self._last_jumped_barrier, pending["barrier_x"])
+            elif real_x is not None:
+                self._last_jumped_barrier = max(self._last_jumped_barrier, real_x)
         
             speed_data = data.get("speed", {}) or {}
             arc_spx = speed_data.get("x", 0)
