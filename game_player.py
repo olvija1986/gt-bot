@@ -60,9 +60,6 @@ AI_POLL_INTERVAL_MS = 80
 # Дополнительное упреждение до идеальной точки прыжка.
 # Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
 JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "14"))
-# Референсная скорость (px/tick) при которой калибровался JUMP_LEAD_TICKS.
-# agility ~53 → speed ~2.6 px/tick
-JUMP_LEAD_REF_SPEED = float(os.environ.get("JUMP_LEAD_REF_SPEED", "2.6"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -446,16 +443,21 @@ class GameSession:
         """
         Предсказывает x по последней опорной точке (x, serverTime).
 
-        Это точнее, чем "локальный game_started_at", т.к. не накапливает
-        сетевую задержку момента получения engine.game.started.
+        server_time_offset вычисляется при получении сообщения, поэтому
+        отстаёт от реального серверного времени на одностороннюю задержку
+        (≈ RTT/2). Добавляем коррекцию вперёд, чтобы не занижать позицию.
         """
+        # Коррекция на одностороннюю сетевую задержку (половина RTT)
+        half_rtt_ticks = self._jump_latency_ms / 20.0  # RTT/2, в тиках (10ms)
+        forward_px = self.current_speed_x * half_rtt_ticks
+
         if self._anchor_server_time > 0 and self.current_speed_x > 0:
             dt_ticks = max(0.0, (self._now_server_ms() - self._anchor_server_time) / 10.0)
-            return self._anchor_x + self.current_speed_x * dt_ticks
+            return self._anchor_x + self.current_speed_x * dt_ticks + forward_px
 
         if self.game_started_at and self.current_speed_x > 0:
             elapsed_ms = time.time() * 1000 - self.game_started_at
-            return 118.0 + self.current_speed_x * (elapsed_ms / 10.0)
+            return 118.0 + self.current_speed_x * (elapsed_ms / 10.0) + forward_px
 
         return self.pet_x
 
@@ -535,19 +537,22 @@ class GameSession:
             ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
         ideal_dist = self.current_speed_x * (ticks + 2)
 
-        # Запас на polling lag + реальную задержку до подтверждения + доп. упреждение.
-        # Упреждение масштабируется по скорости: чем медленнее пет, тем меньше
-        # запас (прыгаем ближе к барьеру), чем быстрее — тем больше.
-        speed_ratio = self.current_speed_x / JUMP_LEAD_REF_SPEED if JUMP_LEAD_REF_SPEED > 0 else 1.0
-        scaled_lead = JUMP_LEAD_TICKS * speed_ratio
+        # Запас на polling lag + сетевую задержку + упреждение.
+        # _estimate_pet_x уже компенсирует half-RTT в позиции, но lag_ticks
+        # должен покрыть задержку отправки (half-RTT) + poll interval + запас.
         lag_ticks = (
             AI_POLL_INTERVAL_MS / 10.0
             + self._jump_latency_ms / 10.0
-            + scaled_lead
+            + JUMP_LEAD_TICKS
         )
         poll_lag_px = self.current_speed_x * lag_ticks
 
-        if dist <= ideal_dist + poll_lag_px:
+        # Минимальная безопасная дистанция: пет должен стартовать прыжок
+        # не ближе чем ширина барьера + ширина пета, иначе врежется.
+        min_safe_px = float(self.width_barrier + self.width_pet)
+        trigger_dist = max(ideal_dist + poll_lag_px, min_safe_px)
+
+        if dist <= trigger_dist:
             now_srv = int(time.time() * 1000 + self.server_time_offset)
             payload = {
                 "clickPosition": {"x": self.click_x, "y": self.click_y},
@@ -561,7 +566,7 @@ class GameSession:
             logger.info(
                 f"[{self.game_id}] ⏱ JUMP barrier={barrier['x']} "
                 f"dist={dist:.1f} ideal={ideal_dist:.1f} lag={poll_lag_px:.1f} "
-                f"spx={self.current_speed_x:.3f} lead={scaled_lead:.1f}"
+                f"trigger={trigger_dist:.1f} spx={self.current_speed_x:.3f}"
             )
 
     def _make_action_payload(self) -> dict:
