@@ -107,6 +107,20 @@ def ticks_to_reach_height(jump_power: float, gravity: float, target_height: floa
     return 200
 
 
+def remaining_arc_ticks(y: float, speed_y: float, gravity: float = 1.5) -> int:
+    """Сколько тиков до приземления из текущей точки дуги (y, speed_y)."""
+    for tick in range(1, 500):
+        speed_y -= 0.6
+        if speed_y < 0:
+            speed_y = 0.0
+        y += speed_y
+        if y - gravity > 0:
+            y -= gravity
+        else:
+            return tick
+    return 500
+
+
 def ticks_to_reach_depth(dive_power: float, target_depth: float) -> int:
     """Порт physics.ts::ticksToReachDepth — для нырка (swim)."""
     depth, speed_y = 0.0, dive_power
@@ -528,6 +542,10 @@ class GameSession:
         if dist <= 0:
             return
 
+        # Уже прыгали для этого барьера — ждём следующий
+        if barrier["x"] == self._last_jumped_barrier:
+            return
+
         # calcIdealJumpDistance: порт из raceBot.ts
         # idealDist = speed * (ticksToReachHeight + 2)
         barrier_high = barrier.get("high", 50)
@@ -850,12 +868,23 @@ class GameSession:
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
-            # Автосброс статуса — ai_loop сам обнаружит когда можно прыгать снова
-            def reset_after_jump():
-                time.sleep(1.2)
+            # Вычисляем оставшееся время дуги из подтверждённых y и speed_y.
+            # Не сбрасываем статус пока пет не приземлится, иначе _tick_bot
+            # пошлёт прыжок пока пет в воздухе и сервер его проигнорирует.
+            confirm_y = coords.get("y", 0)
+            confirm_sy = speed_data.get("y", 0)
+            arc_remain = remaining_arc_ticks(confirm_y, confirm_sy, self.gravity)
+            reset_delay = max(0.3, arc_remain * 0.01 + 0.3)  # тики→сек + запас
+
+            def reset_after_jump(delay):
+                time.sleep(delay)
                 if self.pet_status == "jumping":
                     self.pet_status = "running"
-            threading.Thread(target=reset_after_jump, daemon=True).start()
+            threading.Thread(target=reset_after_jump, args=(reset_delay,), daemon=True).start()
+            logger.info(
+                f"[{self.game_id}] Arc remaining: {arc_remain} ticks "
+                f"({reset_delay:.1f}s) y={confirm_y:.0f} sy={confirm_sy:.1f}"
+            )
 
         client.on("_open",                  on_open)
         client.on("engine.user.connected",  on_user_connected)
