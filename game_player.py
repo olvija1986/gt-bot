@@ -110,6 +110,24 @@ def ticks_to_reach_height(jump_power: float, gravity: float, target_height: floa
     return 200
 
 
+def estimate_jump_power(y: float, speed_y: float) -> float:
+    """Вычисляет jump_power из подтверждённых y и speed_y в середине дуги.
+
+    Решаем: y*0.6 = p*(speed_y - 1.8 + 0.5*p), где p = jp - speed_y.
+    Квадратное уравнение: 0.5*p² + (speed_y-1.8)*p - 0.6*y = 0
+    """
+    if y <= 0 or speed_y <= 0:
+        return speed_y if speed_y > 0 else 20.0
+    a = 0.5
+    b = speed_y - 1.8
+    c = -0.6 * y
+    disc = b * b - 4 * a * c
+    if disc < 0:
+        return 20.0
+    p = (-b + disc ** 0.5) / (2 * a)
+    return speed_y + max(0, p)
+
+
 def remaining_arc_ticks(y: float, speed_y: float, gravity: float = 1.5) -> int:
     """Сколько тиков до приземления из текущей точки дуги (y, speed_y)."""
     for tick in range(1, 500):
@@ -447,6 +465,8 @@ class GameSession:
         self._confirmed_jumps     = 0     # кол-во подтверждённых прыжков (для калибровки)
         self._prev_confirmed_x   = 0.0   # x предыдущего подтверждённого прыжка
         self._prev_confirmed_at  = 0.0   # jumpedAt предыдущего подтверждённого прыжка
+        self._last_confirm_y     = -1.0  # y последнего подтверждённого прыжка
+        self._last_confirm_sy    = -1.0  # speed_y последнего подтверждённого прыжка
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
         self._anchor_x           = 118.0 # последняя подтверждённая x
         self._anchor_server_time = 0.0   # serverTime для anchor_x
@@ -832,14 +852,43 @@ class GameSession:
 
         def on_jump(data: dict):
             """engine.jump — сервер подтвердил прыжок, обновляем состояние."""
+            # Калибруем jump_power из прыжков оппонентов (y=0 → sy = jump_power)
             if data.get("userId") != self.user_id:
+                opp_coords = data.get("coordinates", {})
+                opp_speed = data.get("speed", {}) or {}
+                opp_y = opp_coords.get("y", -1)
+                opp_sy = opp_speed.get("y", 0)
+                if opp_y == 0 and opp_sy > 10 and self._confirmed_jumps == 0:
+                    # У оппонента y=0 — прыжок только начался, sy = jump_power
+                    self.jump_power = opp_sy
+                    logger.info(
+                        f"[{self.game_id}] JP из оппонента: "
+                        f"userId={data.get('userId')} sy={opp_sy:.2f}"
+                    )
                 return
 
-            self.pet_status = "jumping"
             coords = data.get("coordinates", {})
             real_x = coords.get("x")
             speed_data = data.get("speed", {}) or {}
             arc_spx = speed_data.get("x", 0)
+            confirm_y = coords.get("y", 0)
+            confirm_sy = speed_data.get("y", 0)
+
+            # Детекция отклонённого прыжка: сервер вернул те же y/sy что и раньше
+            # → пет всё ещё в воздухе, прыжок был проигнорирован.
+            if (self._last_confirm_y >= 0
+                    and abs(confirm_y - self._last_confirm_y) < 0.1
+                    and abs(confirm_sy - self._last_confirm_sy) < 0.1):
+                logger.warning(
+                    f"[{self.game_id}] JUMP REJECTED: пет в воздухе! "
+                    f"y={confirm_y:.1f} sy={confirm_sy:.1f} (те же что и прошлый)"
+                )
+                # Не обновляем anchor/speed/status — прыжок не состоялся
+                return
+
+            self.pet_status = "jumping"
+            self._last_confirm_y = confirm_y
+            self._last_confirm_sy = confirm_sy
 
             # Оценка фактической задержки между jumpedAt и serverTime.
             jumped_at = self._last_sent_jumped_at
@@ -859,19 +908,31 @@ class GameSession:
                     if dt_ticks > 5:
                         measured_spx = (real_x - self._anchor_x) / dt_ticks
 
-                # Берём max(measured, arc): если measured ниже arc_spx,
-                # значит пет получил штраф за столкновение с барьером.
-                # В таком случае arc_spx — актуальная текущая скорость.
-                if measured_spx > 0.5 and arc_spx > 0.5:
-                    self.current_speed_x = max(measured_spx, arc_spx)
+                # Используем measured_spx — это средняя фактическая скорость
+                # за последний интервал (arc + бег), наиболее точная оценка.
+                # arc_spx — скорость в фазе прыжка, она может быть ВЫШЕ или НИЖЕ
+                # скорости бега в зависимости от пета, поэтому не используем max().
+                if measured_spx > 0.5:
+                    self.current_speed_x = measured_spx
                 elif arc_spx > 0.5:
                     self.current_speed_x = arc_spx
-                elif measured_spx > 0.5:
-                    self.current_speed_x = measured_spx
 
                 self._confirmed_jumps += 1
                 self._anchor_x = real_x
                 self._anchor_server_time = jump_server_time
+
+                # Калибруем jump_power из подтверждённых y и speed_y
+                confirm_y_jp = confirm_y
+                confirm_sy_jp = confirm_sy
+                if confirm_y_jp > 10 and confirm_sy_jp > 1 and self._confirmed_jumps <= 2:
+                    estimated_jp = estimate_jump_power(confirm_y_jp, confirm_sy_jp)
+                    if 15 < estimated_jp < 40:
+                        self.jump_power = estimated_jp
+                        logger.info(
+                            f"[{self.game_id}] Калибровка JP: y={confirm_y_jp:.1f} "
+                            f"sy={confirm_sy_jp:.1f} → jp={estimated_jp:.2f}"
+                        )
+
                 # Калибруем game_started_at по реальной позиции
                 if self.current_speed_x > 0:
                     ticks = (real_x - 118.0) / self.current_speed_x
@@ -887,10 +948,8 @@ class GameSession:
             # Вычисляем оставшееся время дуги из подтверждённых y и speed_y.
             # Не сбрасываем статус пока пет не приземлится, иначе _tick_bot
             # пошлёт прыжок пока пет в воздухе и сервер его проигнорирует.
-            confirm_y = coords.get("y", 0)
-            confirm_sy = speed_data.get("y", 0)
             arc_remain = remaining_arc_ticks(confirm_y, confirm_sy, self.gravity)
-            reset_delay = max(0.3, arc_remain * 0.01 + 0.3)  # тики→сек + запас
+            reset_delay = max(0.5, arc_remain * 0.01 + 0.8)  # тики→сек + большой запас
 
             def reset_after_jump(delay):
                 time.sleep(delay)
