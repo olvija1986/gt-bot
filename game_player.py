@@ -468,6 +468,27 @@ def _min_height_over_zone(dxs: list, ys: list, start_dx: float, zone_width: floa
     return min(h1, h2, h3)
 
 
+def _calc_landing(real_x: float, speed_x: float, confirm_y: float, confirm_sy: float,
+                  gravity: float = 1.5) -> tuple:
+    """
+    Вычисляет позицию и время приземления из mid-arc состояния.
+    Возвращает (landing_x, landing_ticks).
+    """
+    y, sy = confirm_y, confirm_sy
+    dx = 0.0
+    for tick in range(1, 500):
+        sy -= 0.6
+        if sy < 0:
+            sy = 0.0
+        y += sy
+        if y - gravity > 0:
+            y -= gravity
+        else:
+            return real_x + dx, tick
+        dx += speed_x
+    return real_x + dx, 500
+
+
 class GameSession:
     def __init__(self, game_id: str, lobby_url: str, mode: str, user_id: int, on_finish=None, pet_id=None):
         self.game_id   = game_id
@@ -1060,20 +1081,113 @@ class GameSession:
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
-            # Вычисляем оставшееся время дуги из подтверждённых y и speed_y.
-            # Не сбрасываем статус пока пет не приземлится, иначе _tick_bot
-            # пошлёт прыжок пока пет в воздухе и сервер его проигнорирует.
+            # ── Вычисляем позицию приземления ──
+            # Используем точную симуляцию вместо грубого таймера.
             arc_remain = remaining_arc_ticks(confirm_y, confirm_sy, self.gravity)
-            reset_delay = max(0.5, arc_remain * 0.01 + 0.8)  # тики→сек + большой запас
+            spx_for_landing = self.current_speed_x
+            landing_x, landing_ticks = _calc_landing(
+                real_x if real_x is not None else self.pet_x,
+                spx_for_landing, confirm_y, confirm_sy, self.gravity
+            )
+            jump_server_time_val = data.get("serverTime") or self._now_server_ms()
+            landing_server_time = jump_server_time_val + landing_ticks * 10.0
 
-            def reset_after_jump(delay):
+            # Уменьшенный буфер: 0.15с вместо 0.8с — позиция приземления теперь точная.
+            reset_delay = max(0.3, arc_remain * 0.01 + 0.15)
+
+            # ── Pre-schedule: ищем следующий барьер после приземления ──
+            # Если барьер близко — планируем прыжок заранее, пока в воздухе.
+            next_jump_delay = None
+            next_jump_barrier_x = None
+            if self.barriers and spx_for_landing > 0:
+                landing_front = landing_x + self.width_pet
+                for b in self.barriers:
+                    if b["x"] + self.width_barrier > landing_front and b["x"] > self._last_jumped_barrier:
+                        # Нашли следующий барьер после приземления
+                        dist_after_land = b["x"] - landing_front
+                        barrier_high = b.get("high", 50)
+
+                        # Рассчитываем безопасную зону для этого барьера
+                        dxs_pre, ys_pre = _simulate_arc_profile(
+                            spx_for_landing, self.jump_power, self.gravity
+                        )
+                        if not dxs_pre:
+                            break
+                        arc_len_pre = dxs_pre[-1]
+
+                        if dist_after_land > arc_len_pre:
+                            break  # барьер далеко, _tick_bot справится
+
+                        # Найти best_d в безопасной зоне
+                        step_pre = max(0.5, spx_for_landing * 0.5)
+                        best_d_pre = None
+                        best_margin_pre = -999.0
+                        d_pre = step_pre
+                        while d_pre < arc_len_pre:
+                            h_pre = _min_height_over_zone(dxs_pre, ys_pre, d_pre, self.width_barrier)
+                            margin_pre = h_pre - barrier_high
+                            if margin_pre > best_margin_pre:
+                                best_margin_pre = margin_pre
+                                best_d_pre = d_pre
+                            d_pre += step_pre
+
+                        if best_d_pre is not None and best_margin_pre > 0:
+                            # Тики от приземления до оптимальной точки прыжка
+                            ticks_to_optimal = max(0, (dist_after_land - best_d_pre) / spx_for_landing)
+                            # Общая задержка: arc до приземления + бег до optimal
+                            total_delay = landing_ticks * 0.01 + ticks_to_optimal * 0.01
+                            if total_delay > 0 and total_delay < 10:  # sanity
+                                next_jump_delay = total_delay
+                                next_jump_barrier_x = b["x"]
+                                # Проверяем мульти-барьер
+                                b_idx = self.barriers.index(b)
+                                for bi in range(b_idx + 1, len(self.barriers)):
+                                    b2 = self.barriers[bi]
+                                    d2 = b2["x"] - landing_front - (dist_after_land - best_d_pre)
+                                    if d2 >= arc_len_pre:
+                                        break
+                                    h2 = b2.get("high", 50)
+                                    h_over = _min_height_over_zone(dxs_pre, ys_pre, d2, self.width_barrier)
+                                    if h_over > h2:
+                                        next_jump_barrier_x = b2["x"]
+                                    else:
+                                        break
+                        break
+
+            def reset_after_jump(delay, land_x, land_srv_time,
+                                 sched_delay, sched_barrier_x):
                 time.sleep(delay)
                 if self.pet_status == "jumping":
                     self.pet_status = "running"
-            threading.Thread(target=reset_after_jump, args=(reset_delay,), daemon=True).start()
+                    self._anchor_x = land_x
+                    self._anchor_server_time = land_srv_time
+
+                # Pre-scheduled jump: если следующий барьер близко
+                if sched_delay is not None and sched_barrier_x is not None:
+                    extra_wait = max(0, sched_delay - delay)
+                    if extra_wait > 0:
+                        time.sleep(extra_wait)
+                    # Проверяем что бот ещё не прыгнул для этого барьера
+                    if (self.pet_status == "running"
+                            and sched_barrier_x > self._last_jumped_barrier
+                            and not self._done.is_set()):
+                        self._do_jump(
+                            sched_barrier_x,
+                            0.0,  # dist неизвестен точно
+                            f"PRE-SCHEDULED from arc"
+                        )
+
+            threading.Thread(
+                target=reset_after_jump,
+                args=(reset_delay, landing_x, landing_server_time,
+                      next_jump_delay, next_jump_barrier_x),
+                daemon=True
+            ).start()
             logger.info(
                 f"[{self.game_id}] Arc remaining: {arc_remain} ticks "
-                f"({reset_delay:.1f}s) y={confirm_y:.0f} sy={confirm_sy:.1f}"
+                f"({reset_delay:.1f}s) y={confirm_y:.0f} sy={confirm_sy:.1f} "
+                f"landing_x={landing_x:.0f} "
+                f"{'PRE-SCHED ' + str(next_jump_barrier_x) if next_jump_barrier_x else 'no-presched'}"
             )
 
         client.on("_open",                  on_open)
