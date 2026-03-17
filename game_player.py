@@ -537,12 +537,12 @@ class GameSession:
             ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
         ideal_dist = self.current_speed_x * (ticks + 2)
 
-        # Запас на polling lag + сетевую задержку + упреждение.
-        # _estimate_pet_x уже компенсирует half-RTT в позиции, но lag_ticks
-        # должен покрыть задержку отправки (half-RTT) + poll interval + запас.
+        # Запас на polling lag + сетевую задержку отправки (half-RTT) + упреждение.
+        # _estimate_pet_x уже компенсирует half-RTT в позиции, поэтому
+        # в lag_ticks закладываем только half-RTT (задержка отправки до сервера).
         lag_ticks = (
             AI_POLL_INTERVAL_MS / 10.0
-            + self._jump_latency_ms / 10.0
+            + self._jump_latency_ms / 20.0   # half-RTT (отправка)
             + JUMP_LEAD_TICKS
         )
         poll_lag_px = self.current_speed_x * lag_ticks
@@ -550,7 +550,19 @@ class GameSession:
         # Минимальная безопасная дистанция: пет должен стартовать прыжок
         # не ближе чем ширина барьера + ширина пета, иначе врежется.
         min_safe_px = float(self.width_barrier + self.width_pet)
+
+        # Максимальная дистанция: дуга прыжка должна дотянуть до барьера.
+        # Если прыгнуть слишком рано, пет приземлится до барьера.
+        arc_len = _simulate_landing(
+            0, self.current_speed_x, self.jump_power, self.gravity
+        )
+        # Пет должен пролететь минимум width_barrier, чтобы перелететь барьер
+        max_trigger_dist = arc_len - self.width_barrier
+
         trigger_dist = max(ideal_dist + poll_lag_px, min_safe_px)
+        # Не прыгаем слишком рано — дуга не дотянет
+        if max_trigger_dist > 0:
+            trigger_dist = min(trigger_dist, max_trigger_dist)
 
         if dist <= trigger_dist:
             now_srv = int(time.time() * 1000 + self.server_time_offset)
@@ -566,7 +578,8 @@ class GameSession:
             logger.info(
                 f"[{self.game_id}] ⏱ JUMP barrier={barrier['x']} "
                 f"dist={dist:.1f} ideal={ideal_dist:.1f} lag={poll_lag_px:.1f} "
-                f"trigger={trigger_dist:.1f} spx={self.current_speed_x:.3f}"
+                f"trigger={trigger_dist:.1f} max={max_trigger_dist:.1f} "
+                f"arc={arc_len:.0f} spx={self.current_speed_x:.3f}"
             )
 
     def _make_action_payload(self) -> dict:
@@ -609,15 +622,15 @@ class GameSession:
             # Квадратичная формула скорости из реальных измерений:
             # (10→1.648, 53→2.610, 77→4.150 px/tick)
             # speed = 0.000624*agi^2 - 0.016927*agi + 1.754893
-            # Коррекция ×1.12: формула занижает реальную скорость
-            # (agility=10: формула=1.648, реально≈1.85 по данным сервера).
+            # Коррекция ×1.25: формула занижает реальную скорость
+            # (agility=10: формула=1.648, реально≈2.07 по данным сервера).
             # После первого прыжка скорость перезапишется измеренной.
             agility = info.get("chars", {}).get("agility", 53)
             self.current_speed_x = (
                 0.000624 * agility**2
                 - 0.016927 * agility
                 + 1.754893
-            ) * 1.12
+            ) * 1.25
             self.current_speed_x = max(0.5, self.current_speed_x)
 
             logger.info(
