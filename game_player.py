@@ -609,12 +609,15 @@ class GameSession:
             # Квадратичная формула скорости из реальных измерений:
             # (10→1.648, 53→2.610, 77→4.150 px/tick)
             # speed = 0.000624*agi^2 - 0.016927*agi + 1.754893
+            # Коррекция ×1.12: формула занижает реальную скорость
+            # (agility=10: формула=1.648, реально≈1.85 по данным сервера).
+            # После первого прыжка скорость перезапишется измеренной.
             agility = info.get("chars", {}).get("agility", 53)
             self.current_speed_x = (
                 0.000624 * agility**2
                 - 0.016927 * agility
                 + 1.754893
-            )
+            ) * 1.12
             self.current_speed_x = max(0.5, self.current_speed_x)
 
             logger.info(
@@ -805,11 +808,22 @@ class GameSession:
 
             if real_x is not None:
                 self.pet_x = real_x
-                self._anchor_x = real_x
-                # Обновляем скорость из ответа сервера
-                if arc_spx > 0.5:
-                    self.current_speed_x = arc_spx
                 jump_server_time = data.get("serverTime") or self._now_server_ms()
+
+                # Измеряем РЕАЛЬНУЮ среднюю скорость от anchor до confirmed.
+                # Это точнее, чем arc_spx, т.к. учитывает ускорения игры.
+                measured_spx = 0.0
+                if self._anchor_server_time > 0 and self._anchor_x >= 0:
+                    dt_ticks = (jump_server_time - self._anchor_server_time) / 10.0
+                    if dt_ticks > 5:
+                        measured_spx = (real_x - self._anchor_x) / dt_ticks
+
+                if measured_spx > 0.5:
+                    self.current_speed_x = measured_spx
+                elif arc_spx > 0.5:
+                    self.current_speed_x = arc_spx
+
+                self._anchor_x = real_x
                 self._anchor_server_time = jump_server_time
                 # Калибруем game_started_at по реальной позиции
                 if self.current_speed_x > 0:
@@ -817,7 +831,8 @@ class GameSession:
                     self.game_started_at = time.time() * 1000 - ticks * 10
                 logger.info(
                     f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
-                    f"spx={self.current_speed_x:.4f} lag_ms≈{self._jump_latency_ms:.0f}"
+                    f"measured_spx={measured_spx:.4f} arc_spx={arc_spx:.4f} "
+                    f"using={self.current_speed_x:.4f} lag_ms≈{self._jump_latency_ms:.0f}"
                 )
 
             self.last_update = data.get("lastUpdate", self.last_update)
