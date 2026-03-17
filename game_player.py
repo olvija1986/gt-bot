@@ -59,7 +59,7 @@ SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", True)
 AI_POLL_INTERVAL_MS = 80
 # Дополнительное упреждение до идеальной точки прыжка.
 # Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
-JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "14"))
+JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "28"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -841,18 +841,22 @@ class GameSession:
                 self.pet_x = real_x
                 jump_server_time = data.get("serverTime") or self._now_server_ms()
 
-                # Измеряем РЕАЛЬНУЮ среднюю скорость от anchor до confirmed.
-                # Это точнее, чем arc_spx, т.к. учитывает ускорения игры.
+                # Измеряем среднюю скорость от anchor до confirmed.
                 measured_spx = 0.0
                 if self._anchor_server_time > 0 and self._anchor_x >= 0:
                     dt_ticks = (jump_server_time - self._anchor_server_time) / 10.0
                     if dt_ticks > 5:
                         measured_spx = (real_x - self._anchor_x) / dt_ticks
 
-                if measured_spx > 0.5:
-                    self.current_speed_x = measured_spx
+                # Берём max(measured, arc): если measured ниже arc_spx,
+                # значит пет получил штраф за столкновение с барьером.
+                # В таком случае arc_spx — актуальная текущая скорость.
+                if measured_spx > 0.5 and arc_spx > 0.5:
+                    self.current_speed_x = max(measured_spx, arc_spx)
                 elif arc_spx > 0.5:
                     self.current_speed_x = arc_spx
+                elif measured_spx > 0.5:
+                    self.current_speed_x = measured_spx
 
                 self._anchor_x = real_x
                 self._anchor_server_time = jump_server_time
