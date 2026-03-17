@@ -59,7 +59,10 @@ SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", True)
 AI_POLL_INTERVAL_MS = 80
 # Дополнительное упреждение до идеальной точки прыжка.
 # Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
-JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "28"))
+JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "14"))
+# Минимальный trigger для первого прыжка (до калибровки скорости).
+# Фиксирован в пикселях — работает для любого пета.
+FIRST_JUMP_MIN_TRIGGER_PX = float(os.environ.get("FIRST_JUMP_MIN_TRIGGER_PX", "120"))
 # ────────────────────────────────────────────────────────
 
 HEADERS_HTTP = {
@@ -441,6 +444,7 @@ class GameSession:
         self._last_jumped_barrier = 0.0  # x барьера для которого уже запланирован/выполнен прыжок
         self._last_sent_jumped_at = 0.0   # jumpedAt который мы отправили последним
         self._jump_latency_ms     = 150.0 # EWMA задержки send→server подтверждения
+        self._confirmed_jumps     = 0     # кол-во подтверждённых прыжков (для калибровки)
         self._prev_confirmed_x   = 0.0   # x предыдущего подтверждённого прыжка
         self._prev_confirmed_at  = 0.0   # jumpedAt предыдущего подтверждённого прыжка
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
@@ -578,6 +582,12 @@ class GameSession:
         max_trigger_dist = arc_len - self.width_barrier
 
         trigger_dist = max(ideal_dist + poll_lag_px, min_safe_px)
+
+        # Первый прыжок (скорость ещё не калибрована по серверу):
+        # используем фиксированный минимум в пикселях — работает для любого пета.
+        if self._confirmed_jumps == 0:
+            trigger_dist = max(trigger_dist, FIRST_JUMP_MIN_TRIGGER_PX)
+
         # Не прыгаем слишком рано — дуга не дотянет
         if max_trigger_dist > 0:
             trigger_dist = min(trigger_dist, max_trigger_dist)
@@ -640,15 +650,16 @@ class GameSession:
             # Квадратичная формула скорости из реальных измерений:
             # (10→1.648, 53→2.610, 77→4.150 px/tick)
             # speed = 0.000624*agi^2 - 0.016927*agi + 1.754893
-            # Коррекция ×1.25: формула занижает реальную скорость
-            # (agility=10: формула=1.648, реально≈2.07 по данным сервера).
-            # После первого прыжка скорость перезапишется измеренной.
+            # Квадратичная формула скорости из реальных измерений:
+            # (10→1.648, 53→2.610, 77→4.150 px/tick)
+            # Это начальная оценка; после первого прыжка скорость
+            # калибруется автоматически из данных сервера.
             agility = info.get("chars", {}).get("agility", 53)
             self.current_speed_x = (
                 0.000624 * agility**2
                 - 0.016927 * agility
                 + 1.754893
-            ) * 1.25
+            )
             self.current_speed_x = max(0.5, self.current_speed_x)
 
             logger.info(
@@ -858,6 +869,7 @@ class GameSession:
                 elif measured_spx > 0.5:
                     self.current_speed_x = measured_spx
 
+                self._confirmed_jumps += 1
                 self._anchor_x = real_x
                 self._anchor_server_time = jump_server_time
                 # Калибруем game_started_at по реальной позиции
