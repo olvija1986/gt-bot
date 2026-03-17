@@ -28,6 +28,7 @@ game_player.py — Авто-игрок Gatto (Race / Swim)
 import os
 import time
 import json
+import bisect
 import logging
 import threading
 import requests
@@ -418,6 +419,55 @@ def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity
     return x
 
 
+def _simulate_arc_profile(speed_x: float, jump_power: float, gravity: float = 1.5):
+    """
+    Симулирует полный прыжок и возвращает (dxs, ys) — параллельные массивы
+    горизонтального смещения и высоты на каждом тике.
+    Используется для точного расчёта пролёта над барьерами.
+    """
+    dxs, ys = [], []
+    y, sy = 0.0, jump_power
+    dx = 0.0
+    for _ in range(500):
+        sy -= 0.6
+        if sy < 0:
+            sy = 0.0
+        y += sy
+        if y - gravity > 0:
+            y -= gravity
+        else:
+            y = max(0.0, y - gravity)
+            if y <= 0:
+                return dxs, ys
+        dx += speed_x
+        dxs.append(dx)
+        ys.append(y)
+    return dxs, ys
+
+
+def _height_at_dx(dxs: list, ys: list, target_dx: float) -> float:
+    """Интерполирует высоту на горизонтальном расстоянии target_dx (бинарный поиск)."""
+    if not dxs or target_dx <= 0:
+        return 0.0
+    if target_dx >= dxs[-1]:
+        return 0.0  # за пределами дуги — уже на земле
+    i = bisect.bisect_left(dxs, target_dx)
+    if i == 0:
+        return ys[0] * (target_dx / dxs[0]) if dxs[0] > 0 else ys[0]
+    x0, y0 = dxs[i - 1], ys[i - 1]
+    x1, y1 = dxs[i], ys[i]
+    t = (target_dx - x0) / (x1 - x0) if x1 != x0 else 0
+    return y0 + t * (y1 - y0)
+
+
+def _min_height_over_zone(dxs: list, ys: list, start_dx: float, zone_width: float) -> float:
+    """Минимальная высота пета над зоной барьера [start_dx, start_dx + zone_width]."""
+    h1 = _height_at_dx(dxs, ys, start_dx)
+    h2 = _height_at_dx(dxs, ys, start_dx + zone_width * 0.5)
+    h3 = _height_at_dx(dxs, ys, start_dx + zone_width)
+    return min(h1, h2, h3)
+
+
 class GameSession:
     def __init__(self, game_id: str, lobby_url: str, mode: str, user_id: int, on_finish=None, pet_id=None):
         self.game_id   = game_id
@@ -547,88 +597,153 @@ class GameSession:
                     self._tick_bot()
             time.sleep(AI_POLL_INTERVAL_MS / 1000.0)
 
-    def _tick_bot(self):
-        """Порт raceBot.tickBot — вызывается каждые 80ms."""
-        # Обновляем оценку позиции (тик = 10ms)
-        self.pet_x = self._estimate_pet_x()
+    def _do_jump(self, last_barrier_x: float, dist: float, extra_info: str = ""):
+        """Отправляет прыжок/нырок на сервер."""
+        now_srv = int(time.time() * 1000 + self.server_time_offset)
+        payload = {
+            "clickPosition": {"x": self.click_x, "y": self.click_y},
+            "jumpedAt": now_srv,
+        }
+        event = "engine.jump" if self.mode == "race" else "engine.dive"
+        self._client.emit_with_null(event, payload)
+        self.pet_status = "jumping"
+        self._last_jumped_barrier = last_barrier_x
+        self._last_sent_jumped_at = now_srv
+        logger.info(
+            f"[{self.game_id}] ⏱ JUMP barrier={last_barrier_x} "
+            f"dist={dist:.1f} spx={self.current_speed_x:.3f} "
+            f"jp={self.jump_power:.1f} {extra_info}"
+        )
 
+    def _tick_bot(self):
+        """
+        Универсальный polling loop — работает для любой скорости пета.
+
+        Вместо эвристических формул используем ПОЛНУЮ СИМУЛЯЦИЮ дуги прыжка:
+        1. Для каждого возможного расстояния до барьера симулируем дугу
+           и проверяем, хватает ли высоты для пролёта.
+        2. Находим «безопасную зону» — диапазон расстояний, в которых прыжок
+           гарантированно перелетает барьер.
+        3. Для сильных петов: проверяем ВСЕ барьеры в пределах дуги
+           и помечаем перелетённые, чтобы не прыгать для них повторно.
+        """
+        self.pet_x = self._estimate_pet_x()
         pet_front = self.pet_x + self.width_pet
 
-        # findNextBarrier: первый барьер чья правая грань ещё впереди пета
-        barrier = next(
-            (b for b in self.barriers if b["x"] + self.width_barrier > pet_front),
-            None
-        )
-        if not barrier:
+        # Ищем следующий барьер впереди
+        next_idx = None
+        for i, b in enumerate(self.barriers):
+            if b["x"] + self.width_barrier > pet_front:
+                next_idx = i
+                break
+        if next_idx is None:
             return
 
+        barrier = self.barriers[next_idx]
         dist = barrier["x"] - pet_front
         if dist <= 0:
             return
-
-        # Уже прыгали для этого барьера — ждём следующий
-        if barrier["x"] == self._last_jumped_barrier:
+        if barrier["x"] <= self._last_jumped_barrier:
             return
 
-        # calcIdealJumpDistance: порт из raceBot.ts
-        # idealDist = speed * (ticksToReachHeight + 2)
+        spx = self.current_speed_x
         barrier_high = barrier.get("high", 50)
-        if self.mode == "race":
-            ticks = ticks_to_reach_height(self.jump_power, self.gravity, barrier_high)
-        else:
-            ticks = ticks_to_reach_depth(self.dive_power, barrier_high)
-        ideal_dist = self.current_speed_x * (ticks + 2)
 
-        # Запас на polling lag + сетевую задержку отправки (half-RTT) + упреждение.
-        # _estimate_pet_x уже компенсирует half-RTT в позиции, поэтому
-        # в lag_ticks закладываем только half-RTT (задержка отправки до сервера).
+        # ── Симуляция дуги ──
+        dxs, ys = _simulate_arc_profile(spx, self.jump_power, self.gravity)
+        if not dxs:
+            return
+        arc_len = dxs[-1]
+
+        # Барьер ещё далеко — не в пределах дуги
+        if dist > arc_len:
+            return
+
+        # ── Найти безопасную зону прыжка ──
+        # safe zone: [min_safe_d, max_safe_d] — диапазон значений dist,
+        # при которых дуга пролетает над barrier_high.
+        # min_safe_d = прыгнуть максимально поздно (ближе к барьеру)
+        # max_safe_d = прыгнуть максимально рано (дальше от барьера)
+        step = max(0.5, spx * 0.5)
+        min_safe_d = None
+        max_safe_d = None
+        best_safe_d = None
+        best_margin = -999.0
+        d = step
+        while d < arc_len:
+            h = _min_height_over_zone(dxs, ys, d, self.width_barrier)
+            margin = h - barrier_high
+            if margin > 0:
+                if min_safe_d is None:
+                    min_safe_d = d
+                max_safe_d = d
+                if margin > best_margin:
+                    best_margin = margin
+                    best_safe_d = d
+            d += step
+
+        if min_safe_d is None:
+            # Пет НЕ МОЖЕТ перепрыгнуть этот барьер ни при каком тайминге.
+            # Аварийный прыжок — максимальная высота (best effort).
+            if dist <= spx * 10:
+                self._do_jump(barrier["x"], dist, "EMERGENCY no-safe-zone")
+            return
+
+        # ── Учёт сетевого лага ──
         lag_ticks = (
             AI_POLL_INTERVAL_MS / 10.0
-            + self._jump_latency_ms / 20.0   # half-RTT (отправка)
+            + self._jump_latency_ms / 20.0
             + JUMP_LEAD_TICKS
         )
-        poll_lag_px = self.current_speed_x * lag_ticks
+        lag_px = spx * lag_ticks
 
-        # Минимальная безопасная дистанция: пет должен стартовать прыжок
-        # не ближе чем ширина барьера + ширина пета, иначе врежется.
-        min_safe_px = float(self.width_barrier + self.width_pet)
+        # Хотим, чтобы dist - lag_px попало в [min_safe_d, max_safe_d].
+        # Триггер: dist <= max_safe_d + lag_px (вошли в окно)
+        trigger = best_safe_d + lag_px  # целимся в оптимальную точку
+        trigger = max(min_safe_d + lag_px, min(trigger, max_safe_d + lag_px))
 
-        # Максимальная дистанция: дуга прыжка должна дотянуть до барьера.
-        # Если прыгнуть слишком рано, пет приземлится до барьера.
-        arc_len = _simulate_landing(
-            0, self.current_speed_x, self.jump_power, self.gravity
-        )
-        # Пет должен пролететь минимум width_barrier, чтобы перелететь барьер
-        max_trigger_dist = arc_len - self.width_barrier
-
-        trigger_dist = max(ideal_dist + poll_lag_px, min_safe_px)
-
-        # Первый прыжок (скорость ещё не калибрована по серверу):
-        # используем фиксированный минимум в пикселях — работает для любого пета.
+        # Первый прыжок (скорость ещё не откалибрована): доп. запас.
         if self._confirmed_jumps == 0:
-            trigger_dist = max(trigger_dist, FIRST_JUMP_MIN_TRIGGER_PX)
+            trigger = max(trigger, FIRST_JUMP_MIN_TRIGGER_PX)
+            trigger = min(trigger, max_safe_d + lag_px)  # не выходим за пределы дуги
 
-        # Не прыгаем слишком рано — дуга не дотянет
-        if max_trigger_dist > 0:
-            trigger_dist = min(trigger_dist, max_trigger_dist)
+        if dist > trigger:
+            return  # ещё рано
 
-        if dist <= trigger_dist:
-            now_srv = int(time.time() * 1000 + self.server_time_offset)
-            payload = {
-                "clickPosition": {"x": self.click_x, "y": self.click_y},
-                "jumpedAt": now_srv,
-            }
-            event = "engine.jump" if self.mode == "race" else "engine.dive"
-            self._client.emit_with_null(event, payload)
-            self.pet_status = "jumping"
-            self._last_jumped_barrier = barrier["x"]
-            self._last_sent_jumped_at = now_srv
-            logger.info(
-                f"[{self.game_id}] ⏱ JUMP barrier={barrier['x']} "
-                f"dist={dist:.1f} ideal={ideal_dist:.1f} lag={poll_lag_px:.1f} "
-                f"trigger={trigger_dist:.1f} max={max_trigger_dist:.1f} "
-                f"arc={arc_len:.0f} spx={self.current_speed_x:.3f}"
-            )
+        # ── Мульти-барьерная проверка (сильные петы) ──
+        # Проверяем, перелетит ли дуга ещё барьеры впереди.
+        last_cleared_x = barrier["x"]
+        for i in range(next_idx + 1, len(self.barriers)):
+            b2 = self.barriers[i]
+            d2 = b2["x"] - pet_front
+            if d2 >= arc_len:
+                break
+            h2 = b2.get("high", 50)
+            h_over = _min_height_over_zone(dxs, ys, d2, self.width_barrier)
+            if h_over > h2:
+                last_cleared_x = b2["x"]
+            else:
+                # Дуга НЕ перелетит этот барьер.
+                # Проверяем, приземлимся ли мы ДО него.
+                if arc_len >= d2 - self.width_pet:
+                    # Приземлимся НА барьер — нужно прыгнуть позже,
+                    # чтобы укоротить полёт и сесть между барьерами.
+                    # Пересчитываем trigger с учётом посадки перед b2.
+                    max_arc_before_b2 = d2 - self.width_pet - self.width_barrier
+                    if max_arc_before_b2 < min_safe_d:
+                        # Невозможно перелететь первый и сесть до второго
+                        logger.warning(
+                            f"[{self.game_id}] Барьеры слишком близко: "
+                            f"{barrier['x']} и {b2['x']}, arc={arc_len:.0f}"
+                        )
+                    # Продолжаем — лучше перепрыгнуть первый, чем стоять
+                break
+
+        self._do_jump(last_cleared_x, dist,
+                      f"zone=[{min_safe_d:.0f},{max_safe_d:.0f}] "
+                      f"best={best_safe_d:.0f} margin={best_margin:.1f} "
+                      f"trigger={trigger:.0f} lag={lag_px:.0f} arc={arc_len:.0f} "
+                      f"cleared_to={last_cleared_x}")
 
     def _make_action_payload(self) -> dict:
         return {
