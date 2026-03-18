@@ -531,6 +531,7 @@ class GameSession:
         self.server_time_offset = 0.0   # local → server time offset
         self._jump_timers       = []    # список Timer объектов
         self._last_jumped_barrier = 0.0  # x барьера для которого уже запланирован/выполнен прыжок
+        self._prev_last_jumped_barrier = 0.0  # предыдущее значение для отката при rejection
         self._last_sent_jumped_at = 0.0   # jumpedAt который мы отправили последним
         self._jump_latency_ms     = 150.0 # EWMA задержки send→server подтверждения
         self._confirmed_jumps     = 0     # кол-во подтверждённых прыжков (для калибровки)
@@ -628,6 +629,7 @@ class GameSession:
         event = "engine.jump" if self.mode == "race" else "engine.dive"
         self._client.emit_with_null(event, payload)
         self.pet_status = "jumping"
+        self._prev_last_jumped_barrier = self._last_jumped_barrier  # сохраняем для отката
         self._last_jumped_barrier = last_barrier_x
         self._last_sent_jumped_at = now_srv
         logger.info(
@@ -1017,9 +1019,12 @@ class GameSession:
                     and abs(confirm_sy - self._last_confirm_sy) < 0.1):
                 logger.warning(
                     f"[{self.game_id}] JUMP REJECTED: пет в воздухе! "
-                    f"y={confirm_y:.1f} sy={confirm_sy:.1f} (те же что и прошлый)"
+                    f"y={confirm_y:.1f} sy={confirm_sy:.1f} (те же что и прошлый) "
+                    f"reverting _last_jumped_barrier {self._last_jumped_barrier:.0f} → {self._prev_last_jumped_barrier:.0f}"
                 )
-                # Не обновляем anchor/speed/status — прыжок не состоялся
+                # Откат состояния: прыжок не состоялся — возвращаем предыдущие значения
+                self._last_jumped_barrier = self._prev_last_jumped_barrier
+                self.pet_status = "running"
                 return
 
             self.pet_status = "jumping"
@@ -1041,15 +1046,23 @@ class GameSession:
                 measured_spx = 0.0
                 if self._anchor_server_time > 0 and self._anchor_x >= 0:
                     dt_ticks = (jump_server_time - self._anchor_server_time) / 10.0
-                    if dt_ticks > 5:
+                    if dt_ticks > 100:  # минимум 1с для точного замера (было 5)
                         measured_spx = (real_x - self._anchor_x) / dt_ticks
 
-                # Используем measured_spx — это средняя фактическая скорость
-                # за последний интервал (arc + бег), наиболее точная оценка.
-                # arc_spx — скорость в фазе прыжка, она может быть ВЫШЕ или НИЖЕ
-                # скорости бега в зависимости от пета, поэтому не используем max().
+                # Используем measured_spx только если интервал достаточно длинный.
+                # При коротких интервалах (после PRE-SCHED) ошибка в landing_x
+                # усиливается — предпочитаем arc_spx.
                 if measured_spx > 0.5:
-                    self.current_speed_x = measured_spx
+                    # Защита от аномальных скачков: не более ±30% от текущей
+                    if self.current_speed_x > 0.5:
+                        ratio = measured_spx / self.current_speed_x
+                        if 0.7 <= ratio <= 1.3:
+                            self.current_speed_x = measured_spx
+                        else:
+                            # Аномальный скачок — усредняем вместо резкой замены
+                            self.current_speed_x = self.current_speed_x * 0.7 + measured_spx * 0.3
+                    else:
+                        self.current_speed_x = measured_spx
                 elif arc_spx > 0.5:
                     self.current_speed_x = arc_spx
 
@@ -1092,8 +1105,9 @@ class GameSession:
             jump_server_time_val = data.get("serverTime") or self._now_server_ms()
             landing_server_time = jump_server_time_val + landing_ticks * 10.0
 
-            # Уменьшенный буфер: 0.15с вместо 0.8с — позиция приземления теперь точная.
-            reset_delay = max(0.3, arc_remain * 0.01 + 0.15)
+            # Адаптивный буфер: учитываем сетевую задержку, минимум 0.3с
+            latency_buf = max(0.3, self._jump_latency_ms / 500.0)
+            reset_delay = max(0.3, arc_remain * 0.01 + latency_buf)
 
             # ── Pre-schedule: ищем следующий барьер после приземления ──
             # Если барьер близко — планируем прыжок заранее, пока в воздухе.
