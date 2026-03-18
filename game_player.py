@@ -711,13 +711,16 @@ class GameSession:
         a = (sum_s - b * sum_t) / n                # начальная скорость
 
         if a > 0.1 and b >= 0:
+            # Ограничиваем ускорение: реальное ~0.02-0.05/sec.
+            # С 2 семплами регрессия часто даёт 0.2+ (шум) → _integrate_distance
+            # предсказывает позицию на 100+ px вперёд → CLAMP → прыжок при dist=1.
+            b = min(b, 0.10)
             self._speed_initial = a
             self._speed_accel = b
-            # Оценка max_speed: если ускорение > 0, max ≈ последнее наблюдение * 1.5
-            # (или будет уточнено если скорость перестанет расти)
+            # Оценка max_speed: если ускорение > 0, max ≈ последнее наблюдение * 1.3
             if b > 0 and not self._speed_max:
                 last_spx = self._speed_samples[-1][1]
-                self._speed_max = last_spx * 2.0  # грубая верхняя граница
+                self._speed_max = last_spx * 1.3  # консервативная верхняя граница
             self._speed_model_ready = True
             logger.info(
                 f"[{self.game_id}] Speed model: initial={a:.4f} accel={b:.6f}/sec "
@@ -1361,12 +1364,6 @@ class GameSession:
             self._anchor_server_time = server_time
             self._anchor_x = self.pet_x
 
-            # Bootstrap speed model: добавляем начальную скорость как 1-й семпл.
-            # После первого подтверждённого прыжка будет 2 семпла →
-            # линейная регрессия → модель ускорения готова СРАЗУ.
-            if self.current_speed_x > 0.5:
-                self._speed_samples.append((server_time, self.current_speed_x))
-
             logger.info(
                 f"[{self.game_id}] 🏁 Игра! physics_start={server_time} "
                 f"speed={self.current_speed_x:.4f}px/tick"
@@ -1634,9 +1631,10 @@ class GameSession:
             self._landing_x = landing_x
             self._landing_server_time = jump_server_time_val + landing_ticks * 10.0
 
-            # Таймер reset: arc_remain * 10ms + 50% запас + сетевая задержка.
-            latency_buf = max(0.3, self._jump_latency_ms / 500.0)
-            reset_delay = max(1.0, arc_remain * 0.015 + latency_buf)
+            # Таймер reset: arc_remain * 10ms + фиксированный буфер 200ms.
+            # Раньше: 50% запас → таймер стрелял на 1с позже приземления →
+            # позиция успевала уплыть на 100+ px. Теперь буфер минимальный.
+            reset_delay = max(0.5, arc_remain * 0.01 + 0.2)
             reset_delay = min(reset_delay, 25.0)  # не более 25с (для low-gravity петов дуга до 15с+)
 
             def reset_after_jump(delay, lx, lst, created_at_jump):
