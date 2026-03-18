@@ -586,6 +586,9 @@ class GameSession:
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
         self._anchor_x           = 118.0 # последняя подтверждённая x
         self._anchor_server_time = 0.0   # serverTime для anchor_x
+        self._arc_spx            = 0.0   # speed_x во время дуги (выше ground speed)
+        self._landing_x          = 0.0   # предсказанная позиция приземления
+        self._landing_server_time = 0.0  # предсказанный serverTime приземления
         self.result             = None
         self._done         = threading.Event()
 
@@ -597,21 +600,40 @@ class GameSession:
         """
         Предсказывает x по последней опорной точке (x, serverTime).
 
-        server_time_offset вычисляется при получении сообщения, поэтому
-        отстаёт от реального серверного времени на одностороннюю задержку
-        (≈ RTT/2). Добавляем коррекцию вперёд, чтобы не занижать позицию.
+        Во время прыжка пет движется с arc_spx (выше ground speed).
+        После приземления — с ground speed (current_speed_x).
         """
         # Коррекция на одностороннюю сетевую задержку (половина RTT)
-        half_rtt_ticks = self._jump_latency_ms / 20.0  # RTT/2, в тиках (10ms)
-        forward_px = self.current_speed_x * half_rtt_ticks
+        half_rtt_ticks = self._jump_latency_ms / 20.0
+        spx = self.current_speed_x
+        forward_px = spx * half_rtt_ticks
 
-        if self._anchor_server_time > 0 and self.current_speed_x > 0:
-            dt_ticks = max(0.0, (self._now_server_ms() - self._anchor_server_time) / 10.0)
-            return self._anchor_x + self.current_speed_x * dt_ticks + forward_px
+        if self._anchor_server_time > 0 and spx > 0:
+            now_srv = self._now_server_ms()
+            dt_ticks = max(0.0, (now_srv - self._anchor_server_time) / 10.0)
 
-        if self.game_started_at and self.current_speed_x > 0:
+            # Во время прыжка: если мы знаем arc_spx и landing_server_time,
+            # используем arc_spx до приземления и ground speed после.
+            if (self.pet_status == "jumping"
+                    and self._arc_spx > 0
+                    and self._landing_server_time > self._anchor_server_time):
+                if now_srv < self._landing_server_time:
+                    # Ещё в воздухе — вся дельта по arc_spx
+                    return self._anchor_x + self._arc_spx * dt_ticks + self._arc_spx * half_rtt_ticks
+                else:
+                    # Уже должен был приземлиться — arc + ground
+                    arc_ticks = (self._landing_server_time - self._anchor_server_time) / 10.0
+                    ground_ticks = dt_ticks - arc_ticks
+                    return (self._anchor_x
+                            + self._arc_spx * arc_ticks
+                            + spx * ground_ticks
+                            + forward_px)
+
+            return self._anchor_x + spx * dt_ticks + forward_px
+
+        if self.game_started_at and spx > 0:
             elapsed_ms = time.time() * 1000 - self.game_started_at
-            return 118.0 + self.current_speed_x * (elapsed_ms / 10.0) + forward_px
+            return 118.0 + spx * (elapsed_ms / 10.0) + forward_px
 
         return self.pet_x
 
@@ -662,7 +684,7 @@ class GameSession:
                 # Safety timeout: если pet_status == "jumping" > 5с, принудительно сбросить
                 if (self.pet_status in ("jumping", "diving")
                         and self._jump_started_at > 0
-                        and time.time() - self._jump_started_at > 30.0):
+                        and time.time() - self._jump_started_at > 15.0):
                     logger.warning(
                         f"[{self.game_id}] SAFETY TIMEOUT: pet_status={self.pet_status} "
                         f"for {time.time() - self._jump_started_at:.1f}s, forcing running"
@@ -671,6 +693,7 @@ class GameSession:
                     self._rejected_in_flight = False
                     self._last_confirm_y = -1.0
                     self._last_confirm_sy = -1.0
+                    self._arc_spx = 0.0
 
                 if self.pet_status not in ("jumping", "diving"):
                     self._tick_bot()
@@ -952,6 +975,7 @@ class GameSession:
                         self._rejected_in_flight = False
                         self._last_confirm_y = -1.0
                         self._last_confirm_sy = -1.0
+                        self._arc_spx = 0.0
                     self.pet_status = status
 
                 # Дополнительная проверка: если пет в воздухе но y ≤ 1 → приземлился
@@ -966,6 +990,7 @@ class GameSession:
                     self._rejected_in_flight = False
                     self._last_confirm_y = -1.0
                     self._last_confirm_sy = -1.0
+                    self._arc_spx = 0.0
 
                 # Если приземлились — обновляем anchor для точной позиции
                 if self.pet_status == "running" and coords.get("x") is not None:
@@ -1127,6 +1152,7 @@ class GameSession:
                     self.pet_status = "running"
                     self._last_confirm_y = -1.0
                     self._last_confirm_sy = -1.0
+                    self._arc_spx = 0.0
                 return
 
             # Детекция отклонённого прыжка: сервер вернул те же y/sy что и раньше
@@ -1223,25 +1249,53 @@ class GameSession:
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
-            # ── Оценка позиции приземления (для лога) ──
+            # ── Вычисляем позицию приземления и ставим таймер ──
             arc_remain = remaining_arc_ticks(confirm_y, confirm_sy, self.gravity)
-            spx_for_landing = self.current_speed_x
+
+            # Для landing_x используем arc_spx (скорость во время дуги),
+            # а не ground speed — пет летит быстрее чем бежит.
+            use_arc_spx = arc_spx if arc_spx > 0.5 else self.current_speed_x
+            self._arc_spx = use_arc_spx
+
             landing_x, landing_ticks = _calc_landing(
                 real_x if real_x is not None else self.pet_x,
-                spx_for_landing, confirm_y, confirm_sy, self.gravity
+                use_arc_spx, confirm_y, confirm_sy, self.gravity
             )
+            jump_server_time_val = data.get("serverTime") or self._now_server_ms()
+            self._landing_x = landing_x
+            self._landing_server_time = jump_server_time_val + landing_ticks * 10.0
 
-            # НЕ ставим таймер на reset_after_jump — gravity и физика
-            # могут быть неточными, что приводит к преждевременному
-            # переключению в "running" и отклонённым прыжкам.
-            # Вместо этого определяем приземление из серверных данных:
-            # - engine.sync с y ≤ 1 или status="running"
-            # - engine.jump stale update с y ≤ 1
-            # - Safety timeout (30с) как абсолютный fallback.
+            # Таймер reset: arc_remain * 10ms + 50% запас + сетевая задержка.
+            latency_buf = max(0.3, self._jump_latency_ms / 500.0)
+            reset_delay = max(1.0, arc_remain * 0.015 + latency_buf)
+            reset_delay = min(reset_delay, 12.0)  # не более 12с
+
+            def reset_after_jump(delay, lx, lst):
+                time.sleep(delay)
+                self._rejected_in_flight = False
+                if self.pet_status == "jumping":
+                    self.pet_status = "running"
+                    self._last_confirm_y = -1.0
+                    self._last_confirm_sy = -1.0
+                    # Обновляем anchor на предсказанную позицию приземления
+                    self._anchor_x = lx
+                    self._anchor_server_time = lst
+                    self._arc_spx = 0.0
+                    logger.info(
+                        f"[{self.game_id}] Arc timer: pet_status → running, "
+                        f"anchor_x={lx:.0f}"
+                    )
+
+            threading.Thread(
+                target=reset_after_jump,
+                args=(reset_delay, landing_x, self._landing_server_time),
+                daemon=True
+            ).start()
             logger.info(
-                f"[{self.game_id}] Arc estimated: {arc_remain} ticks "
-                f"({arc_remain * 0.01:.1f}s) y={confirm_y:.0f} sy={confirm_sy:.1f} "
-                f"landing_x≈{landing_x:.0f} | landing from server sync"
+                f"[{self.game_id}] Arc: remain={arc_remain}t "
+                f"({arc_remain * 0.01:.1f}s) reset={reset_delay:.1f}s "
+                f"y={confirm_y:.0f} sy={confirm_sy:.1f} "
+                f"arc_spx={use_arc_spx:.3f} landing_x≈{landing_x:.0f}"
             )
 
         client.on("_open",                  on_open)
