@@ -1363,25 +1363,17 @@ class GameSession:
                     if dt_ticks > 100:  # минимум 1с
                         measured_spx = (real_x - self._anchor_x) / dt_ticks
 
-                # Первый прыжок: measured_spx от старта игры — самый точный.
-                # Последующие: anchor стоит на mid-arc прошлого прыжка,
-                # measured_spx смешивает arc и ground время — ненадёжно.
-                # Поэтому после первой калибровки скорость не меняем,
-                # если measured_spx аномальный.
-                if self._confirmed_jumps == 0:
-                    # Первый прыжок: надёжный замер от x=118
-                    if measured_spx > 0.5:
-                        self.current_speed_x = measured_spx
-                    elif arc_spx > 0.5:
-                        self.current_speed_x = arc_spx
-                else:
-                    # Последующие: measured_spx ненадёжен (anchor mid-arc).
-                    # Обновляем только если measured_spx в пределах ±20% от текущей.
-                    if measured_spx > 0.5 and self.current_speed_x > 0.5:
-                        ratio = measured_spx / self.current_speed_x
-                        if 0.8 <= ratio <= 1.2:
-                            self.current_speed_x = self.current_speed_x * 0.8 + measured_spx * 0.2
-                    # НЕ используем arc_spx как fallback — он выше ground speed
+                # arc_spx из engine.jump — это МГНОВЕННАЯ скорость пета на момент
+                # подтверждения прыжка (speed.x от сервера). Горизонтальная скорость
+                # одинакова в воздухе и на земле (physics.ts не меняет speed.x в дуге).
+                # measured_spx — СРЕДНЯЯ скорость от anchor до confirmed — ненадёжна,
+                # т.к. anchor часто стоит на predicted landing_x (неточный).
+                # ВСЕГДА используем arc_spx как истинную скорость.
+                if arc_spx > 0.5:
+                    self.current_speed_x = arc_spx
+                elif measured_spx > 0.5 and self._confirmed_jumps == 0:
+                    # Фоллбэк для первого прыжка если arc_spx недоступен
+                    self.current_speed_x = measured_spx
 
                 self._confirmed_jumps += 1
                 self._anchor_x = real_x
@@ -1400,12 +1392,14 @@ class GameSession:
                             f"sy={confirm_sy_jp:.1f} → jp={cal_jp:.2f} gravity={cal_gravity:.3f}"
                         )
 
-                # Калибруем модель ускорения скорости из measured_spx
-                if measured_spx > 0.5 and jump_server_time > 0:
-                    self._calibrate_speed_model(jump_server_time, measured_spx)
+                # Калибруем модель ускорения скорости из arc_spx (мгновенная скорость).
+                # arc_spx = реальная скорость пета на serverTime.
+                if arc_spx > 0.5 and jump_server_time > 0:
+                    self._calibrate_speed_model(jump_server_time, arc_spx)
 
                 # Обновляем current_speed_x из модели ускорения (для AI loop)
-                self.current_speed_x = self._speed_at_server_time(self._now_server_ms())
+                if self._speed_model_ready:
+                    self.current_speed_x = self._speed_at_server_time(self._now_server_ms())
 
                 # Калибруем game_started_at по реальной позиции
                 if self.current_speed_x > 0:
