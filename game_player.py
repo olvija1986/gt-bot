@@ -533,6 +533,7 @@ class GameSession:
         self._last_jumped_barrier = 0.0  # x барьера для которого уже запланирован/выполнен прыжок
         self._prev_last_jumped_barrier = 0.0  # предыдущее значение для отката при rejection
         self._rejected_in_flight = False       # после rejection: следующее engine.jump — stale update
+        self._jump_started_at = 0.0            # time.time() когда последний _do_jump был вызван
         self._last_sent_jumped_at = 0.0   # jumpedAt который мы отправили последним
         self._jump_latency_ms     = 150.0 # EWMA задержки send→server подтверждения
         self._confirmed_jumps     = 0     # кол-во подтверждённых прыжков (для калибровки)
@@ -616,6 +617,17 @@ class GameSession:
         """
         while not self._done.is_set():
             if self.started and self.barriers and self.current_speed_x > 0:
+                # Safety timeout: если pet_status == "jumping" > 5с, принудительно сбросить
+                if (self.pet_status in ("jumping", "diving")
+                        and self._jump_started_at > 0
+                        and time.time() - self._jump_started_at > 5.0):
+                    logger.warning(
+                        f"[{self.game_id}] SAFETY TIMEOUT: pet_status={self.pet_status} "
+                        f"for {time.time() - self._jump_started_at:.1f}s, forcing running"
+                    )
+                    self.pet_status = "running"
+                    self._rejected_in_flight = False
+
                 if self.pet_status not in ("jumping", "diving"):
                     self._tick_bot()
             time.sleep(AI_POLL_INTERVAL_MS / 1000.0)
@@ -630,6 +642,7 @@ class GameSession:
         event = "engine.jump" if self.mode == "race" else "engine.dive"
         self._client.emit_with_null(event, payload)
         self.pet_status = "jumping"
+        self._jump_started_at = time.time()
         self._rejected_in_flight = False  # новый прыжок — сбрасываем флаг
         self._prev_last_jumped_barrier = self._last_jumped_barrier  # сохраняем для отката
         self._last_jumped_barrier = last_barrier_x
@@ -1014,6 +1027,22 @@ class GameSession:
             confirm_y = coords.get("y", 0)
             confirm_sy = speed_data.get("y", 0)
 
+            # После rejection сервер может прислать ещё один engine.jump
+            # с текущей позицией пета в дуге — это НЕ новый прыжок.
+            # Проверяем ДО rejection detection, т.к. stale update может иметь
+            # те же y/sy и ложно триггерить повторный rejection.
+            if self._rejected_in_flight:
+                logger.info(
+                    f"[{self.game_id}] Stale position update after rejection: "
+                    f"x={real_x} y={confirm_y:.1f} sy={confirm_sy:.1f} — ignoring"
+                )
+                self._last_confirm_y = confirm_y
+                self._last_confirm_sy = confirm_sy
+                if real_x is not None:
+                    self.pet_x = real_x
+                self._rejected_in_flight = False
+                return
+
             # Детекция отклонённого прыжка: сервер вернул те же y/sy что и раньше
             # → пет всё ещё в воздухе, прыжок был проигнорирован.
             if (self._last_confirm_y >= 0
@@ -1028,21 +1057,6 @@ class GameSession:
                 self._last_jumped_barrier = self._prev_last_jumped_barrier
                 self.pet_status = "jumping"  # пет ВСЁ ЕЩЁ в воздухе от предыдущего прыжка
                 self._rejected_in_flight = True  # следующее engine.jump — stale update, игнорировать
-                return
-
-            # После rejection сервер может прислать ещё один engine.jump
-            # с текущей позицией пета в дуге — это НЕ новый прыжок.
-            # Игнорируем его, обновляя только _last_confirm для детекции rejection.
-            if self._rejected_in_flight:
-                logger.info(
-                    f"[{self.game_id}] Stale position update after rejection: "
-                    f"x={real_x} y={confirm_y:.1f} sy={confirm_sy:.1f} — ignoring"
-                )
-                self._last_confirm_y = confirm_y
-                self._last_confirm_sy = confirm_sy
-                if real_x is not None:
-                    self.pet_x = real_x
-                self._rejected_in_flight = False
                 return
 
             self.pet_status = "jumping"
@@ -1123,104 +1137,32 @@ class GameSession:
             jump_server_time_val = data.get("serverTime") or self._now_server_ms()
             landing_server_time = jump_server_time_val + landing_ticks * 10.0
 
-            # Адаптивный буфер: учитываем сетевую задержку, минимум 0.3с
+            # Консервативный буфер: arc_remain * 1.5 (gravity может быть ниже для fly-петов)
+            # + сетевая задержка. Лучше подождать чуть дольше, чем прыгнуть в воздухе.
             latency_buf = max(0.3, self._jump_latency_ms / 500.0)
-            reset_delay = max(0.3, arc_remain * 0.01 + latency_buf)
+            reset_delay = max(0.5, arc_remain * 0.015 + latency_buf)
 
-            # ── Pre-schedule: ищем следующий барьер после приземления ──
-            # Если барьер близко — планируем прыжок заранее, пока в воздухе.
-            next_jump_delay = None
-            next_jump_barrier_x = None
-            if self.barriers and spx_for_landing > 0:
-                landing_front = landing_x + self.width_pet
-                for b in self.barriers:
-                    if b["x"] + self.width_barrier > landing_front and b["x"] > self._last_jumped_barrier:
-                        # Нашли следующий барьер после приземления
-                        dist_after_land = b["x"] - landing_front
-                        barrier_high = b.get("high", 50)
-
-                        # Рассчитываем безопасную зону для этого барьера
-                        dxs_pre, ys_pre = _simulate_arc_profile(
-                            spx_for_landing, self.jump_power, self.gravity
-                        )
-                        if not dxs_pre:
-                            break
-                        arc_len_pre = dxs_pre[-1]
-
-                        if dist_after_land > arc_len_pre:
-                            break  # барьер далеко, _tick_bot справится
-
-                        # Найти best_d в безопасной зоне
-                        step_pre = max(0.5, spx_for_landing * 0.5)
-                        best_d_pre = None
-                        best_margin_pre = -999.0
-                        d_pre = step_pre
-                        while d_pre < arc_len_pre:
-                            h_pre = _min_height_over_zone(dxs_pre, ys_pre, d_pre, self.width_barrier)
-                            margin_pre = h_pre - barrier_high
-                            if margin_pre > best_margin_pre:
-                                best_margin_pre = margin_pre
-                                best_d_pre = d_pre
-                            d_pre += step_pre
-
-                        if best_d_pre is not None and best_margin_pre > 0:
-                            # Тики от приземления до оптимальной точки прыжка
-                            ticks_to_optimal = max(0, (dist_after_land - best_d_pre) / spx_for_landing)
-                            # Общая задержка: arc до приземления + бег до optimal
-                            total_delay = landing_ticks * 0.01 + ticks_to_optimal * 0.01
-                            if total_delay > 0 and total_delay < 10:  # sanity
-                                next_jump_delay = total_delay
-                                next_jump_barrier_x = b["x"]
-                                # Проверяем мульти-барьер
-                                b_idx = self.barriers.index(b)
-                                for bi in range(b_idx + 1, len(self.barriers)):
-                                    b2 = self.barriers[bi]
-                                    d2 = b2["x"] - landing_front - (dist_after_land - best_d_pre)
-                                    if d2 >= arc_len_pre:
-                                        break
-                                    h2 = b2.get("high", 50)
-                                    h_over = _min_height_over_zone(dxs_pre, ys_pre, d2, self.width_barrier)
-                                    if h_over > h2:
-                                        next_jump_barrier_x = b2["x"]
-                                    else:
-                                        break
-                        break
-
-            def reset_after_jump(delay, land_x, land_srv_time,
-                                 sched_delay, sched_barrier_x):
+            def reset_after_jump(delay, land_x, land_srv_time):
                 time.sleep(delay)
-                self._rejected_in_flight = False  # дуга завершена, больше нет stale updates
+                self._rejected_in_flight = False  # дуга завершена
                 if self.pet_status == "jumping":
                     self.pet_status = "running"
                     self._anchor_x = land_x
                     self._anchor_server_time = land_srv_time
-
-                # Pre-scheduled jump: если следующий барьер близко
-                if sched_delay is not None and sched_barrier_x is not None:
-                    extra_wait = max(0, sched_delay - delay)
-                    if extra_wait > 0:
-                        time.sleep(extra_wait)
-                    # Проверяем что бот ещё не прыгнул для этого барьера
-                    if (self.pet_status == "running"
-                            and sched_barrier_x > self._last_jumped_barrier
-                            and not self._done.is_set()):
-                        self._do_jump(
-                            sched_barrier_x,
-                            0.0,  # dist неизвестен точно
-                            f"PRE-SCHEDULED from arc"
-                        )
+                    logger.info(
+                        f"[{self.game_id}] Arc timer: pet_status → running, "
+                        f"anchor_x={land_x:.0f}"
+                    )
 
             threading.Thread(
                 target=reset_after_jump,
-                args=(reset_delay, landing_x, landing_server_time,
-                      next_jump_delay, next_jump_barrier_x),
+                args=(reset_delay, landing_x, landing_server_time),
                 daemon=True
             ).start()
             logger.info(
                 f"[{self.game_id}] Arc remaining: {arc_remain} ticks "
                 f"({reset_delay:.1f}s) y={confirm_y:.0f} sy={confirm_sy:.1f} "
-                f"landing_x={landing_x:.0f} "
-                f"{'PRE-SCHED ' + str(next_jump_barrier_x) if next_jump_barrier_x else 'no-presched'}"
+                f"landing_x={landing_x:.0f}"
             )
 
         client.on("_open",                  on_open)
