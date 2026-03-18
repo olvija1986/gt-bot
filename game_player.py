@@ -1102,11 +1102,16 @@ class GameSession:
 
         # ── Мульти-барьерная проверка (сильные петы) ──
         # Проверяем, перелетит ли дуга ещё барьеры впереди.
+        # ОГРАНИЧЕНИЕ: проверяем только барьеры в первых 65% дуги.
+        # После пика высота падает на g=7px/тик → крайне чувствительна
+        # к ошибке скорости. 20% ошибка → 49px разницы высоты.
+        # В хвосте дуги "cleared" ложно-положительный → пет врезается.
+        multi_barrier_limit = arc_len * 0.65
         last_cleared_x = barrier["x"]
         for i in range(next_idx + 1, len(self.barriers)):
             b2 = self.barriers[i]
             d2 = b2["x"] - pet_front
-            if d2 >= arc_len:
+            if d2 >= multi_barrier_limit:
                 break
             h2 = b2.get("high", 50)
             h_over = _min_height_over_zone(dxs, ys, d2, self.width_barrier)
