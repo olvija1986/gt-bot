@@ -111,7 +111,7 @@ def ticks_to_reach_height(jump_power: float, gravity: float, target_height: floa
     return 200
 
 
-def estimate_jump_power(y: float, speed_y: float, gravity: float = 1.5) -> float:
+def estimate_jump_power(y: float, speed_y: float, gravity: float = 6.0) -> float:
     """Вычисляет jump_power из подтверждённых y и speed_y в середине дуги.
 
     Формула: y*0.6 = p*(speed_y - (gravity+0.3) + 0.5*p), где p = jp - speed_y.
@@ -168,7 +168,7 @@ def calibrate_gravity_jp(confirm_y: float, confirm_sy: float,
             candidates.append((N, jp, g, err))
 
     if not candidates:
-        return 1.5, estimate_jump_power(confirm_y, confirm_sy, 1.5)
+        return 6.0, estimate_jump_power(confirm_y, confirm_sy, 6.0)
 
     # Если есть данные предыдущего прыжка — используем как второе уравнение
     if prev_confirm_y > 0 and prev_confirm_sy > 0:
@@ -213,7 +213,7 @@ def calibrate_gravity_jp(confirm_y: float, confirm_sy: float,
     return best_g, best_jp
 
 
-def remaining_arc_ticks(y: float, speed_y: float, gravity: float = 1.5) -> int:
+def remaining_arc_ticks(y: float, speed_y: float, gravity: float = 6.0) -> int:
     """Сколько тиков до приземления из текущей точки дуги (y, speed_y)."""
     for tick in range(1, 5000):
         speed_y -= 0.6
@@ -484,7 +484,7 @@ def _agility_to_speed_per_ms(agility: int) -> float:
     return ys[-1]
 
 
-def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity: float = 1.5) -> float:
+def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity: float = 6.0) -> float:
     """Симулирует физику прыжка и возвращает x где пет приземлится."""
     y, sy = 0.0, jump_power
     x = float(start_x)
@@ -503,7 +503,7 @@ def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity
     return x
 
 
-def _simulate_arc_profile(speed_x: float, jump_power: float, gravity: float = 1.5):
+def _simulate_arc_profile(speed_x: float, jump_power: float, gravity: float = 6.0):
     """
     Симулирует полный прыжок и возвращает (dxs, ys) — параллельные массивы
     горизонтального смещения и высоты на каждом тике.
@@ -553,7 +553,7 @@ def _min_height_over_zone(dxs: list, ys: list, start_dx: float, zone_width: floa
 
 
 def _calc_landing(real_x: float, speed_x: float, confirm_y: float, confirm_sy: float,
-                  gravity: float = 1.5) -> tuple:
+                  gravity: float = 6.0) -> tuple:
     """
     Вычисляет позицию и время приземления из mid-arc состояния.
     Возвращает (landing_x, landing_ticks).
@@ -593,7 +593,7 @@ class GameSession:
         # Физические параметры пета — берём из engine.user.connected
         self.jump_power    = 20.0    # дефолт, перезапишется из pet.info
         self.dive_power    = 10.0    # для swim
-        self.gravity       = 1.5
+        self.gravity       = 6.0     # консервативный дефолт; калибруется после 1-го прыжка
         self.width_pet     = 40
         self.width_barrier = 30      # raceBarrier / poolBarrier
         # Клик координата из реального трафика
@@ -798,6 +798,17 @@ class GameSession:
         if self.game_started_at and spx_now > 0:
             if self.physics_start_at:
                 ground_dist = self._integrate_distance(self.physics_start_at, now_srv)
+                # До калибровки: скорость ускоряется, но модель не готова.
+                # _integrate_distance использует постоянную current_speed_x →
+                # позиция ЗАНИЖЕНА → dist к барьеру завышена → прыжок поздно.
+                # Применяем тот же буст что и в _tick_bot.
+                if self._confirmed_jumps == 0 and not self._speed_model_ready:
+                    elapsed_sec = max(0.0, (now_srv - self.physics_start_at) / 1000.0)
+                    if elapsed_sec > 0.3:
+                        # Средний буст за период [0, elapsed_sec]:
+                        # avg_boost = 1 + 0.15 * elapsed_sec / 2
+                        avg_boost = 1.0 + min(0.25, elapsed_sec * 0.075)
+                        ground_dist *= avg_boost
                 return 118.0 + ground_dist + forward_px
             elapsed_ms = time.time() * 1000 - self.game_started_at
             return 118.0 + spx_now * (elapsed_ms / 10.0) + forward_px
@@ -929,6 +940,25 @@ class GameSession:
         spx = self.current_speed_x
         barrier_high = barrier.get("high", 50)
 
+        # ── Коррекция скорости для первого прыжка ──
+        # До калибровки current_speed_x = начальная скорость из формулы (agi→px/tick).
+        # Но speed УСКОРЯЕТСЯ со временем (speed.ts: initial → max за speedUpInSec).
+        # К моменту первого барьера (2-3 сек) скорость уже значительно выше начальной.
+        # Если speed model готов (speed config от сервера) — скорость уже корректна.
+        # Если НЕТ — оцениваем по прошедшему времени: +15%/сек, макс +50%.
+        if self._confirmed_jumps == 0 and not self._speed_model_ready and self.physics_start_at > 0:
+            elapsed_sec = max(0.0, (self._now_server_ms() - self.physics_start_at) / 1000.0)
+            if elapsed_sec > 0.3:
+                # Типичное ускорение из реальных данных:
+                # initial=1.64 → actual=2.33 за ~3сек ≈ +14%/сек.
+                boost = 1.0 + min(0.5, elapsed_sec * 0.15)
+                spx = spx * boost
+                logger.info(
+                    f"[{self.game_id}] First jump speed boost: "
+                    f"base={self.current_speed_x:.3f} elapsed={elapsed_sec:.1f}s "
+                    f"boost={boost:.2f} → spx={spx:.3f}"
+                )
+
         # ── Симуляция дуги ──
         dxs, ys = _simulate_arc_profile(spx, self.jump_power, self.gravity)
         if not dxs:
@@ -964,10 +994,39 @@ class GameSession:
 
         if min_safe_d is None:
             # Пет НЕ МОЖЕТ перепрыгнуть этот барьер ни при каком тайминге.
-            # Аварийный прыжок — максимальная высота (best effort).
-            if dist <= spx * 10:
-                self._do_jump(barrier["x"], dist, "EMERGENCY no-safe-zone")
-            return
+            # Для первого прыжка: пробуем с ещё более высокой скоростью (1.5x текущей).
+            # Реальная скорость может быть выше оценки из-за неточной формулы.
+            if self._confirmed_jumps == 0:
+                spx_retry = spx * 1.3
+                dxs2, ys2 = _simulate_arc_profile(spx_retry, self.jump_power, self.gravity)
+                if dxs2:
+                    arc_len2 = dxs2[-1]
+                    d = max(0.5, spx_retry * 0.5)
+                    while d < arc_len2:
+                        h = _min_height_over_zone(dxs2, ys2, d, self.width_barrier)
+                        margin = h - barrier_high
+                        if margin > 0:
+                            if min_safe_d is None:
+                                min_safe_d = d
+                            max_safe_d = d
+                            if margin > best_margin:
+                                best_margin = margin
+                                best_safe_d = d
+                        d += max(0.5, spx_retry * 0.5)
+                    if min_safe_d is not None:
+                        # Нашли зону с повышенной скоростью — обновляем arc
+                        dxs, ys = dxs2, ys2
+                        arc_len = arc_len2
+                        spx = spx_retry
+                        logger.info(
+                            f"[{self.game_id}] First jump: safe zone found with "
+                            f"boosted spx={spx_retry:.3f} (1.3x retry)"
+                        )
+            if min_safe_d is None:
+                # Аварийный прыжок — максимальная высота (best effort).
+                if dist <= spx * 10:
+                    self._do_jump(barrier["x"], dist, "EMERGENCY no-safe-zone")
+                return
 
         # ── Учёт сетевого лага ──
         lag_ticks = (
@@ -1023,7 +1082,7 @@ class GameSession:
                       f"zone=[{min_safe_d:.0f},{max_safe_d:.0f}] "
                       f"best={best_safe_d:.0f} margin={best_margin:.1f} "
                       f"trigger={trigger:.0f} lag={lag_px:.0f} arc={arc_len:.0f} "
-                      f"cleared_to={last_cleared_x}")
+                      f"spx_used={spx:.3f} cleared_to={last_cleared_x}")
 
     def _make_action_payload(self) -> dict:
         return {
