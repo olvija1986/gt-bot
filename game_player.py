@@ -1549,25 +1549,34 @@ class GameSession:
             reset_delay = max(1.0, arc_remain * 0.015 + latency_buf)
             reset_delay = min(reset_delay, 25.0)  # не более 25с (для low-gravity петов дуга до 15с+)
 
-            def reset_after_jump(delay, lx, lst):
+            def reset_after_jump(delay, lx, lst, created_at_jump):
                 time.sleep(delay)
                 self._rejected_in_flight = False
-                if self.pet_status == "jumping":
-                    self.pet_status = "running"
-                    self._last_confirm_y = -1.0
-                    self._last_confirm_sy = -1.0
-                    # Обновляем anchor на предсказанную позицию приземления
-                    self._anchor_x = lx
-                    self._anchor_server_time = lst
-                    self._arc_spx = 0.0
+                # Если после создания этого таймера был подтверждён НОВЫЙ прыжок,
+                # этот таймер устарел — его anchor_x неактуален.
+                if self._confirmed_jumps > created_at_jump:
                     logger.info(
-                        f"[{self.game_id}] Arc timer: pet_status → running, "
-                        f"anchor_x={lx:.0f}"
+                        f"[{self.game_id}] Arc timer SKIPPED (stale): "
+                        f"created for jump#{created_at_jump}, "
+                        f"current jumps={self._confirmed_jumps}"
                     )
+                    return
+                if self.pet_status in ("jumping", "diving"):
+                    self.pet_status = "running"
+                self._last_confirm_y = -1.0
+                self._last_confirm_sy = -1.0
+                self._anchor_x = lx
+                self._anchor_server_time = lst
+                self._arc_spx = 0.0
+                logger.info(
+                    f"[{self.game_id}] Arc timer: pet_status → running, "
+                    f"anchor_x={lx:.0f} (jump#{created_at_jump})"
+                )
 
             threading.Thread(
                 target=reset_after_jump,
-                args=(reset_delay, landing_x, self._landing_server_time),
+                args=(reset_delay, landing_x, self._landing_server_time,
+                      self._confirmed_jumps),
                 daemon=True
             ).start()
             logger.info(
