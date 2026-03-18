@@ -532,6 +532,7 @@ class GameSession:
         self._jump_timers       = []    # список Timer объектов
         self._last_jumped_barrier = 0.0  # x барьера для которого уже запланирован/выполнен прыжок
         self._prev_last_jumped_barrier = 0.0  # предыдущее значение для отката при rejection
+        self._rejected_in_flight = False       # после rejection: следующее engine.jump — stale update
         self._last_sent_jumped_at = 0.0   # jumpedAt который мы отправили последним
         self._jump_latency_ms     = 150.0 # EWMA задержки send→server подтверждения
         self._confirmed_jumps     = 0     # кол-во подтверждённых прыжков (для калибровки)
@@ -629,6 +630,7 @@ class GameSession:
         event = "engine.jump" if self.mode == "race" else "engine.dive"
         self._client.emit_with_null(event, payload)
         self.pet_status = "jumping"
+        self._rejected_in_flight = False  # новый прыжок — сбрасываем флаг
         self._prev_last_jumped_barrier = self._last_jumped_barrier  # сохраняем для отката
         self._last_jumped_barrier = last_barrier_x
         self._last_sent_jumped_at = now_srv
@@ -1024,7 +1026,23 @@ class GameSession:
                 )
                 # Откат состояния: прыжок не состоялся — возвращаем предыдущие значения
                 self._last_jumped_barrier = self._prev_last_jumped_barrier
-                self.pet_status = "running"
+                self.pet_status = "jumping"  # пет ВСЁ ЕЩЁ в воздухе от предыдущего прыжка
+                self._rejected_in_flight = True  # следующее engine.jump — stale update, игнорировать
+                return
+
+            # После rejection сервер может прислать ещё один engine.jump
+            # с текущей позицией пета в дуге — это НЕ новый прыжок.
+            # Игнорируем его, обновляя только _last_confirm для детекции rejection.
+            if self._rejected_in_flight:
+                logger.info(
+                    f"[{self.game_id}] Stale position update after rejection: "
+                    f"x={real_x} y={confirm_y:.1f} sy={confirm_sy:.1f} — ignoring"
+                )
+                self._last_confirm_y = confirm_y
+                self._last_confirm_sy = confirm_sy
+                if real_x is not None:
+                    self.pet_x = real_x
+                self._rejected_in_flight = False
                 return
 
             self.pet_status = "jumping"
@@ -1073,7 +1091,7 @@ class GameSession:
                 # Калибруем jump_power из подтверждённых y и speed_y
                 confirm_y_jp = confirm_y
                 confirm_sy_jp = confirm_sy
-                if confirm_y_jp > 10 and confirm_sy_jp > 1 and self._confirmed_jumps <= 2:
+                if confirm_y_jp > 10 and confirm_sy_jp > 1 and self._confirmed_jumps <= 1:
                     estimated_jp = estimate_jump_power(confirm_y_jp, confirm_sy_jp)
                     if 15 < estimated_jp < 40:
                         self.jump_power = estimated_jp
@@ -1171,6 +1189,7 @@ class GameSession:
             def reset_after_jump(delay, land_x, land_srv_time,
                                  sched_delay, sched_barrier_x):
                 time.sleep(delay)
+                self._rejected_in_flight = False  # дуга завершена, больше нет stale updates
                 if self.pet_status == "jumping":
                     self.pet_status = "running"
                     self._anchor_x = land_x
