@@ -111,22 +111,64 @@ def ticks_to_reach_height(jump_power: float, gravity: float, target_height: floa
     return 200
 
 
-def estimate_jump_power(y: float, speed_y: float) -> float:
+def estimate_jump_power(y: float, speed_y: float, gravity: float = 1.5) -> float:
     """Вычисляет jump_power из подтверждённых y и speed_y в середине дуги.
 
-    Решаем: y*0.6 = p*(speed_y - 1.8 + 0.5*p), где p = jp - speed_y.
-    Квадратное уравнение: 0.5*p² + (speed_y-1.8)*p - 0.6*y = 0
+    Формула: y*0.6 = p*(speed_y - (gravity+0.3) + 0.5*p), где p = jp - speed_y.
     """
     if y <= 0 or speed_y <= 0:
         return speed_y if speed_y > 0 else 20.0
     a = 0.5
-    b = speed_y - 1.8
+    b = speed_y - (gravity + 0.3)
     c = -0.6 * y
     disc = b * b - 4 * a * c
     if disc < 0:
         return 20.0
     p = (-b + disc ** 0.5) / (2 * a)
     return speed_y + max(0, p)
+
+
+def calibrate_gravity_jp(confirm_y: float, confirm_sy: float) -> tuple:
+    """Вычисляет gravity и jump_power из первого подтверждённого прыжка.
+
+    Перебирает количество тиков N (от 1 до 50). Для каждого N:
+    - jp = confirm_sy + 0.6*N
+    - gravity = confirm_sy + 0.3*N - 0.3 - confirm_y/N
+    Выбирает пару (gravity, jp) с наименьшей ошибкой при симуляции.
+    """
+    best_g = 1.5
+    best_jp = 20.0
+    best_err = float('inf')
+
+    for N in range(3, 50):
+        jp = confirm_sy + 0.6 * N
+        if jp < 10 or jp > 40:
+            continue
+        g = confirm_sy + 0.3 * N - 0.3 - confirm_y / N
+        if g < 0.05 or g > 3.0:
+            continue
+        # Верифицируем симуляцией
+        y, sy = 0.0, jp
+        for tick in range(1, N + 1):
+            sy -= 0.6
+            if sy < 0:
+                sy = 0.0
+            y += sy
+            if y - g > 0:
+                y -= g
+            else:
+                y = 0.0
+                break
+        err = abs(y - confirm_y) + abs(sy - confirm_sy) * 10
+        if err < best_err:
+            best_err = err
+            best_g = g
+            best_jp = jp
+
+    if best_err > 5.0:
+        # Не удалось подобрать — оставляем значения по умолчанию
+        return 1.5, estimate_jump_power(confirm_y, confirm_sy, 1.5)
+    return best_g, best_jp
 
 
 def remaining_arc_ticks(y: float, speed_y: float, gravity: float = 1.5) -> int:
@@ -1074,44 +1116,48 @@ class GameSession:
                 self.pet_x = real_x
                 jump_server_time = data.get("serverTime") or self._now_server_ms()
 
-                # Измеряем среднюю скорость от anchor до confirmed.
+                # Измеряем скорость от anchor до confirmed.
                 measured_spx = 0.0
                 if self._anchor_server_time > 0 and self._anchor_x >= 0:
                     dt_ticks = (jump_server_time - self._anchor_server_time) / 10.0
-                    if dt_ticks > 100:  # минимум 1с для точного замера (было 5)
+                    if dt_ticks > 100:  # минимум 1с
                         measured_spx = (real_x - self._anchor_x) / dt_ticks
 
-                # Используем measured_spx только если интервал достаточно длинный.
-                # При коротких интервалах (после PRE-SCHED) ошибка в landing_x
-                # усиливается — предпочитаем arc_spx.
-                if measured_spx > 0.5:
-                    # Защита от аномальных скачков: не более ±30% от текущей
-                    if self.current_speed_x > 0.5:
-                        ratio = measured_spx / self.current_speed_x
-                        if 0.7 <= ratio <= 1.3:
-                            self.current_speed_x = measured_spx
-                        else:
-                            # Аномальный скачок — усредняем вместо резкой замены
-                            self.current_speed_x = self.current_speed_x * 0.7 + measured_spx * 0.3
-                    else:
+                # Первый прыжок: measured_spx от старта игры — самый точный.
+                # Последующие: anchor стоит на mid-arc прошлого прыжка,
+                # measured_spx смешивает arc и ground время — ненадёжно.
+                # Поэтому после первой калибровки скорость не меняем,
+                # если measured_spx аномальный.
+                if self._confirmed_jumps == 0:
+                    # Первый прыжок: надёжный замер от x=118
+                    if measured_spx > 0.5:
                         self.current_speed_x = measured_spx
-                elif arc_spx > 0.5:
-                    self.current_speed_x = arc_spx
+                    elif arc_spx > 0.5:
+                        self.current_speed_x = arc_spx
+                else:
+                    # Последующие: measured_spx ненадёжен (anchor mid-arc).
+                    # Обновляем только если measured_spx в пределах ±20% от текущей.
+                    if measured_spx > 0.5 and self.current_speed_x > 0.5:
+                        ratio = measured_spx / self.current_speed_x
+                        if 0.8 <= ratio <= 1.2:
+                            self.current_speed_x = self.current_speed_x * 0.8 + measured_spx * 0.2
+                    # НЕ используем arc_spx как fallback — он выше ground speed
 
                 self._confirmed_jumps += 1
                 self._anchor_x = real_x
                 self._anchor_server_time = jump_server_time
 
-                # Калибруем jump_power из подтверждённых y и speed_y
+                # Калибруем gravity И jump_power из первого подтверждения
                 confirm_y_jp = confirm_y
                 confirm_sy_jp = confirm_sy
                 if confirm_y_jp > 10 and confirm_sy_jp > 1 and self._confirmed_jumps <= 1:
-                    estimated_jp = estimate_jump_power(confirm_y_jp, confirm_sy_jp)
-                    if 15 < estimated_jp < 40:
-                        self.jump_power = estimated_jp
+                    cal_gravity, cal_jp = calibrate_gravity_jp(confirm_y_jp, confirm_sy_jp)
+                    if 15 < cal_jp < 40:
+                        self.jump_power = cal_jp
+                        self.gravity = cal_gravity
                         logger.info(
-                            f"[{self.game_id}] Калибровка JP: y={confirm_y_jp:.1f} "
-                            f"sy={confirm_sy_jp:.1f} → jp={estimated_jp:.2f}"
+                            f"[{self.game_id}] Калибровка JP+G: y={confirm_y_jp:.1f} "
+                            f"sy={confirm_sy_jp:.1f} → jp={cal_jp:.2f} gravity={cal_gravity:.3f}"
                         )
 
                 # Калибруем game_started_at по реальной позиции
@@ -1137,26 +1183,26 @@ class GameSession:
             jump_server_time_val = data.get("serverTime") or self._now_server_ms()
             landing_server_time = jump_server_time_val + landing_ticks * 10.0
 
-            # Консервативный буфер: arc_remain * 1.5 (gravity может быть ниже для fly-петов)
-            # + сетевая задержка. Лучше подождать чуть дольше, чем прыгнуть в воздухе.
+            # Буфер: arc_remain + запас 20% + сетевая задержка.
+            # Gravity теперь калибруется, так что arc_remain должен быть точным.
             latency_buf = max(0.3, self._jump_latency_ms / 500.0)
-            reset_delay = max(0.5, arc_remain * 0.015 + latency_buf)
+            reset_delay = max(0.5, arc_remain * 0.012 + latency_buf)
 
-            def reset_after_jump(delay, land_x, land_srv_time):
+            def reset_after_jump(delay):
                 time.sleep(delay)
                 self._rejected_in_flight = False  # дуга завершена
                 if self.pet_status == "jumping":
                     self.pet_status = "running"
-                    self._anchor_x = land_x
-                    self._anchor_server_time = land_srv_time
+                    # НЕ обновляем anchor — landing_x предсказание неточное
+                    # (зависит от gravity которую мы можем не знать идеально).
+                    # Anchor остаётся от последнего подтверждённого прыжка.
                     logger.info(
-                        f"[{self.game_id}] Arc timer: pet_status → running, "
-                        f"anchor_x={land_x:.0f}"
+                        f"[{self.game_id}] Arc timer: pet_status → running"
                     )
 
             threading.Thread(
                 target=reset_after_jump,
-                args=(reset_delay, landing_x, landing_server_time),
+                args=(reset_delay,),
                 daemon=True
             ).start()
             logger.info(
