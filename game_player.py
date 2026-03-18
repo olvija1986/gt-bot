@@ -173,7 +173,7 @@ def calibrate_gravity_jp(confirm_y: float, confirm_sy: float) -> tuple:
 
 def remaining_arc_ticks(y: float, speed_y: float, gravity: float = 1.5) -> int:
     """Сколько тиков до приземления из текущей точки дуги (y, speed_y)."""
-    for tick in range(1, 500):
+    for tick in range(1, 5000):
         speed_y -= 0.6
         if speed_y < 0:
             speed_y = 0.0
@@ -182,7 +182,7 @@ def remaining_arc_ticks(y: float, speed_y: float, gravity: float = 1.5) -> int:
             y -= gravity
         else:
             return tick
-    return 500
+    return 5000
 
 
 def ticks_to_reach_depth(dive_power: float, target_depth: float) -> int:
@@ -446,7 +446,7 @@ def _simulate_landing(start_x: float, speed_x: float, jump_power: float, gravity
     """Симулирует физику прыжка и возвращает x где пет приземлится."""
     y, sy = 0.0, jump_power
     x = float(start_x)
-    for _ in range(500):
+    for _ in range(5000):
         sy -= 0.6
         if sy < 0:
             sy = 0.0
@@ -470,7 +470,7 @@ def _simulate_arc_profile(speed_x: float, jump_power: float, gravity: float = 1.
     dxs, ys = [], []
     y, sy = 0.0, jump_power
     dx = 0.0
-    for _ in range(500):
+    for _ in range(5000):
         sy -= 0.6
         if sy < 0:
             sy = 0.0
@@ -518,7 +518,7 @@ def _calc_landing(real_x: float, speed_x: float, confirm_y: float, confirm_sy: f
     """
     y, sy = confirm_y, confirm_sy
     dx = 0.0
-    for tick in range(1, 500):
+    for tick in range(1, 5000):
         sy -= 0.6
         if sy < 0:
             sy = 0.0
@@ -528,7 +528,7 @@ def _calc_landing(real_x: float, speed_x: float, confirm_y: float, confirm_sy: f
         else:
             return real_x + dx, tick
         dx += speed_x
-    return real_x + dx, 500
+    return real_x + dx, 5000
 
 
 class GameSession:
@@ -589,6 +589,16 @@ class GameSession:
         self._arc_spx            = 0.0   # speed_x во время дуги (выше ground speed)
         self._landing_x          = 0.0   # предсказанная позиция приземления
         self._landing_server_time = 0.0  # предсказанный serverTime приземления
+
+        # ── Модель ускорения скорости (из speed.ts) ──
+        # speed(t) = min(initial_speed + accel * t_sec, max_speed)
+        # Калибруется из подтверждённых прыжков.
+        self._speed_initial      = 0.0   # начальная скорость px/tick (из pre-game sync или connected)
+        self._speed_max          = 0.0   # максимальная скорость px/tick (оценка)
+        self._speed_accel        = 0.0   # ускорение px/tick/sec
+        self._speed_samples      = []    # [(server_time, speed_x)] для калибровки ускорения
+        self._speed_model_ready  = False # модель откалибрована
+
         self.result             = None
         self._done         = threading.Event()
 
@@ -596,44 +606,157 @@ class GameSession:
         """Оценивает текущее serverTime по локальным часам + offset."""
         return time.time() * 1000 + self.server_time_offset
 
+    def _speed_at_server_time(self, server_time_ms: float) -> float:
+        """
+        Вычисляет ground speed (px/tick) на момент server_time_ms.
+
+        Модель из speed.ts: speed(t) = min(initial + accel * t_sec, max_speed)
+        Если модель не откалибрована — возвращает current_speed_x.
+        """
+        if not self._speed_model_ready or not self.physics_start_at:
+            return self.current_speed_x
+        t_sec = max(0.0, (server_time_ms - self.physics_start_at) / 1000.0)
+        spx = self._speed_initial + self._speed_accel * t_sec
+        if self._speed_max > 0:
+            spx = min(spx, self._speed_max)
+        return max(0.1, spx)
+
+    def _calibrate_speed_model(self, server_time: float, speed_x: float):
+        """
+        Добавляет точку (server_time, speed_x) и калибрует модель ускорения.
+
+        После 2+ точек вычисляем линейную регрессию speed(t) = initial + accel * t_sec.
+        """
+        if not self.physics_start_at or speed_x <= 0.1:
+            return
+        self._speed_samples.append((server_time, speed_x))
+
+        # Нужно минимум 2 точки для вычисления ускорения
+        if len(self._speed_samples) < 2:
+            # Одна точка: сохраняем как initial, ускорение 0
+            self._speed_initial = speed_x
+            return
+
+        # Линейная регрессия: speed = a + b * t_sec
+        n = len(self._speed_samples)
+        sum_t = sum_s = sum_ts = sum_tt = 0.0
+        for st, sx in self._speed_samples:
+            t = (st - self.physics_start_at) / 1000.0
+            sum_t += t
+            sum_s += sx
+            sum_ts += t * sx
+            sum_tt += t * t
+
+        denom = n * sum_tt - sum_t * sum_t
+        if abs(denom) < 1e-9:
+            return
+
+        b = (n * sum_ts - sum_t * sum_s) / denom  # ускорение
+        a = (sum_s - b * sum_t) / n                # начальная скорость
+
+        if a > 0.1 and b >= 0:
+            self._speed_initial = a
+            self._speed_accel = b
+            # Оценка max_speed: если ускорение > 0, max ≈ последнее наблюдение * 1.5
+            # (или будет уточнено если скорость перестанет расти)
+            if b > 0 and not self._speed_max:
+                last_spx = self._speed_samples[-1][1]
+                self._speed_max = last_spx * 2.0  # грубая верхняя граница
+            self._speed_model_ready = True
+            logger.info(
+                f"[{self.game_id}] Speed model: initial={a:.4f} accel={b:.6f}/sec "
+                f"max={self._speed_max:.4f} samples={n}"
+            )
+
+    def _integrate_distance(self, from_server_time: float, to_server_time: float) -> float:
+        """
+        Интегрирует пройденное расстояние с учётом ускорения скорости.
+        speed(t) = min(initial + accel * t_sec, max_speed)
+        Расстояние = интеграл speed от t0 до t1 (в тиках).
+        """
+        if not self._speed_model_ready or not self.physics_start_at:
+            # Фоллбэк: постоянная скорость
+            dt_ticks = (to_server_time - from_server_time) / 10.0
+            return self.current_speed_x * max(0.0, dt_ticks)
+
+        # t0, t1 — секунды от начала физики
+        t0_sec = max(0.0, (from_server_time - self.physics_start_at) / 1000.0)
+        t1_sec = max(t0_sec, (to_server_time - self.physics_start_at) / 1000.0)
+
+        a = self._speed_accel   # px/tick / sec
+        s0 = self._speed_initial  # px/tick при t=0
+        s_max = self._speed_max if self._speed_max > 0 else 1e9
+
+        # Время (сек от старта) когда скорость достигает max
+        if a > 1e-9:
+            t_cap_sec = (s_max - s0) / a
+        else:
+            t_cap_sec = 1e9  # нет ускорения
+
+        # Интегрируем speed(t)*100 ticks/sec от t0_sec до t1_sec
+        # speed в px/tick, 100 тиков/сек → distance_per_sec = speed * 100
+        # Но нам нужно в тиках: dt_ticks = (t1 - t0) * 100, distance = sum(speed * 1 tick)
+        # Или: distance = integral(speed(t), dt) * 100  (переводим сек в тики)
+
+        dist = 0.0
+        # Фаза 1: ускорение (t0 до min(t1, t_cap))
+        phase1_end = min(t1_sec, t_cap_sec)
+        if phase1_end > t0_sec:
+            dt = phase1_end - t0_sec
+            # speed(t) = s0 + a*t (px/tick)
+            # integral = (s0 + a*t0)*dt + a*dt^2/2  (в px/tick * sec)
+            # Переводим в px: * 100 тиков/сек
+            avg_speed = (s0 + a * t0_sec) + a * dt / 2.0
+            dist += avg_speed * dt * 100.0  # px
+
+        # Фаза 2: максимальная скорость (t_cap до t1)
+        if t1_sec > t_cap_sec and t_cap_sec > t0_sec:
+            dt = t1_sec - t_cap_sec
+            dist += s_max * dt * 100.0
+        elif t1_sec > t_cap_sec and t_cap_sec <= t0_sec:
+            # Уже на максимальной скорости весь интервал
+            dt = t1_sec - t0_sec
+            dist += s_max * dt * 100.0
+
+        return dist
+
     def _estimate_pet_x(self) -> float:
         """
         Предсказывает x по последней опорной точке (x, serverTime).
 
         Во время прыжка пет движется с arc_spx (выше ground speed).
-        После приземления — с ground speed (current_speed_x).
+        После приземления — с ground speed (с учётом ускорения).
         """
-        # Коррекция на одностороннюю сетевую задержку (половина RTT)
+        now_srv = self._now_server_ms()
+        # Текущая скорость для forward-prediction (пол-RTT вперёд)
+        spx_now = self._speed_at_server_time(now_srv)
         half_rtt_ticks = self._jump_latency_ms / 20.0
-        spx = self.current_speed_x
-        forward_px = spx * half_rtt_ticks
+        forward_px = spx_now * half_rtt_ticks
 
-        if self._anchor_server_time > 0 and spx > 0:
-            now_srv = self._now_server_ms()
-            dt_ticks = max(0.0, (now_srv - self._anchor_server_time) / 10.0)
-
-            # Во время прыжка: если мы знаем arc_spx и landing_server_time,
-            # используем arc_spx до приземления и ground speed после.
+        if self._anchor_server_time > 0 and spx_now > 0:
+            # Во время прыжка: arc_spx до приземления, ground speed после
             if (self.pet_status == "jumping"
                     and self._arc_spx > 0
                     and self._landing_server_time > self._anchor_server_time):
                 if now_srv < self._landing_server_time:
-                    # Ещё в воздухе — вся дельта по arc_spx
+                    dt_ticks = max(0.0, (now_srv - self._anchor_server_time) / 10.0)
                     return self._anchor_x + self._arc_spx * dt_ticks + self._arc_spx * half_rtt_ticks
                 else:
-                    # Уже должен был приземлиться — arc + ground
                     arc_ticks = (self._landing_server_time - self._anchor_server_time) / 10.0
-                    ground_ticks = dt_ticks - arc_ticks
-                    return (self._anchor_x
-                            + self._arc_spx * arc_ticks
-                            + spx * ground_ticks
-                            + forward_px)
+                    arc_dist = self._arc_spx * arc_ticks
+                    ground_dist = self._integrate_distance(self._landing_server_time, now_srv)
+                    return self._anchor_x + arc_dist + ground_dist + forward_px
 
-            return self._anchor_x + spx * dt_ticks + forward_px
+            # На земле: интегрируем расстояние с ускорением
+            ground_dist = self._integrate_distance(self._anchor_server_time, now_srv)
+            return self._anchor_x + ground_dist + forward_px
 
-        if self.game_started_at and spx > 0:
+        if self.game_started_at and spx_now > 0:
+            if self.physics_start_at:
+                ground_dist = self._integrate_distance(self.physics_start_at, now_srv)
+                return 118.0 + ground_dist + forward_px
             elapsed_ms = time.time() * 1000 - self.game_started_at
-            return 118.0 + spx * (elapsed_ms / 10.0) + forward_px
+            return 118.0 + spx_now * (elapsed_ms / 10.0) + forward_px
 
         return self.pet_x
 
@@ -680,11 +803,19 @@ class GameSession:
         intelligence=1.0 → triggerDist = idealDist (идеальная реакция).
         """
         while not self._done.is_set():
-            if self.started and self.barriers and self.current_speed_x > 0:
+            if self.started and self.barriers:
+                # Обновляем current_speed_x из модели ускорения
+                if self._speed_model_ready:
+                    self.current_speed_x = self._speed_at_server_time(self._now_server_ms())
+
+                if self.current_speed_x <= 0:
+                    time.sleep(AI_POLL_INTERVAL_MS / 1000.0)
+                    continue
+
                 # Safety timeout: если pet_status == "jumping" > 5с, принудительно сбросить
                 if (self.pet_status in ("jumping", "diving")
                         and self._jump_started_at > 0
-                        and time.time() - self._jump_started_at > 15.0):
+                        and time.time() - self._jump_started_at > 25.0):
                     logger.warning(
                         f"[{self.game_id}] SAFETY TIMEOUT: pet_status={self.pet_status} "
                         f"for {time.time() - self._jump_started_at:.1f}s, forcing running"
@@ -901,6 +1032,38 @@ class GameSession:
                 + 1.754893
             )
             self.current_speed_x = max(0.5, self.current_speed_x)
+
+            # Сохраняем speed config из pet_wrap (если сервер отдаёт)
+            speed_cfg = pet_wrap.get("speed", {})
+            if speed_cfg:
+                logger.info(f"[{self.game_id}] pet speed config: {speed_cfg}")
+            # Сохраняем начальную скорость как первый семпл модели
+            self._speed_initial = self.current_speed_x
+
+            # Вычисляем параметры из speed.ts формул если есть chars
+            chars = info.get("chars", {})
+            strength = chars.get("strength", 0)
+            speed_initial_cfg = speed_cfg.get("initial", 0)
+            speed_max_cfg = speed_cfg.get("max", 0)
+            speed_inc_cfg = speed_cfg.get("increasePerSec", 0)
+            if speed_initial_cfg > 0 and speed_max_cfg > 0 and speed_inc_cfg > 0:
+                # Формула из speed.ts для Race:
+                # initialSpeed = speed.initial + speed.initial * (strength / 100)
+                # maxSpeed = speed.max + speed.max * ((str/100 + agi/100) * 0.45)
+                # accelPerSec = speed.increasePerSec + speed.increasePerSec * ((str/100 + agi/100) * 0.45)
+                stat_mult = (strength / 100.0 + agility / 100.0) * 0.45
+                self._speed_initial = speed_initial_cfg * (1 + strength / 100.0)
+                self._speed_max = speed_max_cfg * (1 + stat_mult)
+                self._speed_accel = speed_inc_cfg * (1 + stat_mult)
+                self._speed_model_ready = True
+                self.current_speed_x = self._speed_initial
+                logger.info(
+                    f"[{self.game_id}] Speed from config: "
+                    f"initial={self._speed_initial:.4f} "
+                    f"max={self._speed_max:.4f} "
+                    f"accel={self._speed_accel:.6f}/sec "
+                    f"str={strength} agi={agility}"
+                )
 
             logger.info(
                 f"[{self.game_id}] Наш пет: {info.get('name')} "
@@ -1237,6 +1400,13 @@ class GameSession:
                             f"sy={confirm_sy_jp:.1f} → jp={cal_jp:.2f} gravity={cal_gravity:.3f}"
                         )
 
+                # Калибруем модель ускорения скорости из measured_spx
+                if measured_spx > 0.5 and jump_server_time > 0:
+                    self._calibrate_speed_model(jump_server_time, measured_spx)
+
+                # Обновляем current_speed_x из модели ускорения (для AI loop)
+                self.current_speed_x = self._speed_at_server_time(self._now_server_ms())
+
                 # Калибруем game_started_at по реальной позиции
                 if self.current_speed_x > 0:
                     ticks = (real_x - 118.0) / self.current_speed_x
@@ -1268,7 +1438,7 @@ class GameSession:
             # Таймер reset: arc_remain * 10ms + 50% запас + сетевая задержка.
             latency_buf = max(0.3, self._jump_latency_ms / 500.0)
             reset_delay = max(1.0, arc_remain * 0.015 + latency_buf)
-            reset_delay = min(reset_delay, 12.0)  # не более 12с
+            reset_delay = min(reset_delay, 25.0)  # не более 25с (для low-gravity петов дуга до 15с+)
 
             def reset_after_jump(delay, lx, lst):
                 time.sleep(delay)
