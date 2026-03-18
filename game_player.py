@@ -149,7 +149,7 @@ def calibrate_gravity_jp(confirm_y: float, confirm_sy: float,
         if jp < 10 or jp > 40:
             continue
         g = confirm_sy + 0.3 * N - 0.3 - confirm_y / N
-        if g < 0.01 or g > 20.0:  # расширенный диапазон
+        if g < 0.5 or g > 20.0:  # g < 0.5 нереалистично для race петов
             continue
         # Верифицируем симуляцией
         y, sy = 0.0, jp
@@ -165,7 +165,17 @@ def calibrate_gravity_jp(confirm_y: float, confirm_sy: float,
                 break
         err = abs(y - confirm_y) + abs(sy - confirm_sy) * 10
         if err < 1.0:
-            candidates.append((N, jp, g, err))
+            # Проверяем длину дуги: нереалистично длинные дуги = неправильная гравитация.
+            # Типичная дуга для race: 30-200 тиков (0.3-2.0 секунды).
+            # Дуга > 400 тиков (> 4 секунд) — однозначно ошибка калибровки.
+            full_arc = remaining_arc_ticks(0, jp, g)
+            if full_arc > 400:
+                logger.debug(
+                    f"calibrate_gravity_jp: REJECTED N={N} jp={jp:.2f} g={g:.3f} "
+                    f"full_arc={full_arc}t (too long)"
+                )
+                continue
+            candidates.append((N, jp, g, err, full_arc))
 
     if not candidates:
         return 6.0, estimate_jump_power(confirm_y, confirm_sy, 6.0)
@@ -173,7 +183,7 @@ def calibrate_gravity_jp(confirm_y: float, confirm_sy: float,
     # Если есть данные предыдущего прыжка — используем как второе уравнение
     if prev_confirm_y > 0 and prev_confirm_sy > 0:
         valid_2pt = []
-        for N, jp, g, err1 in candidates:
+        for N, jp, g, err1, _ in candidates:
             # Для того же jp, найдём N2 для prev_confirm
             N2 = round((jp - prev_confirm_sy) / 0.6)
             if N2 < 1 or N2 > 50:
@@ -195,21 +205,23 @@ def calibrate_gravity_jp(confirm_y: float, confirm_sy: float,
             if total < 2.0:
                 valid_2pt.append((g, jp, total))
         if valid_2pt:
-            # Сначала по ошибке (точное решение приоритетнее), потом по jp ≈ TARGET_JP
-            TARGET_JP = 20.5
-            valid_2pt.sort(key=lambda c: (round(c[2], 1), abs(c[1] - TARGET_JP)))
+            valid_2pt.sort(key=lambda c: (round(c[2], 1), abs(c[1] - 24.5)))
             best_g, best_jp, best_err = valid_2pt[0]
             logger.info(f"calibrate_gravity_jp: 2-point solution: g={best_g:.3f} "
                        f"jp={best_jp:.2f} total_err={best_err:.4f}")
             return best_g, best_jp
 
-    # Один прыжок: выбираем кандидата с jp ≈ 20-21 (типичное значение)
-    # Из реальных данных: jp обычно 19-22 для race петов.
-    TARGET_JP = 20.5
-    candidates.sort(key=lambda c: abs(c[1] - TARGET_JP))
-    best_N, best_jp, best_g, best_err = candidates[0]
+    # Один прыжок: выбираем кандидата с реалистичной дугой.
+    # Из реальных данных evo7 lv10: jp обычно 23-26, g обычно 3-8.
+    # Сортировка: 1) предпочитаем arc 30-200 тиков, 2) jp ближе к 24.5 (типичное для evo7).
+    # Для weaker петов jp ≈ 20-22 — тоже попадёт, т.к. arc всё равно реалистичный.
+    candidates.sort(key=lambda c: (
+        0 if 30 <= c[4] <= 200 else 1,  # c[4] = full_arc
+        abs(c[1] - 24.5),                # jp ближе к типичному
+    ))
+    best_N, best_jp, best_g, best_err, best_arc = candidates[0]
     logger.info(f"calibrate_gravity_jp: best candidate N={best_N} jp={best_jp:.2f} "
-               f"g={best_g:.3f} err={best_err:.4f} (target_jp={TARGET_JP})")
+               f"g={best_g:.3f} err={best_err:.4f} arc={best_arc}t")
     return best_g, best_jp
 
 
