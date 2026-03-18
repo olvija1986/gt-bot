@@ -662,13 +662,15 @@ class GameSession:
                 # Safety timeout: если pet_status == "jumping" > 5с, принудительно сбросить
                 if (self.pet_status in ("jumping", "diving")
                         and self._jump_started_at > 0
-                        and time.time() - self._jump_started_at > 5.0):
+                        and time.time() - self._jump_started_at > 30.0):
                     logger.warning(
                         f"[{self.game_id}] SAFETY TIMEOUT: pet_status={self.pet_status} "
                         f"for {time.time() - self._jump_started_at:.1f}s, forcing running"
                     )
                     self.pet_status = "running"
                     self._rejected_in_flight = False
+                    self._last_confirm_y = -1.0
+                    self._last_confirm_sy = -1.0
 
                 if self.pet_status not in ("jumping", "diving"):
                     self._tick_bot()
@@ -942,7 +944,36 @@ class GameSession:
 
                 status = u.get("status") or pet_wrap.get("status")
                 if status:
+                    if self.pet_status in ("jumping", "diving") and status == "running":
+                        logger.info(
+                            f"[{self.game_id}] LANDING from sync: "
+                            f"server status=running, y={self.pet_y:.1f}"
+                        )
+                        self._rejected_in_flight = False
+                        self._last_confirm_y = -1.0
+                        self._last_confirm_sy = -1.0
                     self.pet_status = status
+
+                # Дополнительная проверка: если пет в воздухе но y ≤ 1 → приземлился
+                if (self.pet_status in ("jumping", "diving")
+                        and coords.get("y") is not None
+                        and coords["y"] <= 1.0
+                        and self.started):
+                    logger.info(
+                        f"[{self.game_id}] LANDING from sync coords: y={coords['y']:.2f}"
+                    )
+                    self.pet_status = "running"
+                    self._rejected_in_flight = False
+                    self._last_confirm_y = -1.0
+                    self._last_confirm_sy = -1.0
+
+                # Если приземлились — обновляем anchor для точной позиции
+                if self.pet_status == "running" and coords.get("x") is not None:
+                    server_time_sync = data.get("serverTime", 0)
+                    if server_time_sync > 0:
+                        self._anchor_x = coords["x"]
+                        self._anchor_server_time = server_time_sync
+
                 break
 
             if not found and self.started:
@@ -1076,13 +1107,26 @@ class GameSession:
             if self._rejected_in_flight:
                 logger.info(
                     f"[{self.game_id}] Stale position update after rejection: "
-                    f"x={real_x} y={confirm_y:.1f} sy={confirm_sy:.1f} — ignoring"
+                    f"x={real_x} y={confirm_y:.1f} sy={confirm_sy:.1f}"
                 )
                 self._last_confirm_y = confirm_y
                 self._last_confirm_sy = confirm_sy
                 if real_x is not None:
                     self.pet_x = real_x
+                    self._anchor_x = real_x
+                    st = data.get("serverTime")
+                    if st:
+                        self._anchor_server_time = st
                 self._rejected_in_flight = False
+
+                # Проверяем: пет уже приземлился?
+                if confirm_y <= 1.0:
+                    logger.info(
+                        f"[{self.game_id}] LANDING from stale update: y={confirm_y:.2f}"
+                    )
+                    self.pet_status = "running"
+                    self._last_confirm_y = -1.0
+                    self._last_confirm_sy = -1.0
                 return
 
             # Детекция отклонённого прыжка: сервер вернул те же y/sy что и раньше
@@ -1099,6 +1143,13 @@ class GameSession:
                 self._last_jumped_barrier = self._prev_last_jumped_barrier
                 self.pet_status = "jumping"  # пет ВСЁ ЕЩЁ в воздухе от предыдущего прыжка
                 self._rejected_in_flight = True  # следующее engine.jump — stale update, игнорировать
+                # Обновляем anchor из rejection data для точности позиции
+                if real_x is not None:
+                    self.pet_x = real_x
+                    self._anchor_x = real_x
+                    rej_st = data.get("serverTime")
+                    if rej_st:
+                        self._anchor_server_time = rej_st
                 return
 
             self.pet_status = "jumping"
@@ -1172,43 +1223,25 @@ class GameSession:
 
             self.last_update = data.get("lastUpdate", self.last_update)
 
-            # ── Вычисляем позицию приземления ──
-            # Используем точную симуляцию вместо грубого таймера.
+            # ── Оценка позиции приземления (для лога) ──
             arc_remain = remaining_arc_ticks(confirm_y, confirm_sy, self.gravity)
             spx_for_landing = self.current_speed_x
             landing_x, landing_ticks = _calc_landing(
                 real_x if real_x is not None else self.pet_x,
                 spx_for_landing, confirm_y, confirm_sy, self.gravity
             )
-            jump_server_time_val = data.get("serverTime") or self._now_server_ms()
-            landing_server_time = jump_server_time_val + landing_ticks * 10.0
 
-            # Буфер: arc_remain + запас 20% + сетевая задержка.
-            # Gravity теперь калибруется, так что arc_remain должен быть точным.
-            latency_buf = max(0.3, self._jump_latency_ms / 500.0)
-            reset_delay = max(0.5, arc_remain * 0.012 + latency_buf)
-
-            def reset_after_jump(delay):
-                time.sleep(delay)
-                self._rejected_in_flight = False  # дуга завершена
-                if self.pet_status == "jumping":
-                    self.pet_status = "running"
-                    # НЕ обновляем anchor — landing_x предсказание неточное
-                    # (зависит от gravity которую мы можем не знать идеально).
-                    # Anchor остаётся от последнего подтверждённого прыжка.
-                    logger.info(
-                        f"[{self.game_id}] Arc timer: pet_status → running"
-                    )
-
-            threading.Thread(
-                target=reset_after_jump,
-                args=(reset_delay,),
-                daemon=True
-            ).start()
+            # НЕ ставим таймер на reset_after_jump — gravity и физика
+            # могут быть неточными, что приводит к преждевременному
+            # переключению в "running" и отклонённым прыжкам.
+            # Вместо этого определяем приземление из серверных данных:
+            # - engine.sync с y ≤ 1 или status="running"
+            # - engine.jump stale update с y ≤ 1
+            # - Safety timeout (30с) как абсолютный fallback.
             logger.info(
-                f"[{self.game_id}] Arc remaining: {arc_remain} ticks "
-                f"({reset_delay:.1f}s) y={confirm_y:.0f} sy={confirm_sy:.1f} "
-                f"landing_x={landing_x:.0f}"
+                f"[{self.game_id}] Arc estimated: {arc_remain} ticks "
+                f"({arc_remain * 0.01:.1f}s) y={confirm_y:.0f} sy={confirm_sy:.1f} "
+                f"landing_x≈{landing_x:.0f} | landing from server sync"
             )
 
         client.on("_open",                  on_open)
