@@ -60,7 +60,7 @@ SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", True)
 AI_POLL_INTERVAL_MS = 80
 # Дополнительное упреждение до идеальной точки прыжка.
 # Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
-JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "14"))
+JUMP_LEAD_TICKS = float(os.environ.get("JUMP_LEAD_TICKS", "6"))
 # Минимальный trigger для первого прыжка (до калибровки скорости).
 # Фиксирован в пикселях — работает для любого пета.
 FIRST_JUMP_MIN_TRIGGER_PX = float(os.environ.get("FIRST_JUMP_MIN_TRIGGER_PX", "120"))
@@ -807,6 +807,14 @@ class GameSession:
 
             # На земле: интегрируем расстояние с ускорением
             ground_dist = self._integrate_distance(self._anchor_server_time, now_srv)
+            # Коррекция на ускорение когда speed model не готов:
+            # _integrate_distance использует постоянную current_speed_x →
+            # позиция ЗАНИЖЕНА для ускоряющегося пета.
+            if not self._speed_model_ready:
+                dt_sec = (now_srv - self._anchor_server_time) / 1000.0
+                if dt_sec > 0.3:
+                    avg_boost = 1.0 + min(0.15, dt_sec * 0.05)
+                    ground_dist *= avg_boost
             return self._anchor_x + ground_dist + forward_px
 
         if self.game_started_at and spx_now > 0:
@@ -998,8 +1006,10 @@ class GameSession:
             return
         arc_len = dxs[-1]
 
-        # Барьер ещё далеко — не в пределах дуги
-        if dist > arc_len:
+        # Предварительная проверка: с учётом лага trigger может быть > arc_len,
+        # поэтому берём запас = lag (макс ~30 тиков * spx).
+        max_possible_lag_px = spx * 40
+        if dist > arc_len + max_possible_lag_px:
             return
 
         # ── Найти безопасную зону прыжка ──
@@ -1077,9 +1087,12 @@ class GameSession:
         trigger = max(min_safe_d + lag_px, min(trigger, max_safe_d + lag_px))
 
         # Первый прыжок (скорость ещё не откалибрована): доп. запас.
+        # Но не больше 85% длины дуги — иначе для слабых петов
+        # trigger > arc_len и прыжок невозможен.
         if self._confirmed_jumps == 0:
-            trigger = max(trigger, FIRST_JUMP_MIN_TRIGGER_PX)
-            trigger = min(trigger, max_safe_d + lag_px)  # не выходим за пределы дуги
+            first_cap = min(FIRST_JUMP_MIN_TRIGGER_PX, arc_len * 0.85)
+            trigger = max(trigger, first_cap)
+            trigger = min(trigger, max_safe_d + lag_px)
 
         if dist > trigger:
             return  # ещё рано
@@ -1347,6 +1360,12 @@ class GameSession:
             self.physics_start_at = server_time
             self._anchor_server_time = server_time
             self._anchor_x = self.pet_x
+
+            # Bootstrap speed model: добавляем начальную скорость как 1-й семпл.
+            # После первого подтверждённого прыжка будет 2 семпла →
+            # линейная регрессия → модель ускорения готова СРАЗУ.
+            if self.current_speed_x > 0.5:
+                self._speed_samples.append((server_time, self.current_speed_x))
 
             logger.info(
                 f"[{self.game_id}] 🏁 Игра! physics_start={server_time} "
