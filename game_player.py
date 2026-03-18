@@ -1478,17 +1478,28 @@ class GameSession:
                     if dt_ticks > 100:  # минимум 1с
                         measured_spx = (real_x - self._anchor_x) / dt_ticks
 
-                # arc_spx из engine.jump — это МГНОВЕННАЯ скорость пета на момент
-                # подтверждения прыжка (speed.x от сервера). Горизонтальная скорость
-                # одинакова в воздухе и на земле (physics.ts не меняет speed.x в дуге).
-                # measured_spx — СРЕДНЯЯ скорость от anchor до confirmed — ненадёжна,
-                # т.к. anchor часто стоит на predicted landing_x (неточный).
-                # ВСЕГДА используем arc_spx как истинную скорость.
-                if arc_spx > 0.5:
-                    self.current_speed_x = arc_spx
-                elif measured_spx > 0.5 and self._confirmed_jumps == 0:
-                    # Фоллбэк для первого прыжка если arc_spx недоступен
-                    self.current_speed_x = measured_spx
+                # arc_spx — мгновенная скорость из engine.jump (speed.x).
+                # measured_spx — средняя скорость (anchor→confirmed), зависит от
+                # точности landing prediction.
+                #
+                # Для БЫСТРЫХ петов (длинные дуги → landing prediction неточный):
+                #   measured_spx может быть x2 от реальной → ненадёжна.
+                # Для МЕДЛЕННЫХ петов (короткие дуги → landing prediction точный):
+                #   measured_spx отражает реальное УСКОРЕНИЕ, arc_spx занижена.
+                #
+                # Стратегия: если measured_spx в пределах 30% от arc_spx И выше —
+                # это надёжное ускорение, используем measured_spx.
+                # Иначе (слишком большая разница) — used arc_spx.
+                best_spx = arc_spx if arc_spx > 0.5 else 0.0
+                if arc_spx > 0.5 and measured_spx > arc_spx:
+                    ratio = measured_spx / arc_spx
+                    if ratio < 1.3:
+                        # measured_spx надёжна (близка к arc_spx) и выше → ускорение
+                        best_spx = measured_spx
+                elif measured_spx > 0.5 and best_spx < 0.1:
+                    best_spx = measured_spx
+                if best_spx > 0.5:
+                    self.current_speed_x = best_spx
 
                 self._confirmed_jumps += 1
                 self._anchor_x = real_x
@@ -1519,10 +1530,10 @@ class GameSession:
                         self._first_confirm_y = confirm_y_jp
                         self._first_confirm_sy = confirm_sy_jp
 
-                # Калибруем модель ускорения скорости из arc_spx (мгновенная скорость).
-                # arc_spx = реальная скорость пета на serverTime.
-                if arc_spx > 0.5 and jump_server_time > 0:
-                    self._calibrate_speed_model(jump_server_time, arc_spx)
+                # Калибруем модель ускорения скорости из лучшей оценки скорости.
+                # best_spx учитывает ускорение (measured_spx когда надёжна).
+                if best_spx > 0.5 and jump_server_time > 0:
+                    self._calibrate_speed_model(jump_server_time, best_spx)
 
                 # Обновляем current_speed_x из модели ускорения (для AI loop)
                 if self._speed_model_ready:
@@ -1535,7 +1546,8 @@ class GameSession:
                 logger.info(
                     f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
                     f"measured_spx={measured_spx:.4f} arc_spx={arc_spx:.4f} "
-                    f"using={self.current_speed_x:.4f} lag_ms≈{self._jump_latency_ms:.0f}"
+                    f"best_spx={best_spx:.4f} using={self.current_speed_x:.4f} "
+                    f"lag_ms≈{self._jump_latency_ms:.0f}"
                 )
 
             self.last_update = data.get("lastUpdate", self.last_update)
