@@ -128,24 +128,28 @@ def estimate_jump_power(y: float, speed_y: float, gravity: float = 1.5) -> float
     return speed_y + max(0, p)
 
 
-def calibrate_gravity_jp(confirm_y: float, confirm_sy: float) -> tuple:
-    """Вычисляет gravity и jump_power из первого подтверждённого прыжка.
+def calibrate_gravity_jp(confirm_y: float, confirm_sy: float,
+                         prev_confirm_y: float = -1.0,
+                         prev_confirm_sy: float = -1.0) -> tuple:
+    """Вычисляет gravity и jump_power из подтверждённого прыжка.
 
-    Перебирает количество тиков N (от 1 до 50). Для каждого N:
-    - jp = confirm_sy + 0.6*N
-    - gravity = confirm_sy + 0.3*N - 0.3 - confirm_y/N
-    Выбирает пару (gravity, jp) с наименьшей ошибкой при симуляции.
+    ПРОБЛЕМА: одна точка (y, sy) имеет БЕСКОНЕЧНО МНОГО решений (N, jp, g)
+    с err=0. Нужна дополнительная информация для однозначного выбора.
+
+    Стратегия:
+    1. Если есть данные двух прыжков (prev_confirm_y/sy) — решаем систему
+       из двух уравнений → единственное решение.
+    2. Если один прыжок — выбираем N который даёт jp ≈ 20 (типичное значение),
+       что соответствует gravity ≈ 2-8 для большинства петов.
     """
-    best_g = 1.5
-    best_jp = 20.0
-    best_err = float('inf')
+    candidates = []
 
     for N in range(3, 50):
         jp = confirm_sy + 0.6 * N
         if jp < 10 or jp > 40:
             continue
         g = confirm_sy + 0.3 * N - 0.3 - confirm_y / N
-        if g < 0.05 or g > 3.0:
+        if g < 0.01 or g > 20.0:  # расширенный диапазон
             continue
         # Верифицируем симуляцией
         y, sy = 0.0, jp
@@ -160,14 +164,52 @@ def calibrate_gravity_jp(confirm_y: float, confirm_sy: float) -> tuple:
                 y = 0.0
                 break
         err = abs(y - confirm_y) + abs(sy - confirm_sy) * 10
-        if err < best_err:
-            best_err = err
-            best_g = g
-            best_jp = jp
+        if err < 1.0:
+            candidates.append((N, jp, g, err))
 
-    if best_err > 5.0:
-        # Не удалось подобрать — оставляем значения по умолчанию
+    if not candidates:
         return 1.5, estimate_jump_power(confirm_y, confirm_sy, 1.5)
+
+    # Если есть данные предыдущего прыжка — используем как второе уравнение
+    if prev_confirm_y > 0 and prev_confirm_sy > 0:
+        valid_2pt = []
+        for N, jp, g, err1 in candidates:
+            # Для того же jp, найдём N2 для prev_confirm
+            N2 = round((jp - prev_confirm_sy) / 0.6)
+            if N2 < 1 or N2 > 50:
+                continue
+            # Симулируем prev_confirm
+            y2, sy2 = 0.0, jp
+            for tick in range(1, N2 + 1):
+                sy2 -= 0.6
+                if sy2 < 0:
+                    sy2 = 0.0
+                y2 += sy2
+                if y2 - g > 0:
+                    y2 -= g
+                else:
+                    y2 = 0.0
+                    break
+            err2 = abs(y2 - prev_confirm_y) + abs(sy2 - prev_confirm_sy) * 10
+            total = err1 + err2
+            if total < 2.0:
+                valid_2pt.append((g, jp, total))
+        if valid_2pt:
+            # Сначала по ошибке (точное решение приоритетнее), потом по jp ≈ TARGET_JP
+            TARGET_JP = 20.5
+            valid_2pt.sort(key=lambda c: (round(c[2], 1), abs(c[1] - TARGET_JP)))
+            best_g, best_jp, best_err = valid_2pt[0]
+            logger.info(f"calibrate_gravity_jp: 2-point solution: g={best_g:.3f} "
+                       f"jp={best_jp:.2f} total_err={best_err:.4f}")
+            return best_g, best_jp
+
+    # Один прыжок: выбираем кандидата с jp ≈ 20-21 (типичное значение)
+    # Из реальных данных: jp обычно 19-22 для race петов.
+    TARGET_JP = 20.5
+    candidates.sort(key=lambda c: abs(c[1] - TARGET_JP))
+    best_N, best_jp, best_g, best_err = candidates[0]
+    logger.info(f"calibrate_gravity_jp: best candidate N={best_N} jp={best_jp:.2f} "
+               f"g={best_g:.3f} err={best_err:.4f} (target_jp={TARGET_JP})")
     return best_g, best_jp
 
 
@@ -583,6 +625,8 @@ class GameSession:
         self._prev_confirmed_at  = 0.0   # jumpedAt предыдущего подтверждённого прыжка
         self._last_confirm_y     = -1.0  # y последнего подтверждённого прыжка
         self._last_confirm_sy    = -1.0  # speed_y последнего подтверждённого прыжка
+        self._first_confirm_y    = -1.0  # y первого подтверждённого прыжка (для 2-point calibration)
+        self._first_confirm_sy   = -1.0  # sy первого подтверждённого прыжка
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
         self._anchor_x           = 118.0 # последняя подтверждённая x
         self._anchor_server_time = 0.0   # serverTime для anchor_x
@@ -1379,18 +1423,30 @@ class GameSession:
                 self._anchor_x = real_x
                 self._anchor_server_time = jump_server_time
 
-                # Калибруем gravity И jump_power из первого подтверждения
+                # Калибруем gravity И jump_power
+                # 1-й прыжок: одна точка (y, sy) — неоднозначная, используем эвристику jp≈20
+                # 2-й прыжок: ДВЕ точки → единственное решение (перекалибровка)
                 confirm_y_jp = confirm_y
                 confirm_sy_jp = confirm_sy
-                if confirm_y_jp > 10 and confirm_sy_jp > 1 and self._confirmed_jumps <= 1:
-                    cal_gravity, cal_jp = calibrate_gravity_jp(confirm_y_jp, confirm_sy_jp)
+                if confirm_y_jp > 10 and confirm_sy_jp > 1 and self._confirmed_jumps <= 2:
+                    cal_gravity, cal_jp = calibrate_gravity_jp(
+                        confirm_y_jp, confirm_sy_jp,
+                        self._first_confirm_y, self._first_confirm_sy
+                    )
                     if 15 < cal_jp < 40:
+                        old_g = self.gravity
                         self.jump_power = cal_jp
                         self.gravity = cal_gravity
                         logger.info(
-                            f"[{self.game_id}] Калибровка JP+G: y={confirm_y_jp:.1f} "
-                            f"sy={confirm_sy_jp:.1f} → jp={cal_jp:.2f} gravity={cal_gravity:.3f}"
+                            f"[{self.game_id}] Калибровка JP+G (jump#{self._confirmed_jumps}): "
+                            f"y={confirm_y_jp:.1f} sy={confirm_sy_jp:.1f} → "
+                            f"jp={cal_jp:.2f} gravity={cal_gravity:.3f} "
+                            f"(prev g={old_g:.3f})"
                         )
+                    # Сохраняем данные первого прыжка для перекалибровки
+                    if self._confirmed_jumps == 1 and self._first_confirm_y < 0:
+                        self._first_confirm_y = confirm_y_jp
+                        self._first_confirm_sy = confirm_sy_jp
 
                 # Калибруем модель ускорения скорости из arc_spx (мгновенная скорость).
                 # arc_spx = реальная скорость пета на serverTime.
