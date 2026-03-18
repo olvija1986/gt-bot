@@ -786,7 +786,9 @@ class GameSession:
         now_srv = self._now_server_ms()
         # Текущая скорость для forward-prediction (пол-RTT вперёд)
         spx_now = self._speed_at_server_time(now_srv)
-        half_rtt_ticks = self._jump_latency_ms / 20.0
+        # Ограничиваем forward prediction: не более 150ms / 20 = 7.5 тиков.
+        # Без ограничения при lag>300ms позиция уплывает на десятки px.
+        half_rtt_ticks = min(self._jump_latency_ms, 150.0) / 20.0
         forward_px = spx_now * half_rtt_ticks
 
         if self._anchor_server_time > 0 and spx_now > 0:
@@ -933,6 +935,25 @@ class GameSession:
         self.pet_x = self._estimate_pet_x()
         pet_front = self.pet_x + self.width_pet
 
+        # ── Sanity check: позиция не может быть за непрыгнутым барьером ──
+        # Если мы не прыгали через барьер, пет не мог его пролететь бегом.
+        # Ограничиваем позицию до x барьера - 1px, чтобы не «перескочить» его.
+        if self.pet_status not in ("jumping", "diving"):
+            for b in self.barriers:
+                bx = b["x"]
+                if bx <= self._last_jumped_barrier:
+                    continue  # уже перепрыгнули
+                if pet_front > bx:
+                    # Позиция оценена ЗА барьером, который мы не прыгали!
+                    clamped_x = bx - self.width_pet - 1.0
+                    logger.warning(
+                        f"[{self.game_id}] POSITION CLAMP: estimated {self.pet_x:.0f} "
+                        f"past barrier {bx}, clamping to {clamped_x:.0f}"
+                    )
+                    self.pet_x = clamped_x
+                    pet_front = self.pet_x + self.width_pet
+                    break
+
         # Ищем следующий барьер впереди
         next_idx = None
         for i, b in enumerate(self.barriers):
@@ -986,6 +1007,8 @@ class GameSession:
         # при которых дуга пролетает над barrier_high.
         # min_safe_d = прыгнуть максимально поздно (ближе к барьеру)
         # max_safe_d = прыгнуть максимально рано (дальше от барьера)
+        # SAFETY_MARGIN: запас высоты для компенсации неточности позиции/тайминга.
+        SAFETY_MARGIN = 15
         step = max(0.5, spx * 0.5)
         min_safe_d = None
         max_safe_d = None
@@ -994,7 +1017,7 @@ class GameSession:
         d = step
         while d < arc_len:
             h = _min_height_over_zone(dxs, ys, d, self.width_barrier)
-            margin = h - barrier_high
+            margin = h - barrier_high - SAFETY_MARGIN
             if margin > 0:
                 if min_safe_d is None:
                     min_safe_d = d
@@ -1071,7 +1094,7 @@ class GameSession:
                 break
             h2 = b2.get("high", 50)
             h_over = _min_height_over_zone(dxs, ys, d2, self.width_barrier)
-            if h_over > h2:
+            if h_over > h2 + SAFETY_MARGIN:
                 last_cleared_x = b2["x"]
             else:
                 # Дуга НЕ перелетит этот барьер.
@@ -1464,8 +1487,10 @@ class GameSession:
             jumped_at = self._last_sent_jumped_at
             server_time = data.get("serverTime")
             if jumped_at and server_time:
-                sample = max(0.0, min(600.0, float(server_time) - float(jumped_at)))
+                sample = max(0.0, min(400.0, float(server_time) - float(jumped_at)))
                 self._jump_latency_ms = self._jump_latency_ms * 0.7 + sample * 0.3
+                # Ограничиваем рост: >300ms = позиция уплывает слишком далеко
+                self._jump_latency_ms = min(self._jump_latency_ms, 300.0)
 
             if real_x is not None:
                 self.pet_x = real_x
@@ -1478,6 +1503,27 @@ class GameSession:
                     if dt_ticks > 100:  # минимум 1с
                         measured_spx = (real_x - self._anchor_x) / dt_ticks
 
+                # ── Детекция столкновения с барьером ──
+                # Если measured_spx << arc_spx, пет врезался в барьер и замедлился.
+                # В этом случае speed model повреждена — НЕ калибруем из этого прыжка.
+                _collision_detected = False
+                if (arc_spx > 1.0 and measured_spx > 0.01
+                        and measured_spx < arc_spx * 0.5):
+                    _collision_detected = True
+                    logger.warning(
+                        f"[{self.game_id}] COLLISION DETECTED: "
+                        f"measured_spx={measured_spx:.3f} << arc_spx={arc_spx:.3f} "
+                        f"(ratio={measured_spx / arc_spx:.2f}). "
+                        f"Pet likely hit a barrier. Resetting speed model."
+                    )
+                    # Сбрасываем speed model — данные после столкновения ненадёжны
+                    self._speed_samples = [
+                        s for s in self._speed_samples
+                        if s[1] > arc_spx * 0.6
+                    ]
+                    if len(self._speed_samples) < 2:
+                        self._speed_model_ready = False
+
                 # arc_spx — мгновенная скорость из engine.jump (speed.x).
                 # measured_spx — средняя скорость (anchor→confirmed), зависит от
                 # точности landing prediction.
@@ -1489,7 +1535,7 @@ class GameSession:
                 #
                 # Стратегия: если measured_spx в пределах 30% от arc_spx И выше —
                 # это надёжное ускорение, используем measured_spx.
-                # Иначе (слишком большая разница) — used arc_spx.
+                # Иначе (слишком большая разница) — используем arc_spx.
                 best_spx = arc_spx if arc_spx > 0.5 else 0.0
                 if arc_spx > 0.5 and measured_spx > arc_spx:
                     ratio = measured_spx / arc_spx
@@ -1532,7 +1578,8 @@ class GameSession:
 
                 # Калибруем модель ускорения скорости из лучшей оценки скорости.
                 # best_spx учитывает ускорение (measured_spx когда надёжна).
-                if best_spx > 0.5 and jump_server_time > 0:
+                # При столкновении НЕ калибруем — данные повреждены.
+                if best_spx > 0.5 and jump_server_time > 0 and not _collision_detected:
                     self._calibrate_speed_model(jump_server_time, best_spx)
 
                 # Обновляем current_speed_x из модели ускорения (для AI loop)
