@@ -642,7 +642,8 @@ class GameSession:
         self._prev_target_x      = 0.0   # target_x предыдущего запланированного прыжка
         self._anchor_x           = 118.0 # последняя подтверждённая x
         self._anchor_server_time = 0.0   # serverTime для anchor_x
-        self._arc_spx            = 0.0   # speed_x во время дуги (выше ground speed)
+        self._arc_spx            = 0.0   # speed_x во время дуги (текущий, сбрасывается после приземления)
+        self._last_arc_spx       = 0.0   # arc_spx последнего подтверждённого прыжка (не сбрасывается)
         self._landing_x          = 0.0   # предсказанная позиция приземления
         self._landing_server_time = 0.0  # предсказанный serverTime приземления
 
@@ -679,53 +680,33 @@ class GameSession:
 
     def _calibrate_speed_model(self, server_time: float, speed_x: float):
         """
-        Добавляет точку (server_time, speed_x) и калибрует модель ускорения.
+        Добавляет точку (server_time, speed_x) и калибрует модель скорости.
 
-        После 2+ точек вычисляем линейную регрессию speed(t) = initial + accel * t_sec.
+        Использует EMA (exponential moving average) вместо линейной регрессии,
+        т.к. реальная скорость ~константа с шумом (2.1-2.5), а регрессия
+        принимала линейный рост и переоценивала скорость на 19%+.
         """
         if not self.physics_start_at or speed_x <= 0.1:
             return
         self._speed_samples.append((server_time, speed_x))
 
-        # Нужно минимум 2 точки для вычисления ускорения
-        if len(self._speed_samples) < 2:
-            # Одна точка: сохраняем как initial, ускорение 0
-            self._speed_initial = speed_x
-            return
-
-        # Линейная регрессия: speed = a + b * t_sec
         n = len(self._speed_samples)
-        sum_t = sum_s = sum_ts = sum_tt = 0.0
-        for st, sx in self._speed_samples:
-            t = (st - self.physics_start_at) / 1000.0
-            sum_t += t
-            sum_s += sx
-            sum_ts += t * sx
-            sum_tt += t * t
-
-        denom = n * sum_tt - sum_t * sum_t
-        if abs(denom) < 1e-9:
+        if n == 1:
+            self._speed_initial = speed_x
+            self._speed_accel = 0.0
             return
 
-        b = (n * sum_ts - sum_t * sum_s) / denom  # ускорение
-        a = (sum_s - b * sum_t) / n                # начальная скорость
-
-        if a > 0.1 and b >= 0:
-            # Ограничиваем ускорение: реальное ~0.02-0.05/sec.
-            # С 2 семплами регрессия часто даёт 0.2+ (шум) → _integrate_distance
-            # предсказывает позицию на 100+ px вперёд → CLAMP → прыжок при dist=1.
-            b = min(b, 0.10)
-            self._speed_initial = a
-            self._speed_accel = b
-            # Оценка max_speed: если ускорение > 0, max ≈ последнее наблюдение * 1.3
-            if b > 0 and not self._speed_max:
-                last_spx = self._speed_samples[-1][1]
-                self._speed_max = last_spx * 1.3  # консервативная верхняя граница
-            self._speed_model_ready = True
-            logger.info(
-                f"[{self.game_id}] Speed model: initial={a:.4f} accel={b:.6f}/sec "
-                f"max={self._speed_max:.4f} samples={n}"
-            )
+        # EMA: сглаживаем шум, не предполагая ускорения.
+        # alpha=0.4 — реагируем на изменения, но фильтруем выбросы.
+        alpha = 0.4
+        self._speed_initial = alpha * speed_x + (1.0 - alpha) * self._speed_initial
+        self._speed_accel = 0.0
+        self._speed_max = 0.0  # нет cap — скорость ~постоянная
+        self._speed_model_ready = True
+        logger.info(
+            f"[{self.game_id}] Speed model (EMA): speed={self._speed_initial:.4f} "
+            f"samples={n} latest={speed_x:.4f}"
+        )
 
     def _integrate_distance(self, from_server_time: float, to_server_time: float) -> float:
         """
@@ -1004,7 +985,12 @@ class GameSession:
                 )
 
         # ── Симуляция дуги ──
-        dxs, ys = _simulate_arc_profile(spx, self.jump_power, self.gravity)
+        # Для дуги используем arc_spx (in-flight speed) — она на 10-30% НИЖЕ
+        # ground speed. Если использовать ground speed, дуга выглядит длиннее
+        # чем в реальности → ложный clearance барьеров.
+        # spx (ground speed) используем для lag compensation и position estimation.
+        spx_arc = self._last_arc_spx if self._last_arc_spx > 0.5 else spx
+        dxs, ys = _simulate_arc_profile(spx_arc, self.jump_power, self.gravity)
         if not dxs:
             return
         arc_len = dxs[-1]
@@ -1138,7 +1124,8 @@ class GameSession:
                       f"zone=[{min_safe_d:.0f},{max_safe_d:.0f}] "
                       f"best={best_safe_d:.0f} margin={best_margin:.1f} "
                       f"trigger={trigger:.0f} lag={lag_px:.0f} arc={arc_len:.0f} "
-                      f"spx_used={spx:.3f} cleared_to={last_cleared_x}")
+                      f"spx_ground={spx:.3f} spx_arc={spx_arc:.3f} "
+                      f"cleared_to={last_cleared_x}")
 
     def _make_action_payload(self) -> dict:
         return {
@@ -1597,14 +1584,13 @@ class GameSession:
                         self._first_confirm_y = confirm_y_jp
                         self._first_confirm_sy = confirm_sy_jp
 
-                # Калибруем модель ускорения скорости из arc_spx (server-confirmed).
-                # НЕ из best_spx — measured_spx зависит от точности landing prediction
-                # и может завышать скорость на 10-20%, что делает speed model
-                # слишком крутой → позиция убегает вперёд → ложный clearance.
-                # arc_spx — мгновенная скорость из engine.jump, самая надёжная.
+                # Калибруем модель ускорения скорости из best_spx (ground speed).
+                # best_spx = лучшая оценка скорости бега (из measured или arc).
+                # Используем для ПОЗИЦИИ (нужна точная ground speed).
+                # Для ДУГИ используем отдельно _last_arc_spx (in-flight speed, ниже).
                 # При столкновении НЕ калибруем — данные повреждены.
-                if arc_spx > 0.5 and jump_server_time > 0 and not _collision_detected:
-                    self._calibrate_speed_model(jump_server_time, arc_spx)
+                if best_spx > 0.5 and jump_server_time > 0 and not _collision_detected:
+                    self._calibrate_speed_model(jump_server_time, best_spx)
 
                 # Обновляем current_speed_x из модели ускорения (для AI loop)
                 if self._speed_model_ready:
@@ -1630,6 +1616,8 @@ class GameSession:
             # а не ground speed — пет летит быстрее чем бежит.
             use_arc_spx = arc_spx if arc_spx > 0.5 else self.current_speed_x
             self._arc_spx = use_arc_spx
+            if arc_spx > 0.5:
+                self._last_arc_spx = arc_spx  # сохраняем для arc simulation (не сбрасывается)
 
             landing_x, landing_ticks = _calc_landing(
                 real_x if real_x is not None else self.pet_x,
