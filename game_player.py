@@ -1597,11 +1597,14 @@ class GameSession:
                         self._first_confirm_y = confirm_y_jp
                         self._first_confirm_sy = confirm_sy_jp
 
-                # Калибруем модель ускорения скорости из лучшей оценки скорости.
-                # best_spx учитывает ускорение (measured_spx когда надёжна).
+                # Калибруем модель ускорения скорости из arc_spx (server-confirmed).
+                # НЕ из best_spx — measured_spx зависит от точности landing prediction
+                # и может завышать скорость на 10-20%, что делает speed model
+                # слишком крутой → позиция убегает вперёд → ложный clearance.
+                # arc_spx — мгновенная скорость из engine.jump, самая надёжная.
                 # При столкновении НЕ калибруем — данные повреждены.
-                if best_spx > 0.5 and jump_server_time > 0 and not _collision_detected:
-                    self._calibrate_speed_model(jump_server_time, best_spx)
+                if arc_spx > 0.5 and jump_server_time > 0 and not _collision_detected:
+                    self._calibrate_speed_model(jump_server_time, arc_spx)
 
                 # Обновляем current_speed_x из модели ускорения (для AI loop)
                 if self._speed_model_ready:
@@ -1635,6 +1638,23 @@ class GameSession:
             jump_server_time_val = data.get("serverTime") or self._now_server_ms()
             self._landing_x = landing_x
             self._landing_server_time = jump_server_time_val + landing_ticks * 10.0
+
+            # ── Проверка: долетела ли дуга до отмеченного барьера? ──
+            # _last_jumped_barrier ставится оптимистично в _do_jump
+            # на основе speed model (может завышать скорость на 20%+).
+            # Если РЕАЛЬНАЯ дуга (из arc_spx) не достигает барьера →
+            # пет приземлится ПЕРЕД ним и врежется. Откатываем.
+            landing_front = landing_x + self.width_pet
+            if (self._last_jumped_barrier > 0
+                    and landing_front < self._last_jumped_barrier):
+                logger.warning(
+                    f"[{self.game_id}] ARC TOO SHORT: landing_front={landing_front:.0f} "
+                    f"< barrier={self._last_jumped_barrier:.0f} "
+                    f"(gap={self._last_jumped_barrier - landing_front:.0f}px). "
+                    f"Reverting _last_jumped_barrier "
+                    f"{self._last_jumped_barrier:.0f} → {self._prev_last_jumped_barrier:.0f}"
+                )
+                self._last_jumped_barrier = self._prev_last_jumped_barrier
 
             # Таймер reset: arc_remain * 10ms + фиксированный буфер 200ms.
             # Раньше: 50% запас → таймер стрелял на 1с позже приземления →
