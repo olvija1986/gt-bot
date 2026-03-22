@@ -1925,6 +1925,9 @@ class AutoPlayer:
                 "extra_awards": extra,
             })
 
+            # ─── Бонус за просмотр рекламы ───────────────
+            self._watch_ad()
+
             if self.played < self.target_count and not self._stop.is_set():
                 time.sleep(3)
 
@@ -1935,6 +1938,19 @@ class AutoPlayer:
             "total_exp":   self.total_exp,
             "total_extra": self.total_extra,
         })
+
+    def _watch_ad(self):
+        """Отправляет ads.watch после каждой игры для получения бонуса."""
+        try:
+            r = requests.post(
+                f"{API_BASE}/ads.watch",
+                headers=HEADERS_HTTP,
+                json={"alias": "game.bonus"},
+                timeout=10,
+            )
+            logger.info(f"AutoPlayer ads.watch: {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            logger.warning(f"AutoPlayer ads.watch error: {e}")
 
     def _notify(self, event: str, data: dict):
         logger.info(f"AutoPlayer [{event}] {data}")

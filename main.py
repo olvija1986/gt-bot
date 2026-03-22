@@ -123,30 +123,47 @@ def format_extra_awards(extra_awards: list) -> str:
         "eventCurrency": "🎫", "experience": "⭐",
     }
 
-    def award_key(award: dict) -> str:
-        # Новая структура: {type, item:{name, itemType, ...}}
-        item = award.get("item") or award  # fallback на старую структуру
-        item_type = item.get("itemType") or award.get("type", "")
+    def award_key(award: dict) -> tuple:
+        """Возвращает (display_str, is_numeric) для стакинга."""
+        raw_item = award.get("item")
+        award_type = award.get("type", "")
+
+        # item — число (gton, ton, soft и т.д.)
+        if isinstance(raw_item, (int, float)):
+            emoji = EMOJI.get(award_type, "❓")
+            return (f"{emoji} {award_type}", True)
+
+        # item — dict
+        item = raw_item if isinstance(raw_item, dict) else award
+        item_type = item.get("itemType") or award_type
         name = item.get("name") or item.get("itemName") or ""
         emoji = EMOJI.get(item_type, "❓")
 
         if item_type == "egg":
-            return f"{emoji} {item.get('allowedRegion','')} {item.get('rarity','')}".strip()
+            return (f"{emoji} {item.get('allowedRegion','')} {item.get('rarity','')}".strip(), False)
         if item_type == "mutagen":
-            return f"{emoji} {item.get('probability', name or '?')}"
+            return (f"{emoji} {item.get('probability', name or '?')}", False)
         if item_type == "essence":
-            return f"{emoji} {name or item.get('type','?')}"
+            return (f"{emoji} {name or item.get('type','?')}", False)
         if name:
-            return f"{emoji} {name}"
-        return f"{emoji} {item_type}"
+            return (f"{emoji} {name}", False)
+        return (f"{emoji} {item_type}", False)
 
-    counts = defaultdict(int)
+    # Стакаем: для числовых наград суммируем значение, для остальных — считаем количество
+    numeric_sums = defaultdict(float)   # display_str → сумма значений
+    item_counts = defaultdict(int)      # display_str → количество
+
     for award in extra_awards:
-        key = award_key(award)
-        counts[key] += award.get("count", 1)
+        key, is_numeric = award_key(award)
+        if is_numeric:
+            numeric_sums[key] += award.get("item", 0)
+        else:
+            item_counts[key] += award.get("count", 1)
 
     lines = ["🎁 Доп. награды:"]
-    for k, c in counts.items():
+    for k, total in numeric_sums.items():
+        lines.append(f"  • {k}: {total:g}")
+    for k, c in item_counts.items():
         lines.append(f"  • {k}" + (f" x{c}" if c > 1 else ""))
     return "\n".join(lines)
 
