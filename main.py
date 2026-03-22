@@ -154,11 +154,15 @@ def format_extra_awards(extra_awards: list) -> str:
     item_counts = defaultdict(int)      # display_str → количество
 
     for award in extra_awards:
+        if not isinstance(award, dict):
+            # Необёрнутое значение (float/int/str) — пропускаем
+            continue
         key, is_numeric = award_key(award)
         if is_numeric:
-            numeric_sums[key] += award.get("item", 0)
+            raw = award.get("item", 0)
+            numeric_sums[key] += raw if isinstance(raw, (int, float)) else 0
         else:
-            item_counts[key] += award.get("count", 1)
+            item_counts[key] += 1
 
     lines = ["🎁 Доп. награды:"]
     for k, total in numeric_sums.items():
@@ -177,11 +181,17 @@ def make_game_callback(mode: str, count: int):
                 f"Игр запланировано: {count}"
             )
         elif event == "game_done":
-            place_emoji = {1: "🥇", 2: "🥈", 3: "🥉"}.get(data["place"], "🏅")
+            place = data["place"]
+            place_emoji = {1: "🥇", 2: "🥈", 3: "🥉"}.get(place, "🏅")
+            money = data.get("money", 0)
+            exp = data.get("exp", 0)
             lines = [
-                f"{place_emoji} Игра {data['played']}/{data['total']}",
-                f"Место: {data['place']} | Монет: {data['money']} | Опыт: {data['exp']}",
+                f"{place_emoji} Игра {data['played']}/{data['total']} — место {place}",
             ]
+            if money or exp:
+                lines.append(f"💰 {money} монет | ⭐ {exp} опыта")
+            else:
+                lines.append("🚫 Лимит наград исчерпан")
             extra_text = format_extra_awards(data.get("extra_awards", []))
             if extra_text:
                 lines.append(extra_text)

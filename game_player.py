@@ -56,7 +56,7 @@ WAITROOM_WS    = "wss://waitroom.nl.gatto.pw/socket.io/?EIO=4&transport=websocke
 SCREEN         = {"w": 1182, "h": 468}
 WAITROOM_TIMEOUT = 60    # сек ждём матч
 GAME_TIMEOUT     = 120   # сек максимум на игру
-SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", True)
+SOCKET_FULL_LOG  = _env_flag("SOCKET_FULL_LOG", False)
 AI_POLL_INTERVAL_MS = 80
 # Дополнительное упреждение до идеальной точки прыжка.
 # Нужен запас, чтобы не утыкаться в барьер при сетевом джиттере.
@@ -87,7 +87,7 @@ def validate_token() -> bool:
             json={},
             timeout=10
         )
-        logger.info(f"[token check] status={r.status_code} response={r.text[:100]}")
+        logger.debug(f"[token check] status={r.status_code} response={r.text[:100]}")
         return r.status_code == 200
     except Exception as e:
         logger.error(f"[token check] error: {e}")
@@ -207,7 +207,7 @@ def calibrate_gravity_jp(confirm_y: float, confirm_sy: float,
         if valid_2pt:
             valid_2pt.sort(key=lambda c: (round(c[2], 1), abs(c[1] - 24.5)))
             best_g, best_jp, best_err = valid_2pt[0]
-            logger.info(f"calibrate_gravity_jp: 2-point solution: g={best_g:.3f} "
+            logger.debug(f"calibrate_gravity_jp: 2-point solution: g={best_g:.3f} "
                        f"jp={best_jp:.2f} total_err={best_err:.4f}")
             return best_g, best_jp
 
@@ -220,7 +220,7 @@ def calibrate_gravity_jp(confirm_y: float, confirm_sy: float,
         abs(c[1] - 24.5),                # jp ближе к типичному
     ))
     best_N, best_jp, best_g, best_err, best_arc = candidates[0]
-    logger.info(f"calibrate_gravity_jp: best candidate N={best_N} jp={best_jp:.2f} "
+    logger.debug(f"calibrate_gravity_jp: best candidate N={best_N} jp={best_jp:.2f} "
                f"g={best_g:.3f} err={best_err:.4f} arc={best_arc}t")
     return best_g, best_jp
 
@@ -338,12 +338,12 @@ class SioClient:
     def _on_open(self, ws):
         # TCP соединение установлено — ждём 0{sid} от сервера, ничего не шлём
         import logging as _l
-        _l.getLogger("game_player").info(f"[SioClient] TCP open: {self.url}")
+        _l.getLogger("game_player").debug(f"[SioClient] TCP open: {self.url}")
 
     def _on_message(self, ws, msg: str):
         import logging as _l
         log = _l.getLogger("game_player")
-        log.info(f"[SioClient] <- {msg[:200]}")
+        log.debug(f"[SioClient] <- {msg[:200]}")
         if SOCKET_FULL_LOG:
             log.info(f"[SioClient][full] <- {msg}")
 
@@ -354,9 +354,9 @@ class SioClient:
         # Engine.IO open: 0{sid, pingInterval, ...}
         if msg.startswith("0") and not self._eio_open_received:
             self._eio_open_received = True
-            log.info(f"[SioClient] EIO open received. Token starts with: {self.token[:60]!r}")
-            auth = f'40{{"token":"Bearer {self.token}"}}' 
-            log.info(f"[SioClient] Sending auth: {auth[:100]}")
+            log.debug(f"[SioClient] EIO open received. Token starts with: {self.token[:60]!r}")
+            auth = f'40{{"token":"Bearer {self.token}"}}'
+            log.debug(f"[SioClient] Sending auth: {auth[:100]}")
             self._ws_send(auth)
             # x-info шлём отдельно, после небольшой паузы
             import time as _t
@@ -368,7 +368,7 @@ class SioClient:
         if msg.startswith("40"):
             if not self._sio_ack_received:
                 self._sio_ack_received = True
-                log.info("[SioClient] SIO namespace ack — ready, calling _open handler")
+                log.debug("[SioClient] SIO namespace ack — ready, calling _open handler")
                 if self._handlers.get("_open"):
                     self._handlers["_open"]()
             return
@@ -376,7 +376,7 @@ class SioClient:
         # Обычные события: 42["event", data]
         event, data = sio_parse(msg)
         if event:
-            log.info(f"[SioClient] event: {event}")
+            log.debug(f"[SioClient] event: {event}")
             if event in self._handlers:
                 self._handlers[event](data)
 
@@ -438,25 +438,25 @@ class WaitroomSession:
 
         def on_open():
             payload = {"petId": self.pet_id, "gameType": self.game_type}
-            logger.info(f"[waitroom] → waitroom:connect {payload}")
+            logger.debug(f"[waitroom] → waitroom:connect {payload}")
             client.emit_ack("waitroom:connect", payload)
 
         def on_game_new(data: dict):
             game = data.get("game", {})
             game_id  = game.get("id") or game.get("_id")
             lobby_url = game.get("lobbyUrl", "")
-            logger.info(f"[waitroom] game.new: id={game_id} lobbyUrl={lobby_url}")
+            logger.debug(f"[waitroom] game.new: id={game_id} lobbyUrl={lobby_url}")
             if not lobby_url.endswith("/socket.io/?EIO=4&transport=websocket"):
                 if not lobby_url.endswith("/"):
                     lobby_url += "/"
                 lobby_url += "socket.io/?EIO=4&transport=websocket"
-            logger.info(f"[waitroom] full WS URL: {lobby_url}")
+            logger.debug(f"[waitroom] full WS URL: {lobby_url}")
             self._result = {"game_id": str(game_id), "lobby_url": lobby_url}
             self._done.set()
 
         def on_list_update(data):
             count = len(data) if isinstance(data, list) else "?"
-            logger.info(f"[waitroom] list.update: {count} игроков: {[u.get('userId') for u in data] if isinstance(data, list) else data}")
+            logger.debug(f"[waitroom] list.update: {count} игроков")
 
         client.on("_open",                  on_open)
         client.on("waitroom.game.new",      on_game_new)
@@ -703,7 +703,7 @@ class GameSession:
         self._speed_accel = 0.0
         self._speed_max = 0.0  # нет cap — скорость ~постоянная
         self._speed_model_ready = True
-        logger.info(
+        logger.debug(
             f"[{self.game_id}] Speed model (EMA): speed={self._speed_initial:.4f} "
             f"samples={n} latest={speed_x:.4f}"
         )
@@ -845,7 +845,7 @@ class GameSession:
                 dx = confirmed_x - self._prev_target_x
                 if dx > 0:
                     speed = dx / dt
-                    logger.info(f"run_speed delta: prev_x={self._prev_target_x:.0f} "
+                    logger.debug(f"run_speed delta: prev_x={self._prev_target_x:.0f} "
                                f"curr_x={confirmed_x:.0f} dt={dt:.0f}t → {speed:.4f}")
                     return speed
 
@@ -877,9 +877,8 @@ class GameSession:
                 if (self.pet_status in ("jumping", "diving")
                         and self._jump_started_at > 0
                         and time.time() - self._jump_started_at > 25.0):
-                    logger.warning(
-                        f"[{self.game_id}] SAFETY TIMEOUT: pet_status={self.pet_status} "
-                        f"for {time.time() - self._jump_started_at:.1f}s, forcing running"
+                    logger.debug(
+                        f"[{self.game_id}] SAFETY TIMEOUT: pet_status={self.pet_status}"
                     )
                     self.pet_status = "running"
                     self._rejected_in_flight = False
@@ -906,7 +905,7 @@ class GameSession:
         self._prev_last_jumped_barrier = self._last_jumped_barrier  # сохраняем для отката
         self._last_jumped_barrier = last_barrier_x
         self._last_sent_jumped_at = now_srv
-        logger.info(
+        logger.debug(
             f"[{self.game_id}] ⏱ JUMP barrier={last_barrier_x} "
             f"dist={dist:.1f} spx={self.current_speed_x:.3f} "
             f"jp={self.jump_power:.1f} {extra_info}"
@@ -938,9 +937,8 @@ class GameSession:
                 if pet_front > bx:
                     # Позиция оценена ЗА барьером, который мы не прыгали!
                     clamped_x = bx - self.width_pet - 1.0
-                    logger.warning(
-                        f"[{self.game_id}] POSITION CLAMP: estimated {self.pet_x:.0f} "
-                        f"past barrier {bx}, clamping to {clamped_x:.0f}"
+                    logger.debug(
+                        f"[{self.game_id}] POSITION CLAMP: {self.pet_x:.0f} → {clamped_x:.0f}"
                     )
                     self.pet_x = clamped_x
                     pet_front = self.pet_x + self.width_pet
@@ -978,10 +976,8 @@ class GameSession:
                 # initial=1.64 → actual=2.33 за ~3сек ≈ +14%/сек.
                 boost = 1.0 + min(0.5, elapsed_sec * 0.15)
                 spx = spx * boost
-                logger.info(
-                    f"[{self.game_id}] First jump speed boost: "
-                    f"base={self.current_speed_x:.3f} elapsed={elapsed_sec:.1f}s "
-                    f"boost={boost:.2f} → spx={spx:.3f}"
+                logger.debug(
+                    f"[{self.game_id}] First jump boost: {self.current_speed_x:.3f} → {spx:.3f}"
                 )
 
         # ── Симуляция дуги ──
@@ -1052,9 +1048,8 @@ class GameSession:
                         dxs, ys = dxs2, ys2
                         arc_len = arc_len2
                         spx = spx_retry
-                        logger.info(
-                            f"[{self.game_id}] First jump: safe zone found with "
-                            f"boosted spx={spx_retry:.3f} (1.3x retry)"
+                        logger.debug(
+                            f"[{self.game_id}] First jump: retry spx={spx_retry:.3f}"
                         )
             if min_safe_d is None:
                 # Аварийный прыжок — максимальная высота (best effort).
@@ -1113,9 +1108,9 @@ class GameSession:
                     max_arc_before_b2 = d2 - self.width_pet - self.width_barrier
                     if max_arc_before_b2 < min_safe_d:
                         # Невозможно перелететь первый и сесть до второго
-                        logger.warning(
+                        logger.debug(
                             f"[{self.game_id}] Барьеры слишком близко: "
-                            f"{barrier['x']} и {b2['x']}, arc={arc_len:.0f}"
+                            f"{barrier['x']} и {b2['x']}"
                         )
                     # Продолжаем — лучше перепрыгнуть первый, чем стоять
                 break
@@ -1138,7 +1133,7 @@ class GameSession:
         self._client = client
 
         def on_open():
-            logger.info(f"[{self.game_id}] WS игры открыт, подключаемся… petId={self.pet_id}")
+            logger.debug(f"[{self.game_id}] WS игры открыт, petId={self.pet_id}")
             payload = {
                 "gameId":           self.game_id,
                 "screenResolution": SCREEN,
@@ -1149,10 +1144,22 @@ class GameSession:
 
         def on_user_connected(data: dict):
             user = data.get("user", {})
-            if user.get("_id") != self.user_id:
-                return
             pet_wrap = data.get("pet", {})
             info = pet_wrap.get("info", {})
+            # ── Логируем КАЖДОГО игрока ──
+            chars = info.get("chars", {})
+            logger.info(
+                f"[{self.game_id}] 👤 {user.get('firstName','?')} | "
+                f"🐾 {info.get('name','?')} "
+                f"evo={info.get('evolution','?')} "
+                f"str={chars.get('strength','?')} "
+                f"agi={chars.get('agility','?')} "
+                f"swim={chars.get('swim','?')} "
+                f"fly={chars.get('fly','?')} "
+                f"sta={chars.get('stamina','?')}"
+            )
+            if user.get("_id") != self.user_id:
+                return
             self.pet_id  = str(info.get("_id", ""))
             self.pet_row = pet_wrap.get("row")
 
@@ -1182,7 +1189,7 @@ class GameSession:
             # Сохраняем speed config из pet_wrap (если сервер отдаёт)
             speed_cfg = pet_wrap.get("speed", {})
             if speed_cfg:
-                logger.info(f"[{self.game_id}] pet speed config: {speed_cfg}")
+                logger.debug(f"[{self.game_id}] pet speed config: {speed_cfg}")
             # Сохраняем начальную скорость как первый семпл модели
             self._speed_initial = self.current_speed_x
 
@@ -1203,7 +1210,7 @@ class GameSession:
                 self._speed_accel = speed_inc_cfg * (1 + stat_mult)
                 self._speed_model_ready = True
                 self.current_speed_x = self._speed_initial
-                logger.info(
+                logger.debug(
                     f"[{self.game_id}] Speed from config: "
                     f"initial={self._speed_initial:.4f} "
                     f"max={self._speed_max:.4f} "
@@ -1211,11 +1218,10 @@ class GameSession:
                     f"str={strength} agi={agility}"
                 )
 
-            logger.info(
+            logger.debug(
                 f"[{self.game_id}] Наш пет: {info.get('name')} "
                 f"row={self.pet_row} agility={agility} "
                 f"speed={self.current_speed_x:.3f}px/tick "
-                f"(тик=10ms → {self.current_speed_x/10:.4f}px/ms) "
                 f"jp={self.jump_power:.1f} g={self.gravity:.2f}"
             )
             # Применяем барьеры если они уже пришли до нашего connected
@@ -1224,7 +1230,7 @@ class GameSession:
                     [b for b in self._all_barriers_raw if b.get("row") == self.pet_row],
                     key=lambda b: b["x"]
                 )
-                logger.info(f"[{self.game_id}] Барьеры применены после connected: "
+                logger.debug(f"[{self.game_id}] Барьеры применены после connected: "
                             f"{len(self.barriers)} на row={self.pet_row}")
 
         _sync_count = [0]
@@ -1241,7 +1247,7 @@ class GameSession:
                         "coords": u.get("coordinates"),
                         "pet_keys": list(u.get("pet", {}).keys()) if u.get("pet") else [],
                     })
-                logger.info(f"[{self.game_id}] SYNC#{_sync_count[0]} users={users_preview}")
+                logger.debug(f"[{self.game_id}] SYNC#{_sync_count[0]} users={users_preview}")
 
             found = False
             for u in data.get("users", []):
@@ -1277,7 +1283,7 @@ class GameSession:
                 status = u.get("status") or pet_wrap.get("status")
                 if status:
                     if self.pet_status in ("jumping", "diving") and status == "running":
-                        logger.info(
+                        logger.debug(
                             f"[{self.game_id}] LANDING from sync: "
                             f"server status=running, y={self.pet_y:.1f}"
                         )
@@ -1292,7 +1298,7 @@ class GameSession:
                         and coords.get("y") is not None
                         and coords["y"] <= 1.0
                         and self.started):
-                    logger.info(
+                    logger.debug(
                         f"[{self.game_id}] LANDING from sync coords: y={coords['y']:.2f}"
                     )
                     self.pet_status = "running"
@@ -1311,7 +1317,7 @@ class GameSession:
                 break
 
             if not found and self.started:
-                logger.warning(f"[{self.game_id}] Наш пет не найден в синке! users count={len(data.get('users',[]))}")
+                logger.debug(f"[{self.game_id}] Наш пет не найден в синке! users count={len(data.get('users',[]))}")
 
             self.last_update = data.get("lastUpdatedAt", self.last_update)
             
@@ -1337,7 +1343,7 @@ class GameSession:
                         [b for b in barriers_raw if b.get("row") == self.pet_row],
                         key=lambda b: b["x"]
                     )
-                    logger.info(
+                    logger.debug(
                         f"[{self.game_id}] Карта: {len(self.barriers)} барьеров "
                         f"на row={self.pet_row}, первый x={self.barriers[0]['x'] if self.barriers else '—'}"
                     )
@@ -1356,7 +1362,7 @@ class GameSession:
             self._anchor_server_time = server_time
             self._anchor_x = self.pet_x
 
-            logger.info(
+            logger.debug(
                 f"[{self.game_id}] 🏁 Игра! physics_start={server_time} "
                 f"speed={self.current_speed_x:.4f}px/tick"
             )
@@ -1366,13 +1372,13 @@ class GameSession:
             for p in data.get("usersPrizes", []):
                 if p.get("userId") == self.user_id:
                     self.result = p
-                    prize = p.get("prize", {})
-                    extra = p.get("extraAwards", [])
+                    prize = p.get("prize") or {}
+                    extra = p.get("extraAwards") or []
                     logger.info(
                         f"[{self.game_id}] Место: {p.get('winningPlace','?')} | "
-                        f"монет: {prize.get('moneyAmount',0)} | "
-                        f"опыт: {prize.get('experience',0)} | "
-                        f"extra: {len(extra)}"
+                        f"монет: {prize.get('moneyAmount',0) if isinstance(prize, dict) else 0} | "
+                        f"опыт: {prize.get('experience',0) if isinstance(prize, dict) else 0} | "
+                        f"extra: {len(extra) if isinstance(extra, list) else 0}"
                     )
             # Отменяем незапущенные таймеры
             for t in self._jump_timers:
@@ -1421,7 +1427,7 @@ class GameSession:
                 if opp_y == 0 and opp_sy > 10 and self._confirmed_jumps == 0:
                     # У оппонента y=0 — прыжок только начался, sy = jump_power
                     self.jump_power = opp_sy
-                    logger.info(
+                    logger.debug(
                         f"[{self.game_id}] JP из оппонента: "
                         f"userId={data.get('userId')} sy={opp_sy:.2f}"
                     )
@@ -1439,7 +1445,7 @@ class GameSession:
             # Проверяем ДО rejection detection, т.к. stale update может иметь
             # те же y/sy и ложно триггерить повторный rejection.
             if self._rejected_in_flight:
-                logger.info(
+                logger.debug(
                     f"[{self.game_id}] Stale position update after rejection: "
                     f"x={real_x} y={confirm_y:.1f} sy={confirm_sy:.1f}"
                 )
@@ -1455,7 +1461,7 @@ class GameSession:
 
                 # Проверяем: пет уже приземлился?
                 if confirm_y <= 1.0:
-                    logger.info(
+                    logger.debug(
                         f"[{self.game_id}] LANDING from stale update: y={confirm_y:.2f}"
                     )
                     self.pet_status = "running"
@@ -1469,9 +1475,9 @@ class GameSession:
             if (self._last_confirm_y >= 0
                     and abs(confirm_y - self._last_confirm_y) < 0.1
                     and abs(confirm_sy - self._last_confirm_sy) < 0.1):
-                logger.warning(
+                logger.debug(
                     f"[{self.game_id}] JUMP REJECTED: пет в воздухе! "
-                    f"y={confirm_y:.1f} sy={confirm_sy:.1f} (те же что и прошлый) "
+                    f"y={confirm_y:.1f} sy={confirm_sy:.1f} "
                     f"reverting _last_jumped_barrier {self._last_jumped_barrier:.0f} → {self._prev_last_jumped_barrier:.0f}"
                 )
                 # Откат состояния: прыжок не состоялся — возвращаем предыдущие значения
@@ -1518,11 +1524,9 @@ class GameSession:
                 if (arc_spx > 1.0 and measured_spx > 0.01
                         and measured_spx < arc_spx * 0.5):
                     _collision_detected = True
-                    logger.warning(
+                    logger.debug(
                         f"[{self.game_id}] COLLISION DETECTED: "
-                        f"measured_spx={measured_spx:.3f} << arc_spx={arc_spx:.3f} "
-                        f"(ratio={measured_spx / arc_spx:.2f}). "
-                        f"Pet likely hit a barrier. Resetting speed model."
+                        f"measured_spx={measured_spx:.3f} << arc_spx={arc_spx:.3f}"
                     )
                     # Сбрасываем speed model — данные после столкновения ненадёжны
                     self._speed_samples = [
@@ -1573,11 +1577,9 @@ class GameSession:
                         old_g = self.gravity
                         self.jump_power = cal_jp
                         self.gravity = cal_gravity
-                        logger.info(
+                        logger.debug(
                             f"[{self.game_id}] Калибровка JP+G (jump#{self._confirmed_jumps}): "
-                            f"y={confirm_y_jp:.1f} sy={confirm_sy_jp:.1f} → "
-                            f"jp={cal_jp:.2f} gravity={cal_gravity:.3f} "
-                            f"(prev g={old_g:.3f})"
+                            f"jp={cal_jp:.2f} g={cal_gravity:.3f}"
                         )
                     # Сохраняем данные первого прыжка для перекалибровки
                     if self._confirmed_jumps == 1 and self._first_confirm_y < 0:
@@ -1600,11 +1602,9 @@ class GameSession:
                 if self.current_speed_x > 0:
                     ticks = (real_x - 118.0) / self.current_speed_x
                     self.game_started_at = time.time() * 1000 - ticks * 10
-                logger.info(
+                logger.debug(
                     f"[{self.game_id}] JUMP confirmed: x={real_x:.0f} "
-                    f"measured_spx={measured_spx:.4f} arc_spx={arc_spx:.4f} "
-                    f"best_spx={best_spx:.4f} using={self.current_speed_x:.4f} "
-                    f"lag_ms≈{self._jump_latency_ms:.0f}"
+                    f"spx={self.current_speed_x:.4f} lag≈{self._jump_latency_ms:.0f}"
                 )
 
             self.last_update = data.get("lastUpdate", self.last_update)
@@ -1635,12 +1635,9 @@ class GameSession:
             landing_front = landing_x + self.width_pet
             if (self._last_jumped_barrier > 0
                     and landing_front < self._last_jumped_barrier):
-                logger.warning(
-                    f"[{self.game_id}] ARC TOO SHORT: landing_front={landing_front:.0f} "
-                    f"< barrier={self._last_jumped_barrier:.0f} "
-                    f"(gap={self._last_jumped_barrier - landing_front:.0f}px). "
-                    f"Reverting _last_jumped_barrier "
-                    f"{self._last_jumped_barrier:.0f} → {self._prev_last_jumped_barrier:.0f}"
+                logger.debug(
+                    f"[{self.game_id}] ARC TOO SHORT: landing={landing_front:.0f} "
+                    f"< barrier={self._last_jumped_barrier:.0f}"
                 )
                 self._last_jumped_barrier = self._prev_last_jumped_barrier
 
@@ -1656,10 +1653,8 @@ class GameSession:
                 # Если после создания этого таймера был подтверждён НОВЫЙ прыжок,
                 # этот таймер устарел — его anchor_x неактуален.
                 if self._confirmed_jumps > created_at_jump:
-                    logger.info(
-                        f"[{self.game_id}] Arc timer SKIPPED (stale): "
-                        f"created for jump#{created_at_jump}, "
-                        f"current jumps={self._confirmed_jumps}"
+                    logger.debug(
+                        f"[{self.game_id}] Arc timer SKIPPED (stale): jump#{created_at_jump}"
                     )
                     return
                 if self.pet_status in ("jumping", "diving"):
@@ -1669,9 +1664,8 @@ class GameSession:
                 self._anchor_x = lx
                 self._anchor_server_time = lst
                 self._arc_spx = 0.0
-                logger.info(
-                    f"[{self.game_id}] Arc timer: pet_status → running, "
-                    f"anchor_x={lx:.0f} (jump#{created_at_jump})"
+                logger.debug(
+                    f"[{self.game_id}] Arc timer: anchor_x={lx:.0f} (jump#{created_at_jump})"
                 )
 
             threading.Thread(
@@ -1680,11 +1674,8 @@ class GameSession:
                       self._confirmed_jumps),
                 daemon=True
             ).start()
-            logger.info(
-                f"[{self.game_id}] Arc: remain={arc_remain}t "
-                f"({arc_remain * 0.01:.1f}s) reset={reset_delay:.1f}s "
-                f"y={confirm_y:.0f} sy={confirm_sy:.1f} "
-                f"arc_spx={use_arc_spx:.3f} landing_x≈{landing_x:.0f}"
+            logger.debug(
+                f"[{self.game_id}] Arc: remain={arc_remain}t landing_x≈{landing_x:.0f}"
             )
 
         client.on("_open",                  on_open)
@@ -1702,7 +1693,7 @@ class GameSession:
         ws_thread = client.connect()
 
         if not self._done.wait(timeout=timeout):
-            logger.warning(f"[{self.game_id}] Таймаут {timeout}с")
+            logger.debug(f"[{self.game_id}] Таймаут {timeout}с")
 
         client.disconnect()
         ws_thread.join(timeout=5)
@@ -1716,7 +1707,7 @@ def _post(url: str, payload: dict):
         r = requests.post(url, headers=HEADERS_HTTP, json=payload, timeout=20)
         if r.status_code == 200:
             return r.json()
-        logger.warning(f"POST {url} → {r.status_code}: {r.text[:200]}")
+        logger.debug(f"POST {url} → {r.status_code}: {r.text[:200]}")
     except Exception as e:
         logger.error(f"POST {url}: {e}")
     return None
@@ -1742,17 +1733,11 @@ def get_all_pets() -> list:
     raw_pets = []
     try:
         regions = data.get("user", {}).get("regions", [])
-        logger.info(f"get_all_pets: регионов={len(regions)}")
+        logger.debug(f"get_all_pets: регионов={len(regions)}")
         for i, region in enumerate(regions):
             pet = region.get("pet")
             if pet and pet.get("_id"):
                 chars = pet.get("chars", {})
-                logger.info(
-                    f"  [{i}] {pet.get('name')} | id={pet.get('_id')} | "
-                    f"evo={pet.get('evolution')} lv={pet.get('level')} | "
-                    f"agi={chars.get('agility',0)} swim={chars.get('swim',0)} "
-                    f"str={chars.get('strength',0)}"
-                )
                 base = pet.get("basePet", {})
                 chars = pet.get("chars", {})
                 raw_pets.append({
@@ -1811,7 +1796,7 @@ def get_best_pet_for_mode(mode: str) -> str | None:
         return None
     best = pets[0]  # первый = наивысшая эволюция
     stat_key = "swim" if mode == "swim" else "agility"
-    logger.info(f"Авто-выбор для {mode}: {best['name']} evo{best['evolution']} "
+    logger.debug(f"Авто-выбор для {mode}: {best['name']} evo{best['evolution']} "
                 f"lv{best['level']} {stat_key}={best[stat_key]}")
     return best["id"]
 
@@ -1851,7 +1836,7 @@ class AutoPlayer:
         return self._thread is not None and self._thread.is_alive()
 
     def _run(self):
-        logger.info(f"[AutoPlayer] TG_TOKEN prefix: {TG_TOKEN[:60]!r}")
+        logger.debug(f"[AutoPlayer] TG_TOKEN prefix: {TG_TOKEN[:60]!r}")
         if not validate_token():
             self._notify("error", {"msg": "❌ TG_TOKEN не работает — проверь переменную окружения."})
             return
@@ -1863,12 +1848,12 @@ class AutoPlayer:
             self._notify("error", {"msg": "❌ Не удалось получить user_id / pet_id. Проверь TG_TOKEN."})
             return
 
-        logger.info(f"AutoPlayer: user_id={self.user_id} pet_id={self.pet_id}")
+        logger.debug(f"AutoPlayer: user_id={self.user_id} pet_id={self.pet_id}")
         self._notify("started", {"mode": self.mode, "count": self.target_count})
 
         while self.played < self.target_count and not self._stop.is_set():
             # ─── Шаг 1: ждём матч ───────────────────────────
-            logger.info(f"AutoPlayer: ищем {self.mode} ({self.played+1}/{self.target_count})…")
+            logger.debug(f"AutoPlayer: ищем {self.mode} ({self.played+1}/{self.target_count})…")
             waitroom = WaitroomSession(self.pet_id, self.mode)
             game_info = waitroom.wait_for_game(timeout=WAITROOM_TIMEOUT)
 
@@ -1904,13 +1889,14 @@ class AutoPlayer:
 
             if result:
                 place  = result.get("winningPlace", "?")
-                prize  = result.get("prize", {})
-                money  = prize.get("moneyAmount", 0)
-                exp    = prize.get("experience", 0)
-                extra  = result.get("extraAwards", [])
+                prize  = result.get("prize") or {}
+                money  = prize.get("moneyAmount", 0) if isinstance(prize, dict) else 0
+                exp    = prize.get("experience", 0) if isinstance(prize, dict) else 0
+                extra  = result.get("extraAwards") or []
                 self.total_money += money
                 self.total_exp   += exp
-                self.total_extra.extend(extra)
+                if extra and isinstance(extra, list):
+                    self.total_extra.extend(extra)
                 if place == 1:
                     self.wins += 1
             else:
@@ -1948,12 +1934,15 @@ class AutoPlayer:
                 json={"alias": "game.bonus"},
                 timeout=10,
             )
-            logger.info(f"AutoPlayer ads.watch: {r.status_code} {r.text[:200]}")
+            logger.debug(f"AutoPlayer ads.watch: {r.status_code} {r.text[:200]}")
         except Exception as e:
             logger.warning(f"AutoPlayer ads.watch error: {e}")
 
     def _notify(self, event: str, data: dict):
-        logger.info(f"AutoPlayer [{event}] {data}")
+        if event in ("game_done", "finished", "error"):
+            logger.info(f"AutoPlayer [{event}] {data}")
+        else:
+            logger.debug(f"AutoPlayer [{event}] {data}")
         if self.on_update:
             try:
                 self.on_update(event, data)
